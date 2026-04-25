@@ -2,8 +2,8 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           4.1
-// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，可选图片预览功能。全面重构：防数据膨胀、性能优化(IntersectionObserver+requestAnimationFrame)、列表瀑布流、图片灯箱支持键盘与前后翻页、缓存体验提升。
+// @version           4.2.0
+// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，可选图片预览功能。支持图片分批抓取、稳定分页、结构化缓存、单帖足迹管理、列表瀑布流和灯箱查看。
 // @description:en    Marks visited threads in Discuz! forum lists and optionally adds image preview. Uses progressive rendering for fast image previews and auto-cleans old data.
 // @author            Ice_wilderness
 // @match             *://*/*forum.php?mod=forumdisplay*
@@ -64,6 +64,11 @@
             cursor: pointer; background-color: #f9f9f9; font-size: 12px; color: #333; transition: all 0.2s;
         }
         .preview-button:hover:not(:disabled) { background-color: #e0e0e0; }
+        .thread-action-button {
+            margin-left: 5px; padding: 2px 6px; border: 1px solid #dcdcdc; border-radius: 4px;
+            cursor: pointer; background-color: #fff; font-size: 12px; color: #666; transition: all 0.2s;
+        }
+        .thread-action-button:hover { background-color: #eef5ff; color: #0056b3; border-color: #9fc5ff; }
 
         .preview-container {
             margin-top: 10px; padding: 10px; border-radius: 4px; border: 1px solid #e4e7ed;
@@ -72,6 +77,12 @@
         }
 
         .preview-status-text { color: #666; font-size: 12px; font-weight: bold; margin-bottom: 8px; grid-column: 1 / -1; }
+        .preview-more-button {
+            grid-column: 1 / -1; justify-self: start; padding: 4px 10px; border: 1px solid #cfd6df;
+            border-radius: 4px; cursor: pointer; background-color: #fff; color: #333; font-size: 12px;
+        }
+        .preview-more-button:hover:not(:disabled) { background-color: #eef5ff; border-color: #9fc5ff; }
+        .preview-more-button:disabled { cursor: wait; opacity: 0.7; }
 
         /* 进度条 */
         .progress-container {
@@ -131,6 +142,8 @@
             .preview-container { background-color: #1e1e1e; border-color: #333; }
             .preview-button { background-color: #333; color: #ccc; border-color: #555; }
             .preview-button:hover:not(:disabled) { background-color: #444; }
+            .thread-action-button, .preview-more-button { background-color: #2d2d2d; color: #ccc; border-color: #555; }
+            .thread-action-button:hover, .preview-more-button:hover:not(:disabled) { background-color: #3a3a3a; color: #fff; }
             .preview-img-item, .preview-img-loading { border-color: #444; background-color: #222; }
             .thread--visited { background-color: #2a2a2a !important; }
             .thread--viewed-images { background-color: #364136 !important; }
@@ -141,6 +154,8 @@
     const BASE_STORAGE_KEY = 'discuz_visited_threads';
     const MIN_DIMENSION = 200; // 图片最小尺寸阈值
     const MAX_HISTORY_RECORDS = 2000; // 最大保存帖子记录数
+    const PREVIEW_PAGE_BATCH_SIZE = 3; // 每次最多抓取 3 页
+    const PREVIEW_CACHE_TTL = 24 * 60 * 60 * 1000; // 预览缓存保留 24 小时
 
     // --- 工具函数 ---
 
@@ -235,6 +250,35 @@
         saveVisitedThreads(visited);
     }
 
+    function removeThreadData(threadId) {
+        if (!threadId) return;
+        const visited = getVisitedThreads();
+        delete visited[threadId];
+        saveVisitedThreads(visited);
+    }
+
+    function getThreadRecordStats(data = getVisitedThreads()) {
+        const keys = Object.keys(data);
+        let visitedCount = 0;
+        let viewedOnlyCount = 0;
+        let latestTs = 0;
+
+        keys.forEach(key => {
+            const record = data[key];
+            const normalized = record === true ? { visited: true, ts: 0 } : (record || {});
+            if (normalized.visited) visitedCount++;
+            if (!normalized.visited && normalized.viewedImages) viewedOnlyCount++;
+            if (normalized.ts && normalized.ts > latestTs) latestTs = normalized.ts;
+        });
+
+        return {
+            total: keys.length,
+            visitedCount,
+            viewedOnlyCount,
+            latestText: latestTs ? new Date(latestTs).toLocaleString() : '暂无记录'
+        };
+    }
+
     // --- 面板 UI ---
 
     function createModalBase(id, innerDomBuilder) {
@@ -253,7 +297,6 @@
     function showSettingsDialog() {
         createModalBase('image-preview-settings-modal', (content, closeFn) => {
             const enablePreview = GM_getValue('enable_preview', true);
-            const enableMultiPage = GM_getValue('enable_multipage_preview', false);
 
             const title = document.createElement('h3'); title.textContent = '图片预览设置';
 
@@ -261,15 +304,14 @@
             const chk1 = document.createElement('input'); chk1.type = 'checkbox'; chk1.checked = enablePreview;
             lbl1.appendChild(chk1); lbl1.appendChild(document.createTextNode(' 启用图片预览功能'));
 
-            const lbl2 = document.createElement('label');
-            const chk2 = document.createElement('input'); chk2.type = 'checkbox'; chk2.checked = enableMultiPage;
-            lbl2.appendChild(chk2); lbl2.appendChild(document.createTextNode(' 【可选】自动抓取多页帖子的所有图片'));
+            const tip = document.createElement('p');
+            tip.textContent = '多页帖子默认抓取前 3 页，可在预览区域继续追加后续页面。';
+            tip.style.cssText = 'font-size:12px; color:#777; text-align:left;';
 
             const saveBtn = document.createElement('button'); saveBtn.textContent = '保存并刷新'; saveBtn.className = 'custom-modal-btn';
 
             saveBtn.addEventListener('click', () => {
                 GM_setValue('enable_preview', chk1.checked);
-                GM_setValue('enable_multipage_preview', chk2.checked);
                 showTemporaryMessage('设置已保存，即将刷新页面。');
                 setTimeout(() => window.location.reload(), 1000);
             });
@@ -277,7 +319,7 @@
             const cancelBtn = document.createElement('button'); cancelBtn.textContent = '取消'; cancelBtn.className = 'custom-modal-btn secondary';
             cancelBtn.addEventListener('click', closeFn);
 
-            content.append(title, lbl1, lbl2, saveBtn, cancelBtn);
+            content.append(title, lbl1, tip, saveBtn, cancelBtn);
         });
     }
 
@@ -285,10 +327,15 @@
         createModalBase('data-management-modal', (content, closeFn) => {
             const data = getVisitedThreads();
             const keys = Object.keys(data);
+            const stats = getThreadRecordStats(data);
 
             const title = document.createElement('h3'); title.textContent = '已读记录数据管理';
-            const info = document.createElement('p'); info.textContent = `当前论坛域存储了 ${keys.length} 条帖子足迹`;
+            const info = document.createElement('p');
+            info.textContent = `当前论坛域存储了 ${keys.length} 条帖子足迹`;
             info.style.color = '#777'; info.style.marginBottom = '20px';
+            const statsInfo = document.createElement('p');
+            statsInfo.innerHTML = `已访问：${stats.visitedCount} 条<br>仅看图：${stats.viewedOnlyCount} 条<br>最近记录：${stats.latestText}<br>存储键：${STORAGE_KEY}`;
+            statsInfo.style.cssText = 'color:#777; font-size:12px; line-height:1.7; text-align:left; word-break:break-all;';
 
             const exportBtn = document.createElement('button'); exportBtn.textContent = '⬇️ 导出数据'; exportBtn.className = 'custom-modal-btn';
             exportBtn.addEventListener('click', () => {
@@ -356,7 +403,7 @@
                 }
             });
 
-            content.append(title, info, exportBtn, fileInput, importBtn, document.createElement('br'), cleanBtn, wipeBtn);
+            content.append(title, info, statsInfo, exportBtn, fileInput, importBtn, document.createElement('br'), cleanBtn, wipeBtn);
         });
     }
 
@@ -458,6 +505,7 @@
         threads.forEach(thread => {
             const threadId = thread.id.replace(/^(normalthread_|stickthread_)/, '');
             const threadData = visited[threadId];
+            thread.classList.remove('thread--visited', 'thread--viewed-images');
             if (!threadData) return;
 
             const isVisited = threadData === true || threadData.visited;
@@ -472,6 +520,19 @@
         });
     }
 
+    function refreshThreadMark(threadElement) {
+        if (!threadElement) return;
+        const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
+        const record = getVisitedThreads()[threadId];
+        threadElement.classList.remove('thread--visited', 'thread--viewed-images');
+        if (!record) return;
+        if (record === true || record.visited) {
+            threadElement.classList.add('thread--visited');
+        } else if (record.viewedImages) {
+            threadElement.classList.add('thread--viewed-images');
+        }
+    }
+
     function recordThreadVisit() {
         const threadId = getThreadIdFromUrl();
         if (threadId) updateThreadData(threadId, { visited: true });
@@ -480,11 +541,12 @@
     function extractImagesFromDoc(doc) {
         const validImages = [];
         const contentAreas = doc.querySelectorAll('.t_f, .t_fsz');
+        const attrNames = ['zoomfile', 'file', 'data-original', 'data-src', 'src'];
         contentAreas.forEach(area => {
-            const images = area.querySelectorAll('img[id^="aimg_"], img.zoom, img[src*="attachment"]');
+            const images = area.querySelectorAll('img[id^="aimg_"], img.zoom, img[src*="attachment"], img[file], img[zoomfile], img[data-original], img[data-src]');
             images.forEach(img => {
-                const src = img.getAttribute('file') || img.getAttribute('src') || img.getAttribute('zoomfile');
-                if (src && !src.includes('smilie') && !src.includes('clear.gif') && !src.includes('none.gif')) {
+                const src = attrNames.map(name => img.getAttribute(name)).find(Boolean);
+                if (src && !/smilie|clear\.gif|none\.gif|avatar|loading/i.test(src)) {
                     validImages.push(src);
                 }
             });
@@ -492,15 +554,116 @@
         return [...new Set(validImages)];
     }
 
+    function buildThreadPageUrl(threadUrl, page) {
+        const url = new URL(threadUrl, window.location.origin);
+        if (url.search) {
+            url.searchParams.set('page', String(page));
+            return url.href;
+        }
+
+        const path = url.pathname;
+        let nextPath = path.replace(/thread-(\d+)-(\d+)(-\d+)?\.html$/i, (all, tid, _page, extra = '') => `thread-${tid}-${page}${extra}.html`);
+        if (nextPath === path) {
+            nextPath = path.replace(/thread-(\d+)-(\d+)-(\d+)\.html$/i, (_all, tid, _page, archive) => `thread-${tid}-${page}-${archive}.html`);
+        }
+
+        if (nextPath !== path) {
+            url.pathname = nextPath;
+            return url.href;
+        }
+
+        url.searchParams.set('page', String(page));
+        return url.href;
+    }
+
+    function getMaxPageFromDoc(doc) {
+        const pgElement = doc.querySelector('.pg');
+        if (!pgElement) return 1;
+        let maxPage = 1;
+        pgElement.querySelectorAll('a, strong').forEach(node => {
+            const textPage = parseInt((node.textContent || '').replace(/\D/g, ''), 10);
+            if (textPage > maxPage) maxPage = textPage;
+            const href = node.getAttribute && node.getAttribute('href');
+            if (href) {
+                const hrefPage = href.match(/[?&]page=(\d+)/i) || href.match(/thread-\d+-(\d+)(?:-\d+)?\.html/i);
+                if (hrefPage) maxPage = Math.max(maxPage, parseInt(hrefPage[1], 10));
+            }
+        });
+        return maxPage;
+    }
+
+    function getPreviewCacheKey(threadId) {
+        return `discuz_preview_v5_${hostName}_${forumName}_${threadId}`;
+    }
+
+    function readPreviewCache(threadId) {
+        try {
+            const cached = JSON.parse(sessionStorage.getItem(getPreviewCacheKey(threadId)) || 'null');
+            if (!cached || cached.version !== 5 || cached.hostName !== hostName || cached.forumName !== forumName || cached.threadId !== threadId) return null;
+            if (Date.now() - (cached.cachedAt || 0) > PREVIEW_CACHE_TTL) return null;
+            return cached;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function writePreviewCache(threadId, cache) {
+        try {
+            sessionStorage.setItem(getPreviewCacheKey(threadId), JSON.stringify({
+                version: 5,
+                hostName,
+                forumName,
+                threadId,
+                cachedAt: Date.now(),
+                maxPage: cache.maxPage || 1,
+                pages: cache.pages || {}
+            }));
+        } catch (e) { }
+    }
+
+    function addThreadActionButton(threadElement, titleLink, threadId) {
+        if (threadElement.querySelector('.thread-action-button')) return;
+        const actionBtn = document.createElement('button');
+        actionBtn.type = 'button';
+        actionBtn.className = 'thread-action-button';
+
+        const updateLabel = () => {
+            const record = getVisitedThreads()[threadId];
+            actionBtn.textContent = record ? '清除足迹' : '标记已读';
+            actionBtn.title = record ? '清除此帖的已读/看图记录' : '将此帖标记为已读';
+        };
+
+        actionBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const record = getVisitedThreads()[threadId];
+            if (record) {
+                removeThreadData(threadId);
+                showTemporaryMessage('已清除此帖足迹。');
+            } else {
+                updateThreadData(threadId, { visited: true });
+                showTemporaryMessage('已标记为已读。');
+            }
+            refreshThreadMark(threadElement);
+            updateLabel();
+        });
+
+        updateLabel();
+        titleLink.insertAdjacentElement('afterend', actionBtn);
+    }
+
     function addPreviewButtonToThread(threadElement) {
-        if (threadElement.querySelector('.preview-button')) return;
         const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
         if (!titleLink) return;
 
         const threadUrl = titleLink.href;
         const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
 
+        addThreadActionButton(threadElement, titleLink, threadId);
+        if (threadElement.querySelector('.preview-button')) return;
+
         const button = document.createElement('button');
+        button.type = 'button';
         button.textContent = '预览图片';
         button.className = 'preview-button';
 
@@ -517,6 +680,11 @@
         const previewContainer = document.createElement('div');
         previewContainer.className = 'preview-container';
 
+        const moreBtn = document.createElement('button');
+        moreBtn.type = 'button';
+        moreBtn.className = 'preview-more-button';
+        moreBtn.style.display = 'none';
+
         statusBar.append(statusText, progressContainer);
         previewContainer.append(statusBar);
         previewOuter.appendChild(previewContainer);
@@ -525,7 +693,205 @@
         const titleCell = titleLink.closest('th');
         if (titleCell) titleCell.appendChild(previewOuter);
 
-        let validCountForTitle = 0; // 一旦成功加载完毕，将按钮标题固化
+        let validCountForTitle = 0;
+        let cache = readPreviewCache(threadId) || { maxPage: 1, pages: {} };
+        let loadedPageUntil = 0;
+        let maxPage = cache.maxPage || 1;
+        let pendingCount = 0;
+        let checkedCount = 0;
+        const renderedSrcSet = new Set();
+
+        const updateButtonLabel = () => {
+            if (previewContainer.dataset.error === 'true') {
+                button.textContent = '获取失败';
+            } else if (previewOuter.style.display !== 'none') {
+                button.textContent = '隐藏图片';
+            } else if (validCountForTitle > 0) {
+                button.textContent = `预览图片 (${validCountForTitle})`;
+            } else if (previewContainer.dataset.loaded === 'true') {
+                button.textContent = '无图片';
+            } else {
+                button.textContent = '预览图片';
+            }
+        };
+
+        const updateMoreButton = () => {
+            if (loadedPageUntil < maxPage) {
+                const nextStart = loadedPageUntil + 1;
+                const nextEnd = Math.min(maxPage, loadedPageUntil + PREVIEW_PAGE_BATCH_SIZE);
+                moreBtn.textContent = `继续抓取后 ${nextEnd - nextStart + 1} 页（${nextStart}-${nextEnd}/${maxPage}）`;
+                moreBtn.style.display = '';
+            } else {
+                moreBtn.style.display = 'none';
+            }
+        };
+
+        const updateStatus = () => {
+            if (pendingCount > 0) {
+                statusText.textContent = `正在逐步呈现图片... (剩余 ${pendingCount} 张待查，符合要求展示 ${validCountForTitle} 张)`;
+            } else if (validCountForTitle > 0) {
+                statusText.textContent = `已抓取 ${loadedPageUntil}/${maxPage} 页，共加载 ${validCountForTitle} 张图片。`;
+            } else if (checkedCount > 0) {
+                statusText.textContent = '没有满足尺寸要求的图片。';
+            } else {
+                statusText.textContent = loadedPageUntil < maxPage ? `前 ${loadedPageUntil} 页未发现图片，可继续抓取后续页面。` : '该帖子内没有发现图片。';
+            }
+            updateMoreButton();
+            updateButtonLabel();
+        };
+
+        const appendImagePlaceholders = (srcList) => {
+            const uniqueList = srcList.filter(src => {
+                if (renderedSrcSet.has(src)) return false;
+                renderedSrcSet.add(src);
+                return true;
+            });
+
+            if (uniqueList.length === 0) {
+                updateStatus();
+                return;
+            }
+
+            pendingCount += uniqueList.length;
+            checkedCount += uniqueList.length;
+
+            const observer = new IntersectionObserver((entries, obs) => {
+                entries.forEach(entry => {
+                    if (!entry.isIntersecting) return;
+                    const placeholder = entry.target;
+                    obs.unobserve(placeholder);
+
+                    const imgSrc = placeholder.dataset.src;
+                    const finalSrc = (!imgSrc.startsWith('http') && !imgSrc.startsWith('//')) ? new URL(imgSrc, threadUrl).href : imgSrc;
+                    const tempImg = new Image();
+                    let isHandled = false;
+
+                    const finish = (shouldShow) => {
+                        if (isHandled) return;
+                        isHandled = true;
+                        if (shouldShow) {
+                            validCountForTitle++;
+                            const previewImg = document.createElement('img');
+                            previewImg.src = finalSrc;
+                            previewImg.className = 'preview-img-item';
+                            previewImg.style.aspectRatio = `${tempImg.naturalWidth} / ${tempImg.naturalHeight}`;
+                            previewImg.addEventListener('click', (evt) => {
+                                evt.stopPropagation();
+                                const allImgs = Array.from(previewContainer.querySelectorAll('.preview-img-item'));
+                                const urls = allImgs.map(img => img.src);
+                                const idx = allImgs.indexOf(previewImg);
+                                openLightbox(urls, idx);
+                            });
+                            placeholder.replaceWith(previewImg);
+                        } else {
+                            placeholder.remove();
+                        }
+                        pendingCount--;
+                        progressBarFill.style.width = checkedCount ? `${Math.min(95, 40 + 55 * ((checkedCount - pendingCount) / checkedCount))}%` : '95%';
+                        if (pendingCount === 0) progressContainer.style.display = 'none';
+                        updateStatus();
+                    };
+
+                    const pollDimension = () => {
+                        if (isHandled) return;
+                        if (tempImg.naturalWidth > 0 && tempImg.naturalHeight > 0) {
+                            finish(tempImg.naturalWidth >= MIN_DIMENSION && tempImg.naturalHeight >= MIN_DIMENSION);
+                        } else {
+                            requestAnimationFrame(pollDimension);
+                        }
+                    };
+
+                    requestAnimationFrame(pollDimension);
+                    tempImg.onload = () => finish(tempImg.naturalWidth >= MIN_DIMENSION && tempImg.naturalHeight >= MIN_DIMENSION);
+                    tempImg.onerror = () => finish(false);
+                    tempImg.src = finalSrc;
+                });
+            }, { root: previewOuter, rootMargin: '400px 0px', threshold: 0.01 });
+
+            uniqueList.forEach(imgSrc => {
+                const placeholder = document.createElement('div');
+                placeholder.className = 'preview-img-loading';
+                placeholder.textContent = '等待呈现...';
+                placeholder.dataset.src = imgSrc;
+                previewContainer.appendChild(placeholder);
+                observer.observe(placeholder);
+            });
+            updateStatus();
+        };
+
+        const fetchPageImages = async (page) => {
+            if (cache.pages[page]) return cache.pages[page];
+            statusText.textContent = `正在拉取第 ${page} 页...`;
+            progressContainer.style.display = 'block';
+            progressBarFill.style.width = `${Math.min(80, 15 + page * 15)}%`;
+
+            const response = await fetch(buildThreadPageUrl(threadUrl, page));
+            if (!response.ok) throw new Error(`第 ${page} 页 HTTP Error: ${response.status}`);
+            const text = await response.text();
+            const doc = new DOMParser().parseFromString(text, 'text/html');
+            const srcList = extractImagesFromDoc(doc);
+            cache.pages[page] = srcList;
+            if (page === 1) {
+                maxPage = getMaxPageFromDoc(doc);
+                cache.maxPage = maxPage;
+            }
+            writePreviewCache(threadId, cache);
+            return srcList;
+        };
+
+        const loadPageBatch = async (startPage) => {
+            if (previewContainer.dataset.loading === 'true') return;
+            previewContainer.dataset.loading = 'true';
+            delete previewContainer.dataset.error;
+            button.disabled = true;
+            moreBtn.disabled = true;
+            progressContainer.style.display = 'block';
+            progressBarFill.style.width = '10%';
+
+            try {
+                if (startPage === 1 || !cache.pages[1]) {
+                    await fetchPageImages(1);
+                }
+                maxPage = cache.maxPage || maxPage || 1;
+
+                const actualStart = Math.max(startPage, loadedPageUntil + 1, 1);
+                const endPage = Math.min(maxPage, actualStart + PREVIEW_PAGE_BATCH_SIZE - 1);
+                const batchImages = [];
+                for (let page = actualStart; page <= endPage; page++) {
+                    batchImages.push(...await fetchPageImages(page));
+                    loadedPageUntil = Math.max(loadedPageUntil, page);
+                }
+
+                if (startPage === 1 && loadedPageUntil < Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE)) {
+                    loadedPageUntil = Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE);
+                }
+
+                appendImagePlaceholders([...new Set(batchImages)]);
+                previewContainer.dataset.loaded = 'true';
+                delete previewContainer.dataset.error;
+                updateThreadData(threadId, { viewedImages: true });
+                refreshThreadMark(threadElement);
+                const actionBtn = threadElement.querySelector('.thread-action-button');
+                if (actionBtn) {
+                    actionBtn.textContent = '清除足迹';
+                    actionBtn.title = '清除此帖的已读/看图记录';
+                }
+                progressBarFill.style.width = '95%';
+                if (pendingCount === 0) progressContainer.style.display = 'none';
+                updateStatus();
+            } catch (err) {
+                console.error('[Discuz Marker] fetch images fail', err);
+                previewContainer.dataset.error = 'true';
+                statusText.textContent = `获取数据失败: ${err.message}`;
+                progressContainer.style.display = 'none';
+                button.textContent = '获取失败';
+            } finally {
+                button.disabled = false;
+                moreBtn.disabled = false;
+                delete previewContainer.dataset.loading;
+                updateButtonLabel();
+            }
+        };
 
         button.addEventListener('click', async (e) => {
             e.preventDefault(); e.stopPropagation();
@@ -533,196 +899,35 @@
             const isDisplayed = previewOuter.style.display !== 'none';
             if (previewContainer.dataset.loaded === "true") {
                 previewOuter.style.display = isDisplayed ? 'none' : 'block';
-                button.textContent = isDisplayed ? (validCountForTitle > 0 ? `预览图片 (${validCountForTitle})` : '无图片') : '隐藏图片';
+                updateButtonLabel();
                 return;
             }
 
-            if (previewContainer.dataset.loading === "true") return;
-
-            button.textContent = '获取中...';
-            button.disabled = true;
-            previewContainer.dataset.loading = "true";
             previewOuter.style.display = 'block';
-            statusText.textContent = '正在获取帖子数据...';
-            progressContainer.style.display = 'block';
-            progressBarFill.style.width = '10%';
-
-            try {
-                let validSrcList = [];
-                const cacheKey = `discuz_preview_v4_${threadId}`;
-                const cached = sessionStorage.getItem(cacheKey);
-
-                if (cached) {
-                    validSrcList = JSON.parse(cached);
-                    statusText.textContent = '从缓存读取成功，正在加载...';
-                    progressBarFill.style.width = '50%';
-                } else {
-                    const response = await fetch(threadUrl);
-                    if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
-                    const text = await response.text();
-                    const doc = new DOMParser().parseFromString(text, 'text/html');
-                    validSrcList = extractImagesFromDoc(doc);
-                    progressBarFill.style.width = '40%';
-
-                    const enableMultiPage = GM_getValue('enable_multipage_preview', false);
-                    if (enableMultiPage) {
-                        const pgElement = doc.querySelector('.pg');
-                        if (pgElement) {
-                            const lastLink = pgElement.querySelector('.last') || pgElement.querySelector('a:nth-last-child(2)');
-                            if (lastLink) {
-                                const maxPageMatch = lastLink.href.match(/page=(\d+)/) || lastLink.href.match(/-(\d+)\.html/);
-                                const maxPage = maxPageMatch ? parseInt(maxPageMatch[1], 10) : 1;
-
-                                if (maxPage > 1) {
-                                    for (let i = 2; i <= maxPage; i++) {
-                                        statusText.textContent = `正在拉取第 ${i}/${maxPage} 页...`;
-                                        progressBarFill.style.width = `${40 + 40 * (i / maxPage)}%`;
-                                        try {
-                                            const pageUrl = threadUrl.includes('?') ? `${threadUrl}&page=${i}` : threadUrl.replace(/-1\.html$/, `-${i}.html`);
-                                            const pRes = await fetch(pageUrl);
-                                            const pText = await pRes.text();
-                                            const pDoc = new DOMParser().parseFromString(pText, 'text/html');
-                                            const pSrcList = extractImagesFromDoc(pDoc);
-                                            validSrcList = [...validSrcList, ...pSrcList];
-                                        } catch (err) { console.error('fetch page err', err); }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    validSrcList = [...new Set(validSrcList)];
-                    try { sessionStorage.setItem(cacheKey, JSON.stringify(validSrcList)); } catch (e) { }
-                }
-
-                if (validSrcList.length === 0) {
-                    statusText.textContent = '该帖子内没有发现图片。';
-                    button.textContent = '无图片';
-                    button.style.cssText = 'background-color:#f5f5f5; color:#aaa; cursor:not-allowed;';
-                    previewContainer.dataset.loaded = "true";
-                    progressContainer.style.display = 'none';
-                    return;
-                }
-
-                let pendingCount = validSrcList.length;
-                let loadedCount = 0;
-
-                const updateCountDisplay = () => {
-                    if (pendingCount === 0) {
-                        statusText.textContent = loadedCount === 0 ? '没有满足尺寸要求的图片。' : `共加载 ${loadedCount} 张图片。`;
-                        progressContainer.style.display = 'none';
-                        button.textContent = loadedCount > 0 ? '隐藏图片' : '无大图';
-                        validCountForTitle = loadedCount;
-                    } else {
-                        statusText.textContent = `正在逐步呈现图片... (剩余 ${pendingCount} 张待查，符合要求展示 ${loadedCount} 张)`;
-                    }
-                };
-
-                const observer = new IntersectionObserver((entries, obs) => {
-                    entries.forEach(entry => {
-                        if (entry.isIntersecting) {
-                            const placeholder = entry.target;
-                            obs.unobserve(placeholder);
-
-                            const imgSrc = placeholder.dataset.src;
-                            const finalSrc = (!imgSrc.startsWith('http') && !imgSrc.startsWith('//')) ? new URL(imgSrc, threadUrl).href : imgSrc;
-
-                            const tempImg = new Image();
-                            let isHandled = false;
-
-                            const replaceDom = () => {
-                                loadedCount++;
-                                const previewImg = document.createElement('img');
-                                previewImg.src = finalSrc;
-                                previewImg.className = 'preview-img-item';
-                                previewImg.style.aspectRatio = `${tempImg.naturalWidth} / ${tempImg.naturalHeight}`;
-
-                                previewImg.addEventListener('click', (evt) => {
-                                    evt.stopPropagation();
-                                    const allImgs = Array.from(previewContainer.querySelectorAll('.preview-img-item'));
-                                    const urls = allImgs.map(img => img.src);
-                                    const idx = allImgs.indexOf(previewImg);
-                                    openLightbox(urls, idx);
-                                });
-
-                                placeholder.replaceWith(previewImg);
-                                progressBarFill.style.width = `${80 + 20 * (loadedCount / validSrcList.length)}%`;
-                            };
-
-                            const pollDimension = () => {
-                                if (isHandled) return;
-                                if (tempImg.naturalWidth > 0 && tempImg.naturalHeight > 0) {
-                                    isHandled = true;
-                                    if (tempImg.naturalWidth >= MIN_DIMENSION && tempImg.naturalHeight >= MIN_DIMENSION) {
-                                        replaceDom();
-                                    } else {
-                                        placeholder.remove();
-                                    }
-                                    pendingCount--;
-                                    updateCountDisplay();
-                                } else {
-                                    requestAnimationFrame(pollDimension);
-                                }
-                            };
-
-                            requestAnimationFrame(pollDimension);
-
-                            tempImg.onload = () => {
-                                if (!isHandled) {
-                                    isHandled = true;
-                                    if (tempImg.naturalWidth >= MIN_DIMENSION && tempImg.naturalHeight >= MIN_DIMENSION) replaceDom();
-                                    else placeholder.remove();
-                                    pendingCount--;
-                                    updateCountDisplay();
-                                }
-                            };
-
-                            tempImg.onerror = () => {
-                                if (!isHandled) {
-                                    isHandled = true;
-                                    placeholder.remove();
-                                    pendingCount--;
-                                    updateCountDisplay();
-                                }
-                            };
-
-                            tempImg.src = finalSrc;
-                        }
-                    });
-                }, { root: previewOuter, rootMargin: '400px 0px', threshold: 0.01 });
-
-                validSrcList.forEach(imgSrc => {
-                    const placeholder = document.createElement('div');
-                    placeholder.className = 'preview-img-loading';
-                    placeholder.textContent = '等待呈现...';
-                    placeholder.dataset.src = imgSrc;
-                    previewContainer.appendChild(placeholder);
-                    observer.observe(placeholder);
-                });
-
-                progressBarFill.style.width = '80%';
-                button.disabled = false;
-                button.textContent = '隐藏图片';
-                previewContainer.dataset.loaded = "true";
-                delete previewContainer.dataset.loading;
-
-                updateThreadData(threadId, { viewedImages: true });
-                if (!threadElement.classList.contains('thread--visited')) {
-                    threadElement.classList.add('thread--viewed-images');
-                }
-
-            } catch (err) {
-                console.error('[Discuz Marker] fetch images fail', err);
-                statusText.textContent = `获取数据失败: ${err.message}`;
-                progressContainer.style.display = 'none';
-                button.textContent = '获取失败';
-                button.disabled = false;
-                delete previewContainer.dataset.loading;
-            }
+            button.textContent = '获取中...';
+            await loadPageBatch(1);
         });
+
+        moreBtn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            await loadPageBatch(loadedPageUntil + 1);
+        });
+
+        previewContainer.appendChild(moreBtn);
     }
 
     function addPreviewButtons() {
         document.querySelectorAll('tbody[id^="normalthread_"], tbody[id^="stickthread_"]').forEach(addPreviewButtonToThread);
+    }
+
+    function addThreadActionButtons() {
+        document.querySelectorAll('tbody[id^="normalthread_"], tbody[id^="stickthread_"]').forEach(threadElement => {
+            const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
+            if (!titleLink) return;
+            const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
+            addThreadActionButton(threadElement, titleLink, threadId);
+        });
     }
 
     function observeNewThreads() {
@@ -734,6 +939,8 @@
                 if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
                     mutation.addedNodes.forEach((node) => {
                         if (node.tagName === 'TBODY' && (node.id.startsWith('normalthread_') || node.id.startsWith('stickthread_'))) {
+                            const titleLink = node.querySelector('th a.s.xst') || node.querySelector('th a.xst');
+                            if (titleLink) addThreadActionButton(node, titleLink, node.id.replace(/^(normalthread_|stickthread_)/, ''));
                             if (enablePreview) addPreviewButtonToThread(node);
                         }
                     });
@@ -741,6 +948,8 @@
                         pendingUpdate = true;
                         setTimeout(() => {
                             markThreadsOnListPage();
+                            addThreadActionButtons();
+                            if (enablePreview) addPreviewButtons();
                             pendingUpdate = false;
                         }, 50);
                     }
@@ -757,6 +966,7 @@
 
     if (currentUrl.includes('mod=forumdisplay') || currentUrl.includes('forum-')) {
         markThreadsOnListPage();
+        addThreadActionButtons();
 
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'visible') markThreadsOnListPage();
