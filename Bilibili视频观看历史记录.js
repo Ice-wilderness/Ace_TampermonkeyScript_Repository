@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.14
+// @version      3.1.15
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -57,7 +57,8 @@
     const BACKUP_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
     const BACKUP_MAX_COUNT = 200;
     const HEADER_SELECTOR = '#biliMainHeader, .bili-header, .bili-header__bar, .mini-header, .international-header';
-    const DOM_START_DELAY = 2500;
+    const DOM_START_FALLBACK_DELAY = 3000;
+    const DOM_IDLE_TIMEOUT = 800;
     const ACTION_LIST_ITEM_SELECTOR = '.action-list-item-wrap[data-key]';
     const PLAYLIST_ITEM_SELECTOR = `${ACTION_LIST_ITEM_SELECTOR}, .video-pod__item[data-key], .bpx-player-ctrl-eplist-multi-menu-item[data-cid], .video-pod__list.section .simple-base-item.page-item`;
 
@@ -1985,7 +1986,8 @@
         }
 
         start() {
-            Utils.log('Script started v3.1.13');
+            const currentVersion = typeof GM_info !== 'undefined' ? (GM_info.script?.version || 'unknown') : 'unknown';
+            Utils.log(`Script started v${currentVersion}`);
 
             // 数据迁移（v1/v2 → v3 分片，仅首次执行）
             StorageManager.migrateIfNeeded();
@@ -1998,16 +2000,51 @@
         }
 
         deferDomStart() {
-            const run = () => {
-                setTimeout(() => this.startDomPhase(), DOM_START_DELAY);
+            const startWhenIdle = (reason) => {
+                if (this._domStarted) return;
+                Utils.log('DOM phase scheduled:', reason);
+                const start = () => this.startDomPhase();
+                if (typeof requestIdleCallback === 'function') {
+                    requestIdleCallback(start, { timeout: DOM_IDLE_TIMEOUT });
+                } else {
+                    setTimeout(start, 0);
+                }
             };
-            if (document.readyState === 'complete') {
-                run();
+
+            const waitForHeader = () => {
+                if (this._domStarted) return;
+                if (document.querySelector(HEADER_SELECTOR)) {
+                    startWhenIdle('header ready');
+                    return;
+                }
+
+                let observer = null;
+                let fallbackTimer = null;
+                const cleanup = () => {
+                    if (observer) observer.disconnect();
+                    if (fallbackTimer) clearTimeout(fallbackTimer);
+                };
+                const scheduleStart = (reason) => {
+                    cleanup();
+                    startWhenIdle(reason);
+                };
+
+                observer = new MutationObserver(() => {
+                    if (document.querySelector(HEADER_SELECTOR)) {
+                        scheduleStart('header mounted');
+                    }
+                });
+                observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+
+                fallbackTimer = setTimeout(() => {
+                    scheduleStart('header wait timeout');
+                }, DOM_START_FALLBACK_DELAY);
+            };
+
+            if (document.readyState === 'loading') {
+                document.addEventListener('DOMContentLoaded', waitForHeader, { once: true });
             } else {
-                window.addEventListener('load', run, { once: true });
-                setTimeout(() => {
-                    if (!this._domStarted) this.startDomPhase();
-                }, DOM_START_DELAY + 3000);
+                waitForHeader();
             }
         }
 
