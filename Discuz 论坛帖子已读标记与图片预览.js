@@ -2,8 +2,8 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           4.2.0
-// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，可选图片预览功能。支持图片分批抓取、稳定分页、结构化缓存、单帖足迹管理、列表瀑布流和灯箱查看。
+// @version           4.2.1
+// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，可选图片预览功能。支持图片分批抓取、稳定分页、结构化缓存、列表瀑布流和灯箱查看。
 // @description:en    Marks visited threads in Discuz! forum lists and optionally adds image preview. Uses progressive rendering for fast image previews and auto-cleans old data.
 // @author            Ice_wilderness
 // @match             *://*/*forum.php?mod=forumdisplay*
@@ -64,12 +64,6 @@
             cursor: pointer; background-color: #f9f9f9; font-size: 12px; color: #333; transition: all 0.2s;
         }
         .preview-button:hover:not(:disabled) { background-color: #e0e0e0; }
-        .thread-action-button {
-            margin-left: 5px; padding: 2px 6px; border: 1px solid #dcdcdc; border-radius: 4px;
-            cursor: pointer; background-color: #fff; font-size: 12px; color: #666; transition: all 0.2s;
-        }
-        .thread-action-button:hover { background-color: #eef5ff; color: #0056b3; border-color: #9fc5ff; }
-
         .preview-container {
             margin-top: 10px; padding: 10px; border-radius: 4px; border: 1px solid #e4e7ed;
             background-color: #f0f2f5; line-height: 1.5; max-height: 50vh; overflow-y: auto; overflow-x: hidden;
@@ -142,8 +136,8 @@
             .preview-container { background-color: #1e1e1e; border-color: #333; }
             .preview-button { background-color: #333; color: #ccc; border-color: #555; }
             .preview-button:hover:not(:disabled) { background-color: #444; }
-            .thread-action-button, .preview-more-button { background-color: #2d2d2d; color: #ccc; border-color: #555; }
-            .thread-action-button:hover, .preview-more-button:hover:not(:disabled) { background-color: #3a3a3a; color: #fff; }
+            .preview-more-button { background-color: #2d2d2d; color: #ccc; border-color: #555; }
+            .preview-more-button:hover:not(:disabled) { background-color: #3a3a3a; color: #fff; }
             .preview-img-item, .preview-img-loading { border-color: #444; background-color: #222; }
             .thread--visited { background-color: #2a2a2a !important; }
             .thread--viewed-images { background-color: #364136 !important; }
@@ -247,13 +241,6 @@
             ...patch,
             ts: Date.now()
         };
-        saveVisitedThreads(visited);
-    }
-
-    function removeThreadData(threadId) {
-        if (!threadId) return;
-        const visited = getVisitedThreads();
-        delete visited[threadId];
         saveVisitedThreads(visited);
     }
 
@@ -621,37 +608,6 @@
         } catch (e) { }
     }
 
-    function addThreadActionButton(threadElement, titleLink, threadId) {
-        if (threadElement.querySelector('.thread-action-button')) return;
-        const actionBtn = document.createElement('button');
-        actionBtn.type = 'button';
-        actionBtn.className = 'thread-action-button';
-
-        const updateLabel = () => {
-            const record = getVisitedThreads()[threadId];
-            actionBtn.textContent = record ? '清除足迹' : '标记已读';
-            actionBtn.title = record ? '清除此帖的已读/看图记录' : '将此帖标记为已读';
-        };
-
-        actionBtn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            const record = getVisitedThreads()[threadId];
-            if (record) {
-                removeThreadData(threadId);
-                showTemporaryMessage('已清除此帖足迹。');
-            } else {
-                updateThreadData(threadId, { visited: true });
-                showTemporaryMessage('已标记为已读。');
-            }
-            refreshThreadMark(threadElement);
-            updateLabel();
-        });
-
-        updateLabel();
-        titleLink.insertAdjacentElement('afterend', actionBtn);
-    }
-
     function addPreviewButtonToThread(threadElement) {
         const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
         if (!titleLink) return;
@@ -659,7 +615,6 @@
         const threadUrl = titleLink.href;
         const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
 
-        addThreadActionButton(threadElement, titleLink, threadId);
         if (threadElement.querySelector('.preview-button')) return;
 
         const button = document.createElement('button');
@@ -871,11 +826,6 @@
                 delete previewContainer.dataset.error;
                 updateThreadData(threadId, { viewedImages: true });
                 refreshThreadMark(threadElement);
-                const actionBtn = threadElement.querySelector('.thread-action-button');
-                if (actionBtn) {
-                    actionBtn.textContent = '清除足迹';
-                    actionBtn.title = '清除此帖的已读/看图记录';
-                }
                 progressBarFill.style.width = '95%';
                 if (pendingCount === 0) progressContainer.style.display = 'none';
                 updateStatus();
@@ -921,15 +871,6 @@
         document.querySelectorAll('tbody[id^="normalthread_"], tbody[id^="stickthread_"]').forEach(addPreviewButtonToThread);
     }
 
-    function addThreadActionButtons() {
-        document.querySelectorAll('tbody[id^="normalthread_"], tbody[id^="stickthread_"]').forEach(threadElement => {
-            const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
-            if (!titleLink) return;
-            const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
-            addThreadActionButton(threadElement, titleLink, threadId);
-        });
-    }
-
     function observeNewThreads() {
         const threadListTable = document.getElementById('threadlisttableid');
         if (!threadListTable) return;
@@ -939,8 +880,6 @@
                 if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
                     mutation.addedNodes.forEach((node) => {
                         if (node.tagName === 'TBODY' && (node.id.startsWith('normalthread_') || node.id.startsWith('stickthread_'))) {
-                            const titleLink = node.querySelector('th a.s.xst') || node.querySelector('th a.xst');
-                            if (titleLink) addThreadActionButton(node, titleLink, node.id.replace(/^(normalthread_|stickthread_)/, ''));
                             if (enablePreview) addPreviewButtonToThread(node);
                         }
                     });
@@ -948,7 +887,6 @@
                         pendingUpdate = true;
                         setTimeout(() => {
                             markThreadsOnListPage();
-                            addThreadActionButtons();
                             if (enablePreview) addPreviewButtons();
                             pendingUpdate = false;
                         }, 50);
@@ -966,7 +904,6 @@
 
     if (currentUrl.includes('mod=forumdisplay') || currentUrl.includes('forum-')) {
         markThreadsOnListPage();
-        addThreadActionButtons();
 
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'visible') markThreadsOnListPage();
