@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.13
+// @version      3.1.14
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -58,7 +58,8 @@
     const BACKUP_MAX_COUNT = 200;
     const HEADER_SELECTOR = '#biliMainHeader, .bili-header, .bili-header__bar, .mini-header, .international-header';
     const DOM_START_DELAY = 2500;
-    const PLAYLIST_ITEM_SELECTOR = '.action-list-item-wrap[data-key], .video-pod__item[data-key], .bpx-player-ctrl-eplist-multi-menu-item[data-cid], .video-pod__list.section .simple-base-item.page-item';
+    const ACTION_LIST_ITEM_SELECTOR = '.action-list-item-wrap[data-key]';
+    const PLAYLIST_ITEM_SELECTOR = `${ACTION_LIST_ITEM_SELECTOR}, .video-pod__item[data-key], .bpx-player-ctrl-eplist-multi-menu-item[data-cid], .video-pod__list.section .simple-base-item.page-item`;
 
     const VideoKey = {
         fromUrl: (value) => {
@@ -116,6 +117,8 @@
         .bvh-tag-small { margin: .2em!important; padding: 0 4px!important; height: 18px; line-height: 18px; font-size: 10px; }
         .bvh-tag-big { height: 22px; line-height: 23px; font-size: 14px; }
         .bvh-episode-tag { display: inline-block; margin-left: 6px; padding: 0 4px; height: 16px; line-height: 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 600; vertical-align: middle; white-space: nowrap; pointer-events: none; }
+        .action-list-item-wrap .cover, .action-list-item-wrap .cover-img { position: relative; }
+        .bvh-action-list-cover-tag { z-index: 109 !important; }
         .video-pod__list.grid .video-pod__item.page { position: relative; }
         .bvh-episode-tag-grid { position: absolute; top: 2px; right: 2px; margin: 0; padding: 0 3px; min-width: 14px; max-width: 30px; height: 14px; line-height: 14px; font-size: 9px; text-align: center; overflow: hidden; text-overflow: ellipsis; }
         .bpx-player-ctrl-eplist-multi-menu-item .bvh-episode-tag { margin-left: 8px; transform: translateY(-1px); }
@@ -278,10 +281,17 @@
                 const key = VideoKey.fromText(el.getAttribute('data-key'));
                 if (key) {
                     const page = VideoKey.page(key);
-                    const cid = `legacy-${page}`;
+                    const cid = `action-list:${key}`;
                     if (!seen.has(cid)) {
                         seen.add(cid);
-                        items.push({ el, cid, page, title: (el.innerText || '').trim() });
+                        items.push({
+                            el,
+                            cid,
+                            page,
+                            key,
+                            base: VideoKey.base(key),
+                            title: (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.innerText || el.innerText || '').trim()
+                        });
                     }
                 }
             });
@@ -1544,8 +1554,13 @@
                         if (target.nodeType === Node.ELEMENT_NODE && target.closest('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
                             shouldRefreshFavoriteCards = true;
                         }
-                        if (target.nodeType === Node.ELEMENT_NODE && target.matches && target.matches(PLAYLIST_ITEM_SELECTOR)) {
-                            addedPlaylistItems.push(target);
+                        if (target.nodeType === Node.ELEMENT_NODE && target.matches) {
+                            const playlistItem = target.matches(PLAYLIST_ITEM_SELECTOR)
+                                ? target
+                                : target.closest?.(ACTION_LIST_ITEM_SELECTOR);
+                            if (playlistItem) {
+                                addedPlaylistItems.push(playlistItem);
+                            }
                         }
                     }
 
@@ -1581,7 +1596,10 @@
                     }
                 });
                 addedLinks.forEach(link => this.observeLink(link));
-                addedPlaylistItems.forEach(item => this.observePlaylistItem(item));
+                addedPlaylistItems.forEach(item => {
+                    this.observePlaylistItem(item);
+                    this.processPlaylistItem(item);
+                });
                 if (shouldRefreshFavoriteCards) {
                     this.scheduleFavoriteRefresh();
                 }
@@ -1607,7 +1625,10 @@
             links.forEach(link => this.observeLink(link));
             // 合集播放列表项
             const playlistItems = document.querySelectorAll(PLAYLIST_ITEM_SELECTOR);
-            playlistItems.forEach(item => this.observePlaylistItem(item));
+            playlistItems.forEach(item => {
+                this.observePlaylistItem(item);
+                this.processPlaylistItem(item);
+            });
             this.refreshFavoriteCards();
         }
 
@@ -1725,17 +1746,17 @@
                 if (!key) return null;
                 return {
                     el,
-                    cid: el.getAttribute('data-key'),
+                    cid: `action-list:${key}`,
                     page: VideoKey.page(key),
                     base: VideoKey.base(key),
                     key,
-                    title: (el.innerText || '').trim()
+                    title: (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.innerText || el.innerText || '').trim()
                 };
             }
             return null;
         }
 
-        createEpisodeTag(record, compact = false) {
+        getRecordTagColorClass(record) {
             let tagColorClass = 'bvh-tag-visited';
             if (record.status === RECORD_STATUS.WATCHED && record.percent) {
                 const p = parseInt(record.percent);
@@ -1745,6 +1766,11 @@
                     else tagColorClass = 'bvh-tag-high';
                 }
             }
+            return tagColorClass;
+        }
+
+        createEpisodeTag(record, compact = false) {
+            const tagColorClass = this.getRecordTagColorClass(record);
             const tagEl = document.createElement('span');
             tagEl.className = `bvh-episode-tag ${tagColorClass}${compact ? ' bvh-episode-tag-grid' : ''}`;
             if (compact) {
@@ -1766,14 +1792,43 @@
             return tagEl;
         }
 
+        createPlaylistCoverTag(record) {
+            const tagText = `${record.status}${record.percent || ''}`;
+            const tagTitle = `${record.status}${record.percent || ''}${record.savedAt ? ` ${record.savedAt}` : ''}`;
+            return UIComponent.createTag(tagText, tagTitle, `bvh-tag ${this.getRecordTagColorClass(record)} bvh-action-list-cover-tag`);
+        }
+
         processPlaylistItem(el) {
             const item = this.getPlaylistItemInfo(el);
             if (!item?.key) return;
 
             let record = StorageManager.getRecord(item.key);
-            el.querySelectorAll('.bvh-episode-tag').forEach(tag => tag.remove());
+            const isActionListItem = el.matches(ACTION_LIST_ITEM_SELECTOR);
+            el.querySelectorAll(isActionListItem ? '.bvh-episode-tag, .bvh-action-list-cover-tag' : '.bvh-episode-tag').forEach(tag => tag.remove());
             if (!record) return;
             if (record.status === RECORD_STATUS.VISITED && !CONFIG.showVisitedTag) {
+                return;
+            }
+
+            if (isActionListItem) {
+                const coverImg = el.querySelector('.cover .cover-img');
+                const coverTarget = coverImg || el.querySelector('.cover');
+                if (!coverTarget || (!coverImg && !coverTarget.querySelector('img, picture'))) {
+                    if (!el._bvhActionListRetryCount) el._bvhActionListRetryCount = 0;
+                    if (el._bvhActionListRetryCount < 5) {
+                        el._bvhActionListRetryCount++;
+                        setTimeout(() => this.processPlaylistItem(el), 600);
+                    }
+                    return;
+                }
+                el._bvhActionListRetryCount = 0;
+                const tagEl = this.createPlaylistCoverTag(record);
+                const firstMedia = coverTarget.querySelector('img, picture');
+                if (firstMedia?.parentNode === coverTarget) {
+                    coverTarget.insertBefore(tagEl, firstMedia);
+                } else {
+                    coverTarget.insertBefore(tagEl, coverTarget.firstChild);
+                }
                 return;
             }
 
