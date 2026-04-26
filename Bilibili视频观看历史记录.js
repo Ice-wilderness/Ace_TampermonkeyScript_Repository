@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.19
+// @version      3.1.20
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -1398,14 +1398,16 @@
             if (record) {
                 UIComponent.showViewPanel(record, this.bvId);
             } else {
-                StorageManager.saveRecord(this.bvId, {
+                const visitedRecord = {
                     v: 2,
                     status: RECORD_STATUS.VISITED,
                     currentTime: '',
                     percent: '',
                     savedAt: Utils.formatTime(),
                     title: this.title
-                });
+                };
+                StorageManager.saveRecord(this.bvId, visitedRecord);
+                UIComponent.showViewPanel(visitedRecord, this.bvId);
             }
             const latest = EpisodeResolver.getLatestRecord(VideoKey.base(this.bvId));
             if (latest) {
