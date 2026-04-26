@@ -2,9 +2,9 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           4.2.1
-// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，可选图片预览功能。支持图片分批抓取、稳定分页、结构化缓存、列表瀑布流和灯箱查看。
-// @description:en    Marks visited threads in Discuz! forum lists and optionally adds image preview. Uses progressive rendering for fast image previews and auto-cleans old data.
+// @version           4.6.0
+// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，支持列表页静默并发图片预览、可选后续分页抓取、已读样式配置和可拖动设置入口。
+// @description:en    Marks visited threads in Discuz! forum lists, with silent concurrent image previews, optional extra-page fetching, configurable visited styles, and a draggable settings entry.
 // @author            Ice_wilderness
 // @match             *://*/*forum.php?mod=forumdisplay*
 // @match             *://*/*forum.php?mod=viewthread*
@@ -34,12 +34,21 @@
         }
         .custom-modal-content {
             background-color: #fff; padding: 20px; border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); max-width: 450px; width: 90%;
-            font-family: Arial, sans-serif; text-align: center;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16); max-width: 760px; width: 92%;
+            max-height: 86vh; overflow-y: auto; font-family: Arial, sans-serif; text-align: left;
         }
         .custom-modal-content h3 { margin-top: 0; color: #333; }
-        .custom-modal-content label { display: block; margin: 15px 0; font-size: 16px; cursor: pointer; color: #555; text-align: left;}
+        .custom-modal-content label { display: block; margin: 12px 0; font-size: 14px; cursor: pointer; color: #555; text-align: left;}
         .custom-modal-content input[type="checkbox"] { margin-right: 10px; }
+        .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }
+        .settings-section { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #fafafa; }
+        .settings-section h4 { margin: 0 0 10px; font-size: 15px; color: #333; }
+        .settings-section p { margin: 8px 0; color: #777; font-size: 12px; line-height: 1.6; }
+        .settings-field { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0; color: #555; font-size: 13px; }
+        .settings-field input[type="number"], .settings-field select {
+            width: 120px; max-width: 48%; padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 4px; background: #fff; color: #333;
+        }
+        .settings-actions { text-align: center; margin-top: 12px; }
         .custom-modal-btn {
             padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin: 5px;
             font-size: 14px; background-color: #007bff; color: #fff; transition: background-color 0.3s;
@@ -50,6 +59,13 @@
         .custom-modal-btn.secondary { background-color: #6c757d; }
         .custom-modal-btn.secondary:hover { background-color: #5a6268; }
         .custom-modal-file-input { display: none; }
+        .discuz-helper-floating-btn {
+            position: fixed; right: 18px; bottom: 86px; width: 42px; height: 42px; border: 1px solid rgba(0,0,0,0.12);
+            border-radius: 50%; z-index: 99998; cursor: grab; background: #ffffff; color: #333; box-shadow: 0 4px 14px rgba(0,0,0,0.18);
+            display: flex; align-items: center; justify-content: center; font-size: 20px; line-height: 1; user-select: none;
+        }
+        .discuz-helper-floating-btn:hover { background: #f3f7ff; border-color: #9fc5ff; }
+        .discuz-helper-floating-btn:active { cursor: grabbing; }
 
         .temporary-message {
             position: fixed; top: 20px; right: 20px; background-color: #4CAF50;
@@ -77,6 +93,15 @@
         }
         .preview-more-button:hover:not(:disabled) { background-color: #eef5ff; border-color: #9fc5ff; }
         .preview-more-button:disabled { cursor: wait; opacity: 0.7; }
+        .preview-full-button {
+            width: 100%; min-height: 0; height: 140px; padding: 10px; border: 1px dashed #cfd6df;
+            border-radius: 4px; cursor: pointer; background-color: #fff; color: #333; font-size: 12px;
+            display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+            line-height: 1.4; text-align: center; box-sizing: border-box;
+        }
+        .preview-full-button::before { content: "+"; font-size: 28px; line-height: 1; font-weight: bold; }
+        .preview-full-button:hover:not(:disabled) { background-color: #fff7e6; border-color: #f0b35d; }
+        .preview-full-button:disabled { cursor: wait; opacity: 0.7; }
 
         /* 进度条 */
         .progress-container {
@@ -102,8 +127,14 @@
         }
 
         /* 帖子状态标记 - 核心：用 CSS class 替代 style 标签注入 */
-        .thread--visited { background-color: #a9a9a9 !important; }
-        .thread--visited a.xst::before { content: "[已访问] "; font-weight: bold; color: #363636; }
+        body.thread-visited-mode-default .thread--visited { background-color: #a9a9a9 !important; }
+        body.thread-visited-mode-default .thread--visited a.xst::before { content: "[已访问] "; font-weight: bold; color: #363636; }
+        body.thread-visited-mode-opacity .thread--visited { opacity: 0.45; }
+        body.thread-visited-mode-strike .thread--visited a.xst { text-decoration: line-through !important; }
+        body.thread-visited-mode-opacity-strike .thread--visited { opacity: 0.45; }
+        body.thread-visited-mode-opacity-strike .thread--visited a.xst { text-decoration: line-through !important; }
+        body.thread-visited-mode-color .thread--visited a.xst { color: #8a8a00 !important; }
+        body.thread-visited-mode-hidden .thread--visited { display: none !important; }
 
         .thread--viewed-images { background-color: #d2d2d2 !important; }
         .thread--viewed-images a.xst::before { content: "[已看图] "; font-weight: bold; color: #ff8c00; }
@@ -133,23 +164,36 @@
             .custom-modal-content { background-color: #2a2a2a; color: #eee; }
             .custom-modal-content h3 { color: #fff; }
             .custom-modal-content label { color: #ccc; }
+            .discuz-helper-floating-btn { background: #2d2d2d; color: #eee; border-color: #555; }
+            .discuz-helper-floating-btn:hover { background: #3a3a3a; }
+            .settings-section { background: #222; border-color: #3a3a3a; }
+            .settings-section h4 { color: #eee; }
+            .settings-field { color: #ccc; }
+            .settings-field input[type="number"], .settings-field select { background: #1f1f1f; border-color: #555; color: #eee; }
             .preview-container { background-color: #1e1e1e; border-color: #333; }
             .preview-button { background-color: #333; color: #ccc; border-color: #555; }
             .preview-button:hover:not(:disabled) { background-color: #444; }
             .preview-more-button { background-color: #2d2d2d; color: #ccc; border-color: #555; }
             .preview-more-button:hover:not(:disabled) { background-color: #3a3a3a; color: #fff; }
+            .preview-full-button { background-color: #2d2d2d; color: #ccc; border-color: #555; }
+            .preview-full-button:hover:not(:disabled) { background-color: #3a3a3a; color: #fff; }
             .preview-img-item, .preview-img-loading { border-color: #444; background-color: #222; }
-            .thread--visited { background-color: #2a2a2a !important; }
+            body.thread-visited-mode-default .thread--visited { background-color: #2a2a2a !important; }
             .thread--viewed-images { background-color: #364136 !important; }
             .progress-container { background-color: #444; }
         }
     `);
 
     const BASE_STORAGE_KEY = 'discuz_visited_threads';
-    const MIN_DIMENSION = 200; // 图片最小尺寸阈值
+    const DEFAULT_MIN_DIMENSION = 200; // 图片最小尺寸阈值
+    const DEFAULT_AUTO_PREVIEW_LIMIT = 5; // 自动预览最多展示第一页 5 张合格图片
     const MAX_HISTORY_RECORDS = 2000; // 最大保存帖子记录数
     const PREVIEW_PAGE_BATCH_SIZE = 3; // 每次最多抓取 3 页
     const PREVIEW_CACHE_TTL = 24 * 60 * 60 * 1000; // 预览缓存保留 24 小时
+    const PREVIEW_CACHE_VERSION = 6;
+    const DEFAULT_AUTO_PREVIEW_CONCURRENT = 1;
+    const AUTO_PREVIEW_DELAY_MS = 300;
+    const VISITED_STYLE_MODES = ['default', 'opacity', 'strike', 'opacity-strike', 'color', 'hidden'];
 
     // --- 工具函数 ---
 
@@ -281,48 +325,113 @@
         modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
     }
 
-    function showSettingsDialog() {
-        createModalBase('image-preview-settings-modal', (content, closeFn) => {
-            const enablePreview = GM_getValue('enable_preview', true);
-
-            const title = document.createElement('h3'); title.textContent = '图片预览设置';
-
-            const lbl1 = document.createElement('label');
-            const chk1 = document.createElement('input'); chk1.type = 'checkbox'; chk1.checked = enablePreview;
-            lbl1.appendChild(chk1); lbl1.appendChild(document.createTextNode(' 启用图片预览功能'));
-
-            const tip = document.createElement('p');
-            tip.textContent = '多页帖子默认抓取前 3 页，可在预览区域继续追加后续页面。';
-            tip.style.cssText = 'font-size:12px; color:#777; text-align:left;';
-
-            const saveBtn = document.createElement('button'); saveBtn.textContent = '保存并刷新'; saveBtn.className = 'custom-modal-btn';
-
-            saveBtn.addEventListener('click', () => {
-                GM_setValue('enable_preview', chk1.checked);
-                showTemporaryMessage('设置已保存，即将刷新页面。');
-                setTimeout(() => window.location.reload(), 1000);
-            });
-
-            const cancelBtn = document.createElement('button'); cancelBtn.textContent = '取消'; cancelBtn.className = 'custom-modal-btn secondary';
-            cancelBtn.addEventListener('click', closeFn);
-
-            content.append(title, lbl1, tip, saveBtn, cancelBtn);
-        });
+    function getNumberSetting(key, defaultValue, min, max) {
+        const value = Number(GM_getValue(key, defaultValue));
+        if (!Number.isFinite(value)) return defaultValue;
+        return Math.min(max, Math.max(min, Math.round(value)));
     }
 
-    function showDataManagementDialog() {
-        createModalBase('data-management-modal', (content, closeFn) => {
+    function getMinDimension() {
+        return getNumberSetting('preview_min_dimension', DEFAULT_MIN_DIMENSION, 1, 2000);
+    }
+
+    function getAutoPreviewLimit() {
+        return getNumberSetting('auto_preview_limit', DEFAULT_AUTO_PREVIEW_LIMIT, 1, 20);
+    }
+
+    function getAutoPreviewConcurrent() {
+        return getNumberSetting('auto_preview_concurrent', DEFAULT_AUTO_PREVIEW_CONCURRENT, 1, 5);
+    }
+
+    function canFetchExtraPages() {
+        return GM_getValue('enable_extra_page_preview', false);
+    }
+
+    function getVisitedStyleMode() {
+        const mode = GM_getValue('visited_style_mode', 'default');
+        return VISITED_STYLE_MODES.includes(mode) ? mode : 'default';
+    }
+
+    function applyVisitedStyleMode() {
+        document.body.classList.remove(...VISITED_STYLE_MODES.map(mode => `thread-visited-mode-${mode}`));
+        document.body.classList.add(`thread-visited-mode-${getVisitedStyleMode()}`);
+    }
+
+    function showSettingsPanel() {
+        createModalBase('discuz-helper-settings-modal', (content, closeFn) => {
             const data = getVisitedThreads();
             const keys = Object.keys(data);
             const stats = getThreadRecordStats(data);
+            const enablePreview = GM_getValue('enable_preview', true);
+            const enableAutoPreview = GM_getValue('enable_auto_preview', true);
+            const enableExtraPagePreview = canFetchExtraPages();
+            const autoPreviewLimit = getAutoPreviewLimit();
+            const autoPreviewConcurrent = getAutoPreviewConcurrent();
+            const minDimension = getMinDimension();
+            const visitedStyleMode = getVisitedStyleMode();
 
-            const title = document.createElement('h3'); title.textContent = '已读记录数据管理';
+            const title = document.createElement('h3'); title.textContent = 'Discuz 辅助设置';
+
+            const grid = document.createElement('div');
+            grid.className = 'settings-grid';
+
+            const previewSection = document.createElement('div');
+            previewSection.className = 'settings-section';
+            const previewTitle = document.createElement('h4'); previewTitle.textContent = '图片预览';
+            const previewEnableLabel = document.createElement('label');
+            const previewEnableInput = document.createElement('input'); previewEnableInput.type = 'checkbox'; previewEnableInput.checked = enablePreview;
+            previewEnableLabel.append(previewEnableInput, document.createTextNode(' 启用图片预览功能'));
+            const autoPreviewLabel = document.createElement('label');
+            const autoPreviewInput = document.createElement('input'); autoPreviewInput.type = 'checkbox'; autoPreviewInput.checked = enableAutoPreview;
+            autoPreviewLabel.append(autoPreviewInput, document.createTextNode(' 列表页自动预览第一页'));
+            const extraPageLabel = document.createElement('label');
+            const extraPageInput = document.createElement('input'); extraPageInput.type = 'checkbox'; extraPageInput.checked = enableExtraPagePreview;
+            extraPageLabel.append(extraPageInput, document.createTextNode(' 允许手动抓取后续分页（每次 3 页）'));
+            const limitField = document.createElement('label'); limitField.className = 'settings-field';
+            const limitInput = document.createElement('input'); limitInput.type = 'number'; limitInput.min = '1'; limitInput.max = '20'; limitInput.value = String(autoPreviewLimit);
+            limitField.append(document.createTextNode('自动预览数量'), limitInput);
+            const concurrentField = document.createElement('label'); concurrentField.className = 'settings-field';
+            const concurrentInput = document.createElement('input'); concurrentInput.type = 'number'; concurrentInput.min = '1'; concurrentInput.max = '5'; concurrentInput.value = String(autoPreviewConcurrent);
+            concurrentField.append(document.createTextNode('自动预览并发'), concurrentInput);
+            const minField = document.createElement('label'); minField.className = 'settings-field';
+            const minInput = document.createElement('input'); minInput.type = 'number'; minInput.min = '1'; minInput.max = '2000'; minInput.value = String(minDimension);
+            minField.append(document.createTextNode('最小图片边长'), minInput);
+            const previewTip = document.createElement('p');
+            previewTip.textContent = '默认只抓取帖子第 1 页；开启后续分页后，预览网格末尾会出现“加载更多图片”卡片。';
+            previewSection.append(previewTitle, previewEnableLabel, autoPreviewLabel, extraPageLabel, limitField, concurrentField, minField, previewTip);
+
+            const styleSection = document.createElement('div');
+            styleSection.className = 'settings-section';
+            const styleTitle = document.createElement('h4'); styleTitle.textContent = '已读样式';
+            const styleField = document.createElement('label'); styleField.className = 'settings-field';
+            const styleSelect = document.createElement('select');
+            [
+                ['default', '灰底标签'],
+                ['opacity', '半透明'],
+                ['strike', '删除线'],
+                ['opacity-strike', '半透明 + 删除线'],
+                ['color', '仅改变标题颜色'],
+                ['hidden', '隐藏已读帖子']
+            ].forEach(([value, text]) => {
+                const option = document.createElement('option');
+                option.value = value;
+                option.textContent = text;
+                option.selected = visitedStyleMode === value;
+                styleSelect.appendChild(option);
+            });
+            styleField.append(document.createTextNode('显示模式'), styleSelect);
+            const styleTip = document.createElement('p');
+            styleTip.textContent = '已读记录仍只在真实进入帖子详情页后产生；仅看图帖子不受“隐藏已读帖子”影响。';
+            styleSection.append(styleTitle, styleField, styleTip);
+
+            const dataSection = document.createElement('div');
+            dataSection.className = 'settings-section';
+            const dataTitle = document.createElement('h4'); dataTitle.textContent = '数据管理';
             const info = document.createElement('p');
             info.textContent = `当前论坛域存储了 ${keys.length} 条帖子足迹`;
-            info.style.color = '#777'; info.style.marginBottom = '20px';
             const statsInfo = document.createElement('p');
             statsInfo.innerHTML = `已访问：${stats.visitedCount} 条<br>仅看图：${stats.viewedOnlyCount} 条<br>最近记录：${stats.latestText}<br>存储键：${STORAGE_KEY}`;
-            statsInfo.style.cssText = 'color:#777; font-size:12px; line-height:1.7; text-align:left; word-break:break-all;';
+            statsInfo.style.wordBreak = 'break-all';
 
             const exportBtn = document.createElement('button'); exportBtn.textContent = '⬇️ 导出数据'; exportBtn.className = 'custom-modal-btn';
             exportBtn.addEventListener('click', () => {
@@ -390,12 +499,116 @@
                 }
             });
 
-            content.append(title, info, statsInfo, exportBtn, fileInput, importBtn, document.createElement('br'), cleanBtn, wipeBtn);
+            dataSection.append(dataTitle, info, statsInfo, exportBtn, fileInput, importBtn, cleanBtn, wipeBtn);
+
+            grid.append(previewSection, styleSection, dataSection);
+
+            const actions = document.createElement('div');
+            actions.className = 'settings-actions';
+            const saveBtn = document.createElement('button'); saveBtn.textContent = '保存并刷新'; saveBtn.className = 'custom-modal-btn';
+            saveBtn.addEventListener('click', () => {
+                GM_setValue('enable_preview', previewEnableInput.checked);
+                GM_setValue('enable_auto_preview', autoPreviewInput.checked);
+                GM_setValue('enable_extra_page_preview', extraPageInput.checked);
+                GM_setValue('auto_preview_limit', getNumberFromInput(limitInput, DEFAULT_AUTO_PREVIEW_LIMIT, 1, 20));
+                GM_setValue('auto_preview_concurrent', getNumberFromInput(concurrentInput, DEFAULT_AUTO_PREVIEW_CONCURRENT, 1, 5));
+                GM_setValue('preview_min_dimension', getNumberFromInput(minInput, DEFAULT_MIN_DIMENSION, 1, 2000));
+                GM_setValue('visited_style_mode', VISITED_STYLE_MODES.includes(styleSelect.value) ? styleSelect.value : 'default');
+                showTemporaryMessage('设置已保存，即将刷新页面。');
+                setTimeout(() => window.location.reload(), 1000);
+            });
+            const cancelBtn = document.createElement('button'); cancelBtn.textContent = '取消'; cancelBtn.className = 'custom-modal-btn secondary';
+            cancelBtn.addEventListener('click', closeFn);
+            actions.append(saveBtn, cancelBtn);
+
+            content.append(title, grid, actions);
         });
     }
 
-    GM_registerMenuCommand("⚙️ 图片预览设置", showSettingsDialog);
-    GM_registerMenuCommand("🗄️ 数据管理面板", showDataManagementDialog);
+    function getNumberFromInput(input, defaultValue, min, max) {
+        const value = Number(input.value);
+        if (!Number.isFinite(value)) return defaultValue;
+        return Math.min(max, Math.max(min, Math.round(value)));
+    }
+
+    GM_registerMenuCommand("⚙️ Discuz 辅助设置", showSettingsPanel);
+
+    function createFloatingSettingsButton() {
+        if (document.getElementById('discuz-helper-floating-btn')) return;
+
+        const btn = document.createElement('button');
+        btn.id = 'discuz-helper-floating-btn';
+        btn.type = 'button';
+        btn.className = 'discuz-helper-floating-btn';
+        btn.textContent = '⚙';
+        btn.title = 'Discuz 辅助设置（可拖动）';
+
+        const savedPos = GM_getValue('floating_settings_button_pos', null);
+        if (savedPos && Number.isFinite(savedPos.x) && Number.isFinite(savedPos.y)) {
+            btn.style.left = `${Math.max(0, Math.min(window.innerWidth - 42, savedPos.x))}px`;
+            btn.style.top = `${Math.max(0, Math.min(window.innerHeight - 42, savedPos.y))}px`;
+            btn.style.right = 'auto';
+            btn.style.bottom = 'auto';
+        }
+
+        let dragging = false;
+        let moved = false;
+        let pointerId = null;
+        let startX = 0;
+        let startY = 0;
+        let startLeft = 0;
+        let startTop = 0;
+
+        btn.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0) return;
+            const rect = btn.getBoundingClientRect();
+            dragging = true;
+            moved = false;
+            pointerId = e.pointerId;
+            startX = e.clientX;
+            startY = e.clientY;
+            startLeft = rect.left;
+            startTop = rect.top;
+            btn.style.left = `${startLeft}px`;
+            btn.style.top = `${startTop}px`;
+            btn.style.right = 'auto';
+            btn.style.bottom = 'auto';
+            btn.setPointerCapture(pointerId);
+        });
+
+        btn.addEventListener('pointermove', (e) => {
+            if (!dragging || e.pointerId !== pointerId) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+            const maxLeft = Math.max(0, window.innerWidth - btn.offsetWidth);
+            const maxTop = Math.max(0, window.innerHeight - btn.offsetHeight);
+            btn.style.left = `${Math.max(0, Math.min(maxLeft, startLeft + dx))}px`;
+            btn.style.top = `${Math.max(0, Math.min(maxTop, startTop + dy))}px`;
+        });
+
+        const finishDrag = (e) => {
+            if (!dragging || (e && e.pointerId !== pointerId)) return;
+            dragging = false;
+            if (pointerId !== null) {
+                try { btn.releasePointerCapture(pointerId); } catch (err) { }
+            }
+            pointerId = null;
+            const rect = btn.getBoundingClientRect();
+            GM_setValue('floating_settings_button_pos', { x: Math.round(rect.left), y: Math.round(rect.top) });
+        };
+
+        btn.addEventListener('pointerup', finishDrag);
+        btn.addEventListener('pointercancel', finishDrag);
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (moved) return;
+            showSettingsPanel();
+        });
+
+        document.body.appendChild(btn);
+    }
 
     // --- 全局灯箱系统 ---
 
@@ -580,13 +793,13 @@
     }
 
     function getPreviewCacheKey(threadId) {
-        return `discuz_preview_v5_${hostName}_${forumName}_${threadId}`;
+        return `discuz_preview_v${PREVIEW_CACHE_VERSION}_${hostName}_${forumName}_${threadId}`;
     }
 
     function readPreviewCache(threadId) {
         try {
             const cached = JSON.parse(sessionStorage.getItem(getPreviewCacheKey(threadId)) || 'null');
-            if (!cached || cached.version !== 5 || cached.hostName !== hostName || cached.forumName !== forumName || cached.threadId !== threadId) return null;
+            if (!cached || cached.version !== PREVIEW_CACHE_VERSION || cached.hostName !== hostName || cached.forumName !== forumName || cached.threadId !== threadId) return null;
             if (Date.now() - (cached.cachedAt || 0) > PREVIEW_CACHE_TTL) return null;
             return cached;
         } catch (e) {
@@ -597,7 +810,7 @@
     function writePreviewCache(threadId, cache) {
         try {
             sessionStorage.setItem(getPreviewCacheKey(threadId), JSON.stringify({
-                version: 5,
+                version: PREVIEW_CACHE_VERSION,
                 hostName,
                 forumName,
                 threadId,
@@ -606,6 +819,50 @@
                 pages: cache.pages || {}
             }));
         } catch (e) { }
+    }
+
+    const autoPreviewQueue = [];
+    let autoPreviewActiveCount = 0;
+    let autoPreviewObserver = null;
+
+    function enqueueAutoPreview(task) {
+        autoPreviewQueue.push(task);
+        drainAutoPreviewQueue();
+    }
+
+    function drainAutoPreviewQueue() {
+        const concurrentLimit = getAutoPreviewConcurrent();
+        while (autoPreviewActiveCount < concurrentLimit && autoPreviewQueue.length > 0) {
+            const task = autoPreviewQueue.shift();
+            autoPreviewActiveCount++;
+            Promise.resolve()
+                .then(task)
+                .catch(err => {
+                    console.error('[Discuz Marker] auto preview fail', err);
+                })
+                .finally(() => {
+                    autoPreviewActiveCount--;
+                    if (autoPreviewQueue.length > 0) {
+                        setTimeout(drainAutoPreviewQueue, AUTO_PREVIEW_DELAY_MS);
+                    }
+                });
+        }
+    }
+
+    function getAutoPreviewObserver() {
+        if (!autoPreviewObserver) {
+            autoPreviewObserver = new IntersectionObserver((entries, observer) => {
+                entries.forEach(entry => {
+                    if (!entry.isIntersecting) return;
+                    observer.unobserve(entry.target);
+                    const threadElement = entry.target;
+                    if (threadElement.dataset.autoPreviewQueued === 'true') return;
+                    threadElement.dataset.autoPreviewQueued = 'true';
+                    enqueueAutoPreview(() => runAutoPreview(threadElement));
+                });
+            }, { rootMargin: '500px 0px', threshold: 0.01 });
+        }
+        return autoPreviewObserver;
     }
 
     function addPreviewButtonToThread(threadElement) {
@@ -640,6 +897,12 @@
         moreBtn.className = 'preview-more-button';
         moreBtn.style.display = 'none';
 
+        const fullBtn = document.createElement('button');
+        fullBtn.type = 'button';
+        fullBtn.className = 'preview-full-button';
+        fullBtn.textContent = '加载更多图片';
+        fullBtn.style.display = 'none';
+
         statusBar.append(statusText, progressContainer);
         previewContainer.append(statusBar);
         previewOuter.appendChild(previewContainer);
@@ -654,34 +917,92 @@
         let maxPage = cache.maxPage || 1;
         let pendingCount = 0;
         let checkedCount = 0;
+        let fullPreviewMode = false;
+        let firstPageImages = [];
+        let firstPageNextIndex = 0;
         const renderedSrcSet = new Set();
 
         const updateButtonLabel = () => {
             if (previewContainer.dataset.error === 'true') {
                 button.textContent = '获取失败';
+            } else if (previewContainer.dataset.loaded === 'true' && validCountForTitle === 0) {
+                button.textContent = '无图片';
             } else if (previewOuter.style.display !== 'none') {
                 button.textContent = '隐藏图片';
             } else if (validCountForTitle > 0) {
                 button.textContent = `预览图片 (${validCountForTitle})`;
-            } else if (previewContainer.dataset.loaded === 'true') {
-                button.textContent = '无图片';
             } else {
                 button.textContent = '预览图片';
             }
         };
 
+        const setManualFeedbackVisible = (visible) => {
+            statusBar.style.display = visible ? '' : 'none';
+            if (!visible) progressContainer.style.display = 'none';
+        };
+
+        setManualFeedbackVisible(false);
+
+        const syncFullButtonSize = () => {
+            const images = Array.from(previewContainer.querySelectorAll('.preview-img-item'));
+            const lastImage = images[images.length - 1];
+            if (!lastImage) {
+                fullBtn.style.height = '140px';
+                return;
+            }
+
+            const rect = lastImage.getBoundingClientRect();
+            if (rect.height > 0) {
+                fullBtn.style.height = `${Math.round(rect.height)}px`;
+            }
+        };
+
+        const hasFirstPageRemainingImages = () => firstPageNextIndex < firstPageImages.length;
+
+        const appendRemainingFirstPageImages = () => {
+            if (!hasFirstPageRemainingImages()) return false;
+            const remainingImages = firstPageImages.slice(firstPageNextIndex);
+            firstPageNextIndex = firstPageImages.length;
+            appendImagePlaceholders(remainingImages, { silent: !canFetchExtraPages() });
+            return true;
+        };
+
         const updateMoreButton = () => {
-            if (loadedPageUntil < maxPage) {
+            moreBtn.style.display = 'none';
+            const hasMoreFirstPageImages = hasFirstPageRemainingImages();
+            const hasMorePages = canFetchExtraPages() && loadedPageUntil < maxPage;
+            if (previewContainer.dataset.loaded === 'true' && validCountForTitle > 0 && (hasMoreFirstPageImages || hasMorePages)) {
                 const nextStart = loadedPageUntil + 1;
                 const nextEnd = Math.min(maxPage, loadedPageUntil + PREVIEW_PAGE_BATCH_SIZE);
-                moreBtn.textContent = `继续抓取后 ${nextEnd - nextStart + 1} 页（${nextStart}-${nextEnd}/${maxPage}）`;
-                moreBtn.style.display = '';
+                fullBtn.textContent = '加载更多图片';
+                fullBtn.title = hasMoreFirstPageImages
+                    ? '继续显示第 1 页剩余图片'
+                    : `继续抓取第 ${nextStart}-${nextEnd} 页（共 ${maxPage} 页）`;
+                fullBtn.style.display = '';
+                requestAnimationFrame(syncFullButtonSize);
             } else {
-                moreBtn.style.display = 'none';
+                fullBtn.title = '';
+                fullBtn.style.display = 'none';
             }
         };
 
         const updateStatus = () => {
+            if (!fullPreviewMode) {
+                if (previewContainer.dataset.loaded === 'true' && pendingCount === 0 && validCountForTitle === 0) {
+                    previewOuter.style.display = 'none';
+                }
+                setManualFeedbackVisible(false);
+                updateMoreButton();
+                updateButtonLabel();
+                return;
+            }
+            if (!canFetchExtraPages()) {
+                setManualFeedbackVisible(false);
+                updateMoreButton();
+                updateButtonLabel();
+                return;
+            }
+            setManualFeedbackVisible(true);
             if (pendingCount > 0) {
                 statusText.textContent = `正在逐步呈现图片... (剩余 ${pendingCount} 张待查，符合要求展示 ${validCountForTitle} 张)`;
             } else if (validCountForTitle > 0) {
@@ -695,7 +1016,10 @@
             updateButtonLabel();
         };
 
-        const appendImagePlaceholders = (srcList) => {
+        const appendImagePlaceholders = (srcList, options = {}) => {
+            const silent = options.silent === true;
+            const limit = Number.isFinite(options.limit) ? options.limit : null;
+            let acceptedInThisRun = 0;
             const uniqueList = srcList.filter(src => {
                 if (renderedSrcSet.has(src)) return false;
                 renderedSrcSet.add(src);
@@ -724,7 +1048,9 @@
                     const finish = (shouldShow) => {
                         if (isHandled) return;
                         isHandled = true;
-                        if (shouldShow) {
+                        const overLimit = shouldShow && limit !== null && acceptedInThisRun >= limit;
+                        if (shouldShow && !overLimit) {
+                            acceptedInThisRun++;
                             validCountForTitle++;
                             const previewImg = document.createElement('img');
                             previewImg.src = finalSrc;
@@ -738,7 +1064,9 @@
                                 openLightbox(urls, idx);
                             });
                             placeholder.replaceWith(previewImg);
+                            requestAnimationFrame(syncFullButtonSize);
                         } else {
+                            if (overLimit) renderedSrcSet.delete(imgSrc);
                             placeholder.remove();
                         }
                         pendingCount--;
@@ -750,14 +1078,18 @@
                     const pollDimension = () => {
                         if (isHandled) return;
                         if (tempImg.naturalWidth > 0 && tempImg.naturalHeight > 0) {
-                            finish(tempImg.naturalWidth >= MIN_DIMENSION && tempImg.naturalHeight >= MIN_DIMENSION);
+                            const minDimension = getMinDimension();
+                            finish(tempImg.naturalWidth >= minDimension && tempImg.naturalHeight >= minDimension);
                         } else {
                             requestAnimationFrame(pollDimension);
                         }
                     };
 
                     requestAnimationFrame(pollDimension);
-                    tempImg.onload = () => finish(tempImg.naturalWidth >= MIN_DIMENSION && tempImg.naturalHeight >= MIN_DIMENSION);
+                    tempImg.onload = () => {
+                        const minDimension = getMinDimension();
+                        finish(tempImg.naturalWidth >= minDimension && tempImg.naturalHeight >= minDimension);
+                    };
                     tempImg.onerror = () => finish(false);
                     tempImg.src = finalSrc;
                 });
@@ -766,19 +1098,26 @@
             uniqueList.forEach(imgSrc => {
                 const placeholder = document.createElement('div');
                 placeholder.className = 'preview-img-loading';
-                placeholder.textContent = '等待呈现...';
+                placeholder.textContent = silent ? '' : '等待呈现...';
                 placeholder.dataset.src = imgSrc;
-                previewContainer.appendChild(placeholder);
+                if (fullBtn.parentNode === previewContainer) {
+                    previewContainer.insertBefore(placeholder, fullBtn);
+                } else {
+                    previewContainer.appendChild(placeholder);
+                }
                 observer.observe(placeholder);
             });
             updateStatus();
         };
 
-        const fetchPageImages = async (page) => {
+        const fetchPageImages = async (page, options = {}) => {
             if (cache.pages[page]) return cache.pages[page];
-            statusText.textContent = `正在拉取第 ${page} 页...`;
-            progressContainer.style.display = 'block';
-            progressBarFill.style.width = `${Math.min(80, 15 + page * 15)}%`;
+            if (!options.silent) {
+                setManualFeedbackVisible(true);
+                statusText.textContent = `正在拉取第 ${page} 页...`;
+                progressContainer.style.display = 'block';
+                progressBarFill.style.width = `${Math.min(80, 15 + page * 15)}%`;
+            }
 
             const response = await fetch(buildThreadPageUrl(threadUrl, page));
             if (!response.ok) throw new Error(`第 ${page} 页 HTTP Error: ${response.status}`);
@@ -787,6 +1126,7 @@
             const srcList = extractImagesFromDoc(doc);
             cache.pages[page] = srcList;
             if (page === 1) {
+                firstPageImages = srcList;
                 maxPage = getMaxPageFromDoc(doc);
                 cache.maxPage = maxPage;
             }
@@ -794,34 +1134,74 @@
             return srcList;
         };
 
-        const loadPageBatch = async (startPage) => {
-            if (previewContainer.dataset.loading === 'true') return;
+        const loadAutoPreview = async () => {
+            if (previewContainer.dataset.loading === 'true' || previewContainer.dataset.loaded === 'true') return;
             previewContainer.dataset.loading = 'true';
             delete previewContainer.dataset.error;
             button.disabled = true;
             moreBtn.disabled = true;
-            progressContainer.style.display = 'block';
-            progressBarFill.style.width = '10%';
+            fullBtn.disabled = true;
+            previewOuter.style.display = 'block';
+            setManualFeedbackVisible(false);
+
+            try {
+                const pageImages = await fetchPageImages(1, { silent: true });
+                firstPageImages = pageImages;
+                firstPageNextIndex = Math.min(pageImages.length, getAutoPreviewLimit());
+                maxPage = cache.maxPage || maxPage || 1;
+                loadedPageUntil = Math.max(loadedPageUntil, 1);
+                appendImagePlaceholders(pageImages.slice(0, firstPageNextIndex), { silent: true });
+                previewContainer.dataset.loaded = 'true';
+                delete previewContainer.dataset.error;
+                updateStatus();
+            } catch (err) {
+                console.error('[Discuz Marker] auto preview images fail', err);
+                previewOuter.style.display = 'none';
+            } finally {
+                button.disabled = false;
+                moreBtn.disabled = false;
+                fullBtn.disabled = false;
+                delete previewContainer.dataset.loading;
+                updateButtonLabel();
+            }
+        };
+
+        const loadPageBatch = async (startPage) => {
+            if (previewContainer.dataset.loading === 'true') return;
+            if (startPage > 1 && !canFetchExtraPages()) return false;
+            previewContainer.dataset.loading = 'true';
+            delete previewContainer.dataset.error;
+            fullPreviewMode = true;
+            setManualFeedbackVisible(canFetchExtraPages());
+            button.disabled = true;
+            moreBtn.disabled = true;
+            fullBtn.disabled = true;
+            progressContainer.style.display = canFetchExtraPages() ? 'block' : 'none';
+            progressBarFill.style.width = canFetchExtraPages() ? '10%' : '0%';
 
             try {
                 if (startPage === 1 || !cache.pages[1]) {
-                    await fetchPageImages(1);
+                    await fetchPageImages(1, { silent: !canFetchExtraPages() });
                 }
                 maxPage = cache.maxPage || maxPage || 1;
+                if (startPage === 1 && cache.pages[1]) {
+                    firstPageImages = cache.pages[1];
+                    firstPageNextIndex = firstPageImages.length;
+                }
 
                 const actualStart = Math.max(startPage, loadedPageUntil + 1, 1);
-                const endPage = Math.min(maxPage, actualStart + PREVIEW_PAGE_BATCH_SIZE - 1);
+                const endPage = canFetchExtraPages() ? Math.min(maxPage, actualStart + PREVIEW_PAGE_BATCH_SIZE - 1) : 1;
                 const batchImages = [];
                 for (let page = actualStart; page <= endPage; page++) {
                     batchImages.push(...await fetchPageImages(page));
                     loadedPageUntil = Math.max(loadedPageUntil, page);
                 }
 
-                if (startPage === 1 && loadedPageUntil < Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE)) {
+                if (canFetchExtraPages() && startPage === 1 && loadedPageUntil < Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE)) {
                     loadedPageUntil = Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE);
                 }
 
-                appendImagePlaceholders([...new Set(batchImages)]);
+                appendImagePlaceholders([...new Set(batchImages)], { silent: !canFetchExtraPages() });
                 previewContainer.dataset.loaded = 'true';
                 delete previewContainer.dataset.error;
                 updateThreadData(threadId, { viewedImages: true });
@@ -829,15 +1209,18 @@
                 progressBarFill.style.width = '95%';
                 if (pendingCount === 0) progressContainer.style.display = 'none';
                 updateStatus();
+                return true;
             } catch (err) {
                 console.error('[Discuz Marker] fetch images fail', err);
                 previewContainer.dataset.error = 'true';
                 statusText.textContent = `获取数据失败: ${err.message}`;
                 progressContainer.style.display = 'none';
                 button.textContent = '获取失败';
+                return false;
             } finally {
                 button.disabled = false;
                 moreBtn.disabled = false;
+                fullBtn.disabled = false;
                 delete previewContainer.dataset.loading;
                 updateButtonLabel();
             }
@@ -848,11 +1231,30 @@
 
             const isDisplayed = previewOuter.style.display !== 'none';
             if (previewContainer.dataset.loaded === "true") {
+                if (validCountForTitle === 0 && (hasFirstPageRemainingImages() || loadedPageUntil < maxPage)) {
+                    if (hasFirstPageRemainingImages() || canFetchExtraPages()) {
+                        fullPreviewMode = true;
+                        previewOuter.style.display = 'block';
+                        button.textContent = '获取中...';
+                        if (appendRemainingFirstPageImages()) {
+                            updateThreadData(threadId, { viewedImages: true });
+                            refreshThreadMark(threadElement);
+                            updateButtonLabel();
+                        } else {
+                            await loadPageBatch(loadedPageUntil + 1);
+                        }
+                    } else {
+                        previewOuter.style.display = 'none';
+                        updateButtonLabel();
+                    }
+                    return;
+                }
                 previewOuter.style.display = isDisplayed ? 'none' : 'block';
                 updateButtonLabel();
                 return;
             }
 
+            fullPreviewMode = true;
             previewOuter.style.display = 'block';
             button.textContent = '获取中...';
             await loadPageBatch(1);
@@ -864,11 +1266,46 @@
             await loadPageBatch(loadedPageUntil + 1);
         });
 
+        fullBtn.addEventListener('click', async (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            fullPreviewMode = true;
+            previewOuter.style.display = 'block';
+            updateThreadData(threadId, { viewedImages: true });
+            refreshThreadMark(threadElement);
+            const appendedFirstPageRemaining = appendRemainingFirstPageImages();
+            updateStatus();
+            if (!appendedFirstPageRemaining && canFetchExtraPages() && loadedPageUntil < maxPage) {
+                await loadPageBatch(loadedPageUntil + 1);
+            }
+            updateStatus();
+        });
+
+        threadElement.discuzStartAutoPreview = loadAutoPreview;
         previewContainer.appendChild(moreBtn);
+        previewContainer.appendChild(fullBtn);
     }
 
     function addPreviewButtons() {
-        document.querySelectorAll('tbody[id^="normalthread_"], tbody[id^="stickthread_"]').forEach(addPreviewButtonToThread);
+        document.querySelectorAll('tbody[id^="normalthread_"], tbody[id^="stickthread_"]').forEach(thread => {
+            addPreviewButtonToThread(thread);
+            registerAutoPreview(thread);
+        });
+    }
+
+    function registerAutoPreview(threadElement) {
+        if (!GM_getValue('enable_auto_preview', true)) return;
+        if (!threadElement || threadElement.dataset.autoPreviewObserved === 'true') return;
+        threadElement.dataset.autoPreviewObserved = 'true';
+        getAutoPreviewObserver().observe(threadElement);
+    }
+
+    async function runAutoPreview(threadElement) {
+        if (!GM_getValue('enable_preview', true) || !GM_getValue('enable_auto_preview', true)) return;
+        addPreviewButtonToThread(threadElement);
+        if (typeof threadElement.discuzStartAutoPreview === 'function') {
+            await threadElement.discuzStartAutoPreview();
+        }
     }
 
     function observeNewThreads() {
@@ -880,7 +1317,10 @@
                 if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
                     mutation.addedNodes.forEach((node) => {
                         if (node.tagName === 'TBODY' && (node.id.startsWith('normalthread_') || node.id.startsWith('stickthread_'))) {
-                            if (enablePreview) addPreviewButtonToThread(node);
+                            if (enablePreview) {
+                                addPreviewButtonToThread(node);
+                                registerAutoPreview(node);
+                            }
                         }
                     });
                     if (!pendingUpdate) {
@@ -901,6 +1341,8 @@
 
     const currentUrl = window.location.href;
     const enablePreview = GM_getValue('enable_preview', true);
+    applyVisitedStyleMode();
+    createFloatingSettingsButton();
 
     if (currentUrl.includes('mod=forumdisplay') || currentUrl.includes('forum-')) {
         markThreadsOnListPage();
