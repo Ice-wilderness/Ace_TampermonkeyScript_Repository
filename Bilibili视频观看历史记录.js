@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.15
+// @version      3.1.18
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -122,7 +122,9 @@
         .bvh-action-list-cover-tag { z-index: 109 !important; }
         .video-pod__list.grid .video-pod__item.page { position: relative; }
         .bvh-episode-tag-grid { position: absolute; top: 2px; right: 2px; margin: 0; padding: 0 3px; min-width: 14px; max-width: 30px; height: 14px; line-height: 14px; font-size: 9px; text-align: center; overflow: hidden; text-overflow: ellipsis; }
-        .bpx-player-ctrl-eplist-multi-menu-item .bvh-episode-tag { margin-left: 8px; transform: translateY(-1px); }
+        .bpx-player-ctrl-eplist-multi-menu-item { position: relative; }
+        .bpx-player-ctrl-eplist-multi-menu-item .bpx-player-ctrl-eplist-multi-menu-item-text { display: block; padding-right: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bpx-player-ctrl-eplist-multi-menu-item .bvh-episode-tag { position: absolute; right: 10px; top: 50%; margin-left: 0; transform: translateY(-50%); }
         .bvh-progress-bar { background: linear-gradient(90deg, rgba(122, 134, 234, 0.9), rgba(156, 166, 255, 0.7)); z-index: 108; position: absolute; height: 4px; bottom: 0px; border-bottom-left-radius: inherit; border-bottom-right-radius: inherit; pointer-events: none; }
         .bvh-toast-container { position: fixed; bottom: 20px; left: 20px; z-index: 99999; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
         .bvh-toast { background-color: #333; color: #fff; padding: 10px 20px; border-radius: 4px; font-size: 14px; opacity: 0; transition: opacity 0.3s; box-shadow: 0 2px 8px rgba(0,0,0,0.2); pointer-events: auto; }
@@ -238,6 +240,8 @@
             };
             const normalizeTitle = (value) => String(value || '').replace(/\s+/g, '').trim();
             const sectionBaseByTitle = new Map();
+            const keyByTitle = new Map();
+            const sectionVideoKeys = [];
             const sectionMultiBases = new Set();
             const currentBase = EpisodeResolver.getBaseKey();
 
@@ -249,7 +253,14 @@
                     el.querySelector('.title-txt')?.innerText ||
                     el.querySelector('.title')?.getAttribute('title') ||
                     el.innerText;
-                if (directKey && title) sectionBaseByTitle.set(normalizeTitle(title), directKey);
+                const normalizedTitle = normalizeTitle(title);
+                if (directKey && normalizedTitle) {
+                    sectionBaseByTitle.set(normalizedTitle, directKey);
+                    keyByTitle.set(normalizedTitle, directKey);
+                }
+                if (directKey && !el.querySelector('.page-list .simple-base-item.page-item')) {
+                    sectionVideoKeys.push(directKey);
+                }
                 if (directKey && el.querySelector('.page-list .simple-base-item.page-item')) sectionMultiBases.add(directKey);
                 add(el, dataKey, title, directKey);
             });
@@ -275,8 +286,11 @@
                     add(el, cid, el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.innerText || el.innerText, key);
                 });
             });
-            document.querySelectorAll('.bpx-player-ctrl-eplist-multi-menu-item[data-cid]').forEach(el => {
-                add(el, el.getAttribute('data-cid'), el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.innerText || el.innerText);
+            const playerMenuItems = Array.from(document.querySelectorAll('.bpx-player-ctrl-eplist-multi-menu-item[data-cid]'));
+            const canMapPlayerByOrder = sectionVideoKeys.length > 1 && sectionVideoKeys.length === playerMenuItems.length;
+            playerMenuItems.forEach((el, index) => {
+                const title = el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.innerText || el.innerText;
+                add(el, el.getAttribute('data-cid'), title, keyByTitle.get(normalizeTitle(title)) || (canMapPlayerByOrder ? sectionVideoKeys[index] : ''));
             });
             document.querySelectorAll('.action-list-item-wrap[data-key]').forEach(el => {
                 const key = VideoKey.fromText(el.getAttribute('data-key'));
@@ -1512,6 +1526,7 @@
             this.processedLinks = new WeakSet();
             this.visibleElements = new Set();
             this.scheduleFavoriteRefresh = Utils.debounce(() => this.refreshFavoriteCards(), 120);
+            this.schedulePlaylistRefresh = Utils.debounce(() => this.refreshPlaylistItems(), 120);
             this.initIntersectionObserver();
             this.initMutationObserver();
 
@@ -1601,6 +1616,9 @@
                     this.observePlaylistItem(item);
                     this.processPlaylistItem(item);
                 });
+                if (addedPlaylistItems.length > 0) {
+                    this.schedulePlaylistRefresh();
+                }
                 if (shouldRefreshFavoriteCards) {
                     this.scheduleFavoriteRefresh();
                 }
