@@ -2,7 +2,7 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           4.6.0
+// @version           4.6.1
 // @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，支持列表页静默并发图片预览、可选后续分页抓取、已读样式配置和可拖动设置入口。
 // @description:en    Marks visited threads in Discuz! forum lists, with silent concurrent image previews, optional extra-page fetching, configurable visited styles, and a draggable settings entry.
 // @author            Ice_wilderness
@@ -921,6 +921,7 @@
         let firstPageImages = [];
         let firstPageNextIndex = 0;
         const renderedSrcSet = new Set();
+        let appendAutoPreviewCandidates = () => false;
 
         const updateButtonLabel = () => {
             if (previewContainer.dataset.error === 'true') {
@@ -1019,6 +1020,7 @@
         const appendImagePlaceholders = (srcList, options = {}) => {
             const silent = options.silent === true;
             const limit = Number.isFinite(options.limit) ? options.limit : null;
+            const autoFillLimit = Number.isFinite(options.autoFillLimit) ? options.autoFillLimit : null;
             let acceptedInThisRun = 0;
             const uniqueList = srcList.filter(src => {
                 if (renderedSrcSet.has(src)) return false;
@@ -1072,6 +1074,9 @@
                         pendingCount--;
                         progressBarFill.style.width = checkedCount ? `${Math.min(95, 40 + 55 * ((checkedCount - pendingCount) / checkedCount))}%` : '95%';
                         if (pendingCount === 0) progressContainer.style.display = 'none';
+                        if (pendingCount === 0 && autoFillLimit !== null && validCountForTitle < autoFillLimit) {
+                            if (appendAutoPreviewCandidates(autoFillLimit, silent)) return;
+                        }
                         updateStatus();
                     };
 
@@ -1108,6 +1113,20 @@
                 observer.observe(placeholder);
             });
             updateStatus();
+        };
+
+        appendAutoPreviewCandidates = (targetLimit, silent = true) => {
+            if (!hasFirstPageRemainingImages() || validCountForTitle >= targetLimit) return false;
+            const neededCount = targetLimit - validCountForTitle;
+            const nextImages = [];
+            while (firstPageNextIndex < firstPageImages.length && nextImages.length < neededCount) {
+                const imgSrc = firstPageImages[firstPageNextIndex++];
+                if (renderedSrcSet.has(imgSrc)) continue;
+                nextImages.push(imgSrc);
+            }
+            if (nextImages.length === 0) return false;
+            appendImagePlaceholders(nextImages, { silent, autoFillLimit: targetLimit });
+            return true;
         };
 
         const fetchPageImages = async (page, options = {}) => {
@@ -1147,10 +1166,10 @@
             try {
                 const pageImages = await fetchPageImages(1, { silent: true });
                 firstPageImages = pageImages;
-                firstPageNextIndex = Math.min(pageImages.length, getAutoPreviewLimit());
+                firstPageNextIndex = 0;
                 maxPage = cache.maxPage || maxPage || 1;
                 loadedPageUntil = Math.max(loadedPageUntil, 1);
-                appendImagePlaceholders(pageImages.slice(0, firstPageNextIndex), { silent: true });
+                appendAutoPreviewCandidates(getAutoPreviewLimit(), true);
                 previewContainer.dataset.loaded = 'true';
                 delete previewContainer.dataset.error;
                 updateStatus();
