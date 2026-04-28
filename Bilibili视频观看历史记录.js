@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.20
+// @version      3.1.22
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -176,8 +176,115 @@
 
     // --- 工具类 ---
     const Utils = {
-        log: (...args) => { if (CONFIG.debug) console.log('[BvH]', ...args); },
-        error: (...args) => console.error('[BvH Error]', ...args),
+        _debugCounters: {},
+        _debugLogs: [],
+        _debugLogLimit: 3000,
+        _stringifyDebugArg: (arg) => {
+            if (arg instanceof Error) return `${arg.name}: ${arg.message}\n${arg.stack || ''}`;
+            if (typeof arg === 'string') return arg;
+            try {
+                return JSON.stringify(arg);
+            } catch (e) {
+                return String(arg);
+            }
+        },
+        _pushDebugLog: (level, label, args) => {
+            const line = `${new Date().toISOString()} ${label} ${args.map(Utils._stringifyDebugArg).join(' ')}`;
+            Utils._debugLogs.push(line);
+            if (Utils._debugLogs.length > Utils._debugLogLimit) {
+                Utils._debugLogs.splice(0, Utils._debugLogs.length - Utils._debugLogLimit);
+            }
+        },
+        _writeLog: (level, label, args, alwaysConsole = false) => {
+            Utils._pushDebugLog(level, label, args);
+            if (alwaysConsole || CONFIG.debug) {
+                const writer = console[level] || console.log;
+                writer.apply(console, [label, ...args]);
+            }
+        },
+        log: (...args) => { if (CONFIG.debug) Utils._writeLog('log', '[BvH]', args); },
+        warn: (...args) => { if (CONFIG.debug) Utils._writeLog('warn', '[BvH Warn]', args); },
+        error: (...args) => Utils._writeLog('error', '[BvH Error]', args, true),
+        debugTime: (name) => {
+            const start = performance.now();
+            return (extra = '') => {
+                if (!CONFIG.debug) return;
+                const cost = performance.now() - start;
+                const suffix = extra ? ` ${extra}` : '';
+                const level = cost >= 80 ? 'warn' : 'log';
+                Utils._writeLog(level, '[BvH Perf]', [`${name}: ${cost.toFixed(1)}ms${suffix}`]);
+            };
+        },
+        logSlow: (name, start, extra = '', threshold = 80) => {
+            if (!CONFIG.debug) return;
+            const cost = performance.now() - start;
+            if (cost >= threshold) {
+                Utils._writeLog('warn', '[BvH Slow]', [`${name}: ${cost.toFixed(1)}ms${extra ? ` ${extra}` : ''}`]);
+            }
+        },
+        count: (name, step = 1) => {
+            if (!CONFIG.debug) return 0;
+            Utils._debugCounters[name] = (Utils._debugCounters[name] || 0) + step;
+            return Utils._debugCounters[name];
+        },
+        logEvery: (name, interval, ...args) => {
+            if (!CONFIG.debug) return;
+            const count = Utils.count(name);
+            if (count === 1 || count % interval === 0) {
+                Utils._writeLog('log', '[BvH Count]', [`${name}: ${count}`, ...args]);
+            }
+        },
+        downloadDebugLog: () => {
+            const version = typeof GM_info !== 'undefined' ? (GM_info.script?.version || 'unknown') : 'unknown';
+            const lines = [
+                '# Bilibili视频观看历史记录 调试日志',
+                `导出时间: ${Utils.formatTime()}`,
+                `脚本版本: ${version}`,
+                `页面地址: ${location.href}`,
+                `UserAgent: ${navigator.userAgent}`,
+                `调试开关: ${CONFIG.debug}`,
+                `页面状态: ${document.readyState}`,
+                `可见状态: ${document.visibilityState}`,
+                `日志条数: ${Utils._debugLogs.length}/${Utils._debugLogLimit}`,
+                '',
+                '# 当前配置',
+                JSON.stringify(CONFIG, null, 2),
+                '',
+                '# 调试计数器',
+                JSON.stringify(Utils._debugCounters, null, 2),
+                '',
+                '# 存储缓存状态',
+                typeof StorageManager === 'undefined'
+                    ? 'StorageManager unavailable'
+                    : JSON.stringify({
+                        cachedShards: StorageManager._shardCache?.size || 0,
+                        indexedBases: StorageManager._bvBaseIndex?.size || 0,
+                        allKeysCached: !!StorageManager._allKeysCache,
+                        allKeysCacheSize: StorageManager._allKeysCache?.length || 0
+                    }, null, 2),
+                '',
+                '# 最近日志',
+                ...Utils._debugLogs
+            ];
+            const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `bvh-debug-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`;
+            a.click();
+            URL.revokeObjectURL(url);
+            Utils.log('Debug log downloaded', `lines=${Utils._debugLogs.length}`);
+        },
+        describeElement: (el) => {
+            if (!el) return '(none)';
+            const tag = (el.tagName || '').toLowerCase();
+            const id = el.id ? `#${el.id}` : '';
+            const cls = el.className && typeof el.className === 'string'
+                ? `.${el.className.trim().split(/\s+/).slice(0, 3).join('.')}`
+                : '';
+            const key = el.getAttribute?.('data-key') || el.getAttribute?.('data-cid') || '';
+            return `${tag}${id}${cls}${key ? `[data=${key}]` : ''}`;
+        },
         formatTime: () => {
             const d = new Date();
             const pad = n => String(n).padStart(2, '0');
@@ -372,8 +479,12 @@
             return `P${page || 1}`;
         },
         getLatestRecord: (base) => {
+            const done = Utils.debugTime('EpisodeResolver.getLatestRecord');
             const bvBase = VideoKey.base(base);
-            if (!bvBase) return null;
+            if (!bvBase) {
+                done('skip: empty base');
+                return null;
+            }
             const keys = StorageManager.getRelatedKeys(bvBase, { loadAll: true });
             let best = null;
             keys.forEach(key => {
@@ -384,6 +495,7 @@
                     best = { key, record, page: VideoKey.page(key), time: t };
                 }
             });
+            done(`base=${bvBase} related=${keys.length} latest=${best?.key || 'none'}`);
             return best;
         },
         getEpisodeRecord: (item) => {
@@ -412,9 +524,15 @@
         _changeCallbacks: [],
         _migrationCount: 0,
 
-        onDataChange: (cb) => StorageManager._changeCallbacks.push(cb),
+        onDataChange: (cb) => {
+            StorageManager._changeCallbacks.push(cb);
+            Utils.log('Storage data-change listener registered:', StorageManager._changeCallbacks.length);
+        },
         _notifyChange: Utils.debounce(() => {
+            const start = performance.now();
+            Utils.log('Storage notify change start, callbacks:', StorageManager._changeCallbacks.length);
             StorageManager._changeCallbacks.forEach(cb => cb());
+            Utils.logSlow('StorageManager._notifyChange callbacks', start, `callbacks=${StorageManager._changeCallbacks.length}`, 20);
         }, 500),
 
         // --- 哈希函数 (FNV-1a) ---
@@ -432,28 +550,36 @@
             if (StorageManager._shardCache.has(shardId)) {
                 return StorageManager._shardCache.get(shardId);
             }
+            const start = performance.now();
             const data = GM_getValue(`bvh_shard_${shardId}`, {});
             const shard = { data, dirty: false };
             StorageManager._shardCache.set(shardId, shard);
+            const keys = Object.keys(data);
             // 加载时增量构建 BV 基础 ID 索引
-            for (const key of Object.keys(data)) {
+            for (const key of keys) {
                 StorageManager._indexKey(key);
             }
+            Utils.logSlow('StorageManager._loadShard', start, `shard=${shardId} records=${keys.length}`, 30);
             return shard;
         },
 
         _flushShard: (shardId) => {
             const shard = StorageManager._shardCache.get(shardId);
             if (shard && shard.dirty) {
+                const start = performance.now();
                 GM_setValue(`bvh_shard_${shardId}`, shard.data);
                 shard.dirty = false;
+                Utils.logSlow('StorageManager._flushShard', start, `shard=${shardId} records=${Object.keys(shard.data).length}`, 30);
             }
         },
 
         _ensureAllShardsLoaded: () => {
+            const start = performance.now();
+            const before = StorageManager._shardCache.size;
             for (let i = 0; i < SHARD_COUNT; i++) {
                 StorageManager._loadShard(i);
             }
+            Utils.logSlow('StorageManager._ensureAllShardsLoaded', start, `loaded=${StorageManager._shardCache.size - before}/${SHARD_COUNT} cached=${StorageManager._shardCache.size}`, 50);
         },
 
         // --- 索引管理 ---
@@ -532,6 +658,7 @@
             if (!id) return;
             id = VideoKey.normalize(id) || id;
             const shardId = StorageManager._getShardId(id);
+            const start = performance.now();
             const shard = StorageManager._loadShard(shardId);
             shard.data[id] = StorageManager._compact(record);
             shard.dirty = true;
@@ -539,12 +666,14 @@
             StorageManager._indexKey(id);
             StorageManager._allKeysCache = null;
             if (notify) StorageManager._notifyChange();
+            Utils.logSlow('StorageManager.saveRecord', start, `key=${id} shard=${shardId} notify=${notify}`, 30);
         },
 
         deleteRecord: (id, notify = true) => {
             if (!id) return;
             id = VideoKey.normalize(id) || id;
             const shardId = StorageManager._getShardId(id);
+            const start = performance.now();
             const shard = StorageManager._loadShard(shardId);
             delete shard.data[id];
             shard.dirty = true;
@@ -552,36 +681,48 @@
             StorageManager._removeFromIndex(id);
             StorageManager._allKeysCache = null;
             if (notify) StorageManager._notifyChange();
+            Utils.logSlow('StorageManager.deleteRecord', start, `key=${id} shard=${shardId} notify=${notify}`, 30);
         },
 
         getAllKeys: () => {
-            if (StorageManager._allKeysCache) return StorageManager._allKeysCache;
+            if (StorageManager._allKeysCache) {
+                Utils.log('StorageManager.getAllKeys cache hit:', StorageManager._allKeysCache.length);
+                return StorageManager._allKeysCache;
+            }
+            const start = performance.now();
             StorageManager._ensureAllShardsLoaded();
             const keys = [];
             for (const [, shard] of StorageManager._shardCache) {
                 keys.push(...Object.keys(shard.data));
             }
             StorageManager._allKeysCache = keys;
+            Utils.logSlow('StorageManager.getAllKeys', start, `keys=${keys.length}`, 50);
             return keys;
         },
 
         getRelatedKeys: (bvBase, options = {}) => {
+            const start = performance.now();
             const shouldLoadAll = options.loadAll !== false;
             if (shouldLoadAll) StorageManager._ensureAllShardsLoaded();
             const set = StorageManager._bvBaseIndex.get(bvBase);
-            return set ? Array.from(set) : [];
+            const keys = set ? Array.from(set) : [];
+            Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} loadAll=${shouldLoadAll} keys=${keys.length}`, 50);
+            return keys;
         },
 
         getAllRecords: () => {
+            const start = performance.now();
             const data = [];
             StorageManager.getAllKeys().forEach(k => {
                 const record = StorageManager.getRecord(k);
                 if (record) data.push({ key: k, record });
             });
+            Utils.logSlow('StorageManager.getAllRecords', start, `records=${data.length}`, 80);
             return data;
         },
 
         getStats: () => {
+            const start = performance.now();
             const now = Date.now();
             const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
             const stats = {
@@ -608,11 +749,13 @@
                 const savedTime = record.savedAt ? new Date(record.savedAt).getTime() : 0;
                 if (savedTime >= weekAgo) stats.recent7Days++;
             });
+            Utils.logSlow('StorageManager.getStats', start, `total=${stats.total}`, 80);
             return stats;
         },
 
         // --- localStorage 备份恢复 ---
         restoreFromLocalStorage: () => {
+            const start = performance.now();
             const keysToRemove = [];
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
@@ -627,9 +770,11 @@
                 }
             }
             keysToRemove.forEach(k => localStorage.removeItem(k));
+            Utils.log('StorageManager.restoreFromLocalStorage done:', keysToRemove.length, `cost=${(performance.now() - start).toFixed(1)}ms`);
         },
 
         cleanupLocalStorageBackups: () => {
+            const start = performance.now();
             const backups = [];
             for (let i = 0; i < localStorage.length; i++) {
                 const key = localStorage.key(i);
@@ -650,14 +795,19 @@
                 .filter(item => localStorage.getItem(item.key) !== null)
                 .sort((a, b) => b.savedAt - a.savedAt);
             remaining.slice(BACKUP_MAX_COUNT).forEach(item => localStorage.removeItem(item.key));
+            Utils.logSlow('StorageManager.cleanupLocalStorageBackups', start, `found=${backups.length} remaining=${remaining.length}`, 50);
         },
 
         cleanupLocalStorageBackupsThrottled: null,
 
         // --- 数据迁移 (v1/v2 → v3 分片) ---
         migrateIfNeeded: () => {
+            const done = Utils.debugTime('StorageManager.migrateIfNeeded');
             const meta = GM_getValue('bvh_meta');
-            if (meta && meta.version === 3) return; // 已完成迁移
+            if (meta && meta.version === 3) {
+                done('already v3');
+                return; // 已完成迁移
+            }
 
             const allKeys = GM_listValues();
             const bvKeys = allKeys.filter(k => VideoKey.isValid(k));
@@ -665,6 +815,7 @@
             if (bvKeys.length === 0) {
                 // 全新安装，直接标记为 v3
                 GM_setValue('bvh_meta', { version: 3, shardCount: SHARD_COUNT, totalRecords: 0, migratedAt: Date.now() });
+                done('new install');
                 return;
             }
 
@@ -708,10 +859,12 @@
 
             Utils.log(`迁移完成：${migratedCount} 条记录`);
             StorageManager._migrationCount = migratedCount;
+            done(`migrated=${migratedCount}`);
         },
 
         // --- 多标签页切换时刷新缓存 ---
         invalidateCache: () => {
+            Utils.log('StorageManager.invalidateCache', `cachedShards=${StorageManager._shardCache.size}`, `indexedBases=${StorageManager._bvBaseIndex.size}`);
             StorageManager._shardCache.clear();
             StorageManager._bvBaseIndex.clear();
             StorageManager._allKeysCache = null;
@@ -895,28 +1048,40 @@
             }
         },
         jumpToProgress: (record) => {
-            if (!record?.currentTime) return;
+            if (!record?.currentTime) {
+                Utils.log('UIComponent.jumpToProgress skipped: no currentTime');
+                return;
+            }
             const video = document.querySelector("#bilibili-player video, bwp-video");
             if (video) {
+                Utils.log('UIComponent.jumpToProgress', record.currentTime, record.percent || '');
                 video.currentTime = Utils.timeToSeconds(record.currentTime);
                 video.play();
                 UIComponent.toast(`已跳转到 ${record.currentTime}`, 'success', 2000);
+            } else {
+                Utils.warn('UIComponent.jumpToProgress skipped: video element not found');
             }
         },
         resumeToRecord: (target) => {
-            if (!target?.record?.currentTime) return;
+            if (!target?.record?.currentTime) {
+                Utils.log('UIComponent.resumeToRecord skipped: no target currentTime');
+                return;
+            }
             const currentKey = EpisodeResolver.getCurrentKey() || VideoKey.fromUrl(location.href);
             if (!target.key || VideoKey.normalize(target.key) === VideoKey.normalize(currentKey)) {
+                Utils.log('UIComponent.resumeToRecord same page', `current=${currentKey}`, `target=${target.key || 'none'}`);
                 UIComponent.jumpToProgress(target.record);
                 return;
             }
 
+            const targetUrl = EpisodeResolver.getSeekUrl(target.key);
+            Utils.warn('UIComponent.resumeToRecord navigate', `current=${currentKey}`, `target=${target.key}`, `url=${targetUrl}`);
             sessionStorage.setItem(PENDING_SEEK_KEY, JSON.stringify({
                 key: target.key,
                 currentTime: target.record.currentTime,
                 savedAt: Date.now()
             }));
-            location.href = EpisodeResolver.getSeekUrl(target.key);
+            location.href = targetUrl;
         },
         applyPendingSeek: (currentKey, video) => {
             if (!currentKey || !video) return;
@@ -924,12 +1089,17 @@
             try {
                 pending = JSON.parse(sessionStorage.getItem(PENDING_SEEK_KEY) || 'null');
             } catch (e) { }
-            if (!pending || VideoKey.normalize(pending.key) !== VideoKey.normalize(currentKey)) return;
+            if (!pending || VideoKey.normalize(pending.key) !== VideoKey.normalize(currentKey)) {
+                if (pending) Utils.log('UIComponent.applyPendingSeek skip: key mismatch', `pending=${pending.key}`, `current=${currentKey}`);
+                return;
+            }
             if (Date.now() - (pending.savedAt || 0) > 60000) {
+                Utils.warn('UIComponent.applyPendingSeek expired', pending);
                 sessionStorage.removeItem(PENDING_SEEK_KEY);
                 return;
             }
             const seek = () => {
+                Utils.log('UIComponent.applyPendingSeek seek', `key=${currentKey}`, `time=${pending.currentTime}`);
                 video.currentTime = Utils.timeToSeconds(pending.currentTime);
                 video.play();
                 sessionStorage.removeItem(PENDING_SEEK_KEY);
@@ -940,9 +1110,16 @@
         },
         showResumePrompt: (target, onStartFresh) => {
             const record = target?.record || target;
-            if (!CONFIG.autoResumePrompt || !record?.currentTime) return;
-            if (document.getElementById('bvh-resume')) return;
+            if (!CONFIG.autoResumePrompt || !record?.currentTime) {
+                Utils.log('UIComponent.showResumePrompt skipped', `auto=${CONFIG.autoResumePrompt}`, `hasTime=${!!record?.currentTime}`);
+                return;
+            }
+            if (document.getElementById('bvh-resume')) {
+                Utils.log('UIComponent.showResumePrompt skipped: prompt exists');
+                return;
+            }
             const label = target?.key ? `${EpisodeResolver.getPageLabel(target.key)} ` : '';
+            Utils.log('UIComponent.showResumePrompt show', `key=${target?.key || 'current'}`, `time=${record.currentTime}`, `percent=${record.percent || ''}`);
             const el = document.createElement('div');
             el.id = 'bvh-resume';
             el.className = 'bvh-resume';
@@ -1035,6 +1212,7 @@
                     <div class="bvh-actions">
                         <button class="bvh-btn primary" data-action="save-settings">保存设置</button>
                         <button class="bvh-btn" data-action="reset-settings">恢复默认设置</button>
+                        <button class="bvh-btn" data-action="download-debug-log">下载调试日志</button>
                         <button class="bvh-btn" data-action="reset-panel">恢复左下角面板位置</button>
                         ${currentRecord?.currentTime ? '<button class="bvh-btn primary" data-action="jump-current">跳转当前视频进度</button>' : ''}
                     </div>`;
@@ -1247,13 +1425,19 @@
                         return;
                     }
                     SettingsManager.save(patch);
+                    Utils.log('Settings saved', patch);
                     UIComponent.toast('设置已保存', 'success', 2000);
                     render();
                 }
                 if (target.dataset.action === 'reset-settings') {
                     SettingsManager.reset();
+                    Utils.log('Settings reset to default');
                     UIComponent.toast('设置已恢复默认', 'success', 2000);
                     render();
+                }
+                if (target.dataset.action === 'download-debug-log') {
+                    Utils.downloadDebugLog();
+                    UIComponent.toast('调试日志已下载', 'success', 2000);
                 }
                 if (target.dataset.action === 'reset-panel') {
                     GM_deleteValue('bvh_panel_position');
@@ -1365,6 +1549,7 @@
         }
 
         init() {
+            Utils.log('VideoPlayerObserver.init', `url=${location.href}`);
             const getBvId = () => {
                 // 合集页面: bvid 在 URL query 参数中
                 const urlKey = VideoKey.fromUrl(location.href);
@@ -1374,30 +1559,38 @@
 
             this.bvId = getBvId();
             if (!this.bvId) {
+                Utils.warn('VideoPlayerObserver.init no bvId, start polling __INITIAL_STATE__');
                 let retries = 0;
                 this.stateInterval = setInterval(() => {
                     this.bvId = getBvId();
                     if (this.bvId) {
+                        Utils.log('VideoPlayerObserver polling resolved bvId:', this.bvId, `retries=${retries}`);
                         clearInterval(this.stateInterval);
                         this.setupRecord();
                     } else if (retries++ > 50) {
+                        Utils.warn('VideoPlayerObserver polling stopped: bvId not found');
                         clearInterval(this.stateInterval);
                     }
                 }, 200);
             } else {
+                Utils.log('VideoPlayerObserver.init bvId:', this.bvId);
                 this.setupRecord();
             }
         }
 
         setupRecord() {
+            const done = Utils.debugTime('VideoPlayerObserver.setupRecord');
             this.bvId = EpisodeResolver.getCurrentKey() || VideoKey.normalize(this.bvId);
             const state = window.__INITIAL_STATE__;
             this.title = document.title || (state?.videoData?.title) || '';
+            Utils.log('VideoPlayerObserver.setupRecord resolved', `key=${this.bvId}`, `title=${this.title}`);
 
             const record = StorageManager.getRecord(this.bvId);
             if (record) {
+                Utils.log('VideoPlayerObserver.setupRecord existing record', this.bvId, record.status, record.percent || '');
                 UIComponent.showViewPanel(record, this.bvId);
             } else {
+                Utils.log('VideoPlayerObserver.setupRecord create visited record', this.bvId);
                 const visitedRecord = {
                     v: 2,
                     status: RECORD_STATUS.VISITED,
@@ -1411,12 +1604,15 @@
             }
             const latest = EpisodeResolver.getLatestRecord(VideoKey.base(this.bvId));
             if (latest) {
+                Utils.log('VideoPlayerObserver.setupRecord latest resume target', `current=${this.bvId}`, `target=${latest.key}`, latest.record.currentTime, latest.record.percent || '');
                 UIComponent.showResumePrompt(latest, () => {
                     if (this.videoEl) {
                         this.videoEl.currentTime = 0;
                         this.videoEl.play();
                     }
                 });
+            } else {
+                Utils.log('VideoPlayerObserver.setupRecord no resume target', this.bvId);
             }
 
             this.waitForVideo().then(video => {
@@ -1424,28 +1620,38 @@
                 this.bindEvents();
                 UIComponent.applyPendingSeek(this.bvId, video);
                 Utils.log('Video element bound');
+                done(`key=${this.bvId} videoReadyState=${video.readyState}`);
             }).catch(e => {
                 Utils.error('Video element not found or timeout', e);
+                done(`key=${this.bvId} video=timeout`);
             });
         }
 
         waitForVideo(timeout = 10000) {
+            const done = Utils.debugTime('VideoPlayerObserver.waitForVideo');
             return new Promise((resolve, reject) => {
                 const getVid = () => document.querySelector("#bilibili-player video, bwp-video");
                 let video = getVid();
-                if (video) return resolve(video);
+                if (video) {
+                    done('found immediately');
+                    return resolve(video);
+                }
+                let timer = null;
 
                 const observer = new MutationObserver(() => {
                     video = getVid();
                     if (video) {
                         observer.disconnect();
+                        if (timer) clearTimeout(timer);
+                        done('found by mutation');
                         resolve(video);
                     }
                 });
                 observer.observe(document.body, { childList: true, subtree: true });
 
-                setTimeout(() => {
+                timer = setTimeout(() => {
                     observer.disconnect();
+                    done('timeout');
                     reject(new Error("Timeout waiting for video element"));
                 }, timeout);
             });
@@ -1453,6 +1659,7 @@
 
         bindEvents() {
             if (!this.videoEl) return;
+            Utils.log('VideoPlayerObserver.bindEvents', `key=${this.bvId}`, `duration=${this.videoEl.duration || 'unknown'}`);
             this.videoEl.addEventListener('play', this._onPlay);
             this.videoEl.addEventListener('timeupdate', this._onTimeUpdate);
             this.videoEl.addEventListener('pause', this._onPause);
@@ -1460,14 +1667,22 @@
         }
 
         saveProgress(force = false) {
+            const start = performance.now();
             const currentKey = EpisodeResolver.getCurrentKey() || this.bvId;
             if (currentKey && currentKey !== this.bvId) {
+                Utils.log('VideoPlayerObserver.saveProgress key changed', `from=${this.bvId}`, `to=${currentKey}`);
                 this.bvId = currentKey;
                 const existing = StorageManager.getRecord(this.bvId);
                 if (existing) UIComponent.showViewPanel(existing, this.bvId);
             }
-            if (!this.hasPlayed || !this.bvId || !this.videoEl) return;
-            if (!this.videoEl.duration) return;
+            if (!this.hasPlayed || !this.bvId || !this.videoEl) {
+                Utils.logEvery('saveProgressSkippedNotReady', 20, `force=${force}`, `hasPlayed=${this.hasPlayed}`, `key=${this.bvId || 'none'}`, `video=${!!this.videoEl}`);
+                return;
+            }
+            if (!this.videoEl.duration) {
+                Utils.logEvery('saveProgressSkippedNoDuration', 20, `force=${force}`, `key=${this.bvId}`);
+                return;
+            }
 
             const current = this.videoEl.currentTime || 0;
             const duration = this.videoEl.duration || 1;
@@ -1501,9 +1716,12 @@
             const panel = document.getElementById('bvh-view-panel');
             if (panel) panel.dataset.bvhKey = this.bvId;
             UIComponent.updateViewPanelProgress(value);
+            Utils.log('VideoPlayerObserver.saveProgress saved', `key=${this.bvId}`, `time=${value.currentTime}`, `percent=${value.percent}`, `force=${force}`);
+            Utils.logSlow('VideoPlayerObserver.saveProgress', start, `key=${this.bvId} force=${force}`, 30);
         }
 
         destroy() {
+            Utils.log('VideoPlayerObserver.destroy', `key=${this.bvId}`, `hasLastState=${!!this._lastKnownState}`);
             // 使用缓存的进度数据保存，不再读取 video 元素（SPA 切换时 video 可能已加载新视频）
             if (this._lastKnownState?.key && this._lastKnownState?.value) {
                 StorageManager.saveRecord(this._lastKnownState.key, this._lastKnownState.value);
@@ -1532,43 +1750,64 @@
             this.schedulePlaylistRefresh = Utils.debounce(() => this.refreshPlaylistItems(), 120);
             this.initIntersectionObserver();
             this.initMutationObserver();
+            Utils.log('DOMWatcher constructed');
 
             // 事件驱动而非定时盲扫
             StorageManager.onDataChange(() => {
+                const start = performance.now();
+                let processed = 0;
+                let removed = 0;
                 this.visibleElements.forEach(el => {
                     if (document.contains(el)) {
                         this.processLink(el);
+                        processed++;
                     } else {
                         this.visibleElements.delete(el);
+                        removed++;
                     }
                 });
+                Utils.log('DOMWatcher data-change refresh', `visible=${this.visibleElements.size}`, `processed=${processed}`, `removed=${removed}`);
+                Utils.logSlow('DOMWatcher data-change refresh', start, `processed=${processed}`, 50);
             });
         }
 
         initIntersectionObserver() {
             this.intersectionObserver = new IntersectionObserver((entries) => {
+                const start = performance.now();
+                let enterCount = 0;
+                let leaveCount = 0;
                 entries.forEach(entry => {
                     if (entry.isIntersecting) {
                         this.visibleElements.add(entry.target);
                         this.processLink(entry.target);
+                        enterCount++;
                     } else {
                         this.visibleElements.delete(entry.target);
+                        leaveCount++;
                     }
                 });
+                Utils.logEvery('intersectionBatches', 20, `entries=${entries.length}`, `enter=${enterCount}`, `leave=${leaveCount}`, `visible=${this.visibleElements.size}`);
+                Utils.logSlow('DOMWatcher IntersectionObserver batch', start, `entries=${entries.length} enter=${enterCount}`, 50);
             }, { rootMargin: '200px 0px' });
+            Utils.log('DOMWatcher IntersectionObserver initialized');
         }
 
         initMutationObserver() {
             this.mutationObserver = new MutationObserver((mutations) => {
+                const start = performance.now();
                 let addedLinks = [];
                 let addedPlaylistItems = [];
                 let shouldRefreshFavoriteCards = false;
+                let attributeCount = 0;
+                let childListCount = 0;
+                let addedNodeCount = 0;
                 mutations.forEach(m => {
                     if (m.target?.nodeType === Node.ELEMENT_NODE && m.target.closest(HEADER_SELECTOR)) {
                         return;
                     }
 
                     if (m.type === 'attributes') {
+                        attributeCount++;
                         const target = m.target;
                         if (target.nodeType === Node.ELEMENT_NODE && target.closest('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
                             shouldRefreshFavoriteCards = true;
@@ -1584,7 +1823,9 @@
                     }
 
                     if (m.type === 'childList') {
+                        childListCount++;
                         m.addedNodes.forEach(node => {
+                            addedNodeCount++;
                             if (node.nodeType === Node.ELEMENT_NODE) {
                                 if (node.closest?.(HEADER_SELECTOR) || node.matches?.(HEADER_SELECTOR)) {
                                     return;
@@ -1625,6 +1866,8 @@
                 if (shouldRefreshFavoriteCards) {
                     this.scheduleFavoriteRefresh();
                 }
+                Utils.logEvery('mutationBatches', 20, `mutations=${mutations.length}`, `attr=${attributeCount}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `links=${addedLinks.length}`, `playlist=${addedPlaylistItems.length}`, `favorite=${shouldRefreshFavoriteCards}`);
+                Utils.logSlow('DOMWatcher MutationObserver batch', start, `mutations=${mutations.length} attr=${attributeCount} child=${childListCount} links=${addedLinks.length} playlist=${addedPlaylistItems.length}`, 50);
             });
             this.mutationObserver.observe(document.body, {
                 childList: true,
@@ -1632,6 +1875,7 @@
                 attributes: true,
                 attributeFilter: ['href', 'data-bsb-bvid', 'data-key', 'data-cid', 'class', 'src', 'srcset', 'title']
             });
+            Utils.log('DOMWatcher MutationObserver initialized');
         }
 
         observeLink(el) {
@@ -1639,10 +1883,12 @@
             if (!this.processedLinks.has(el) && this.isValidLink(el)) {
                 this.processedLinks.add(el);
                 this.intersectionObserver.observe(el);
+                Utils.logEvery('observedLinks', 100, Utils.describeElement(el), el.href || '');
             }
         }
 
         scanExistingLinks() {
+            const done = Utils.debugTime('DOMWatcher.scanExistingLinks');
             const links = document.querySelectorAll('a[href]');
             links.forEach(link => this.observeLink(link));
             // 合集播放列表项
@@ -1652,28 +1898,37 @@
                 this.processPlaylistItem(item);
             });
             this.refreshFavoriteCards();
+            done(`links=${links.length} playlist=${playlistItems.length} visible=${this.visibleElements.size}`);
         }
 
         // 强制刷新所有播放列表项标签（绕过 processedLinks 检查）
         refreshPlaylistItems() {
+            const done = Utils.debugTime('DOMWatcher.refreshPlaylistItems');
             const items = document.querySelectorAll(PLAYLIST_ITEM_SELECTOR);
+            let processed = 0;
             items.forEach(item => {
                 // 确保新节点也被纳入观察
                 this.observePlaylistItem(item);
                 // 直接重新处理，不依赖 IntersectionObserver 回调
                 this.processPlaylistItem(item);
+                processed++;
             });
+            done(`items=${items.length} processed=${processed}`);
         }
 
         // 收藏夹弹窗会复用卡片节点并改写 href / 图片 / 标题，必须绕过 WeakSet 直接刷新
         refreshFavoriteCards() {
+            const done = Utils.debugTime('DOMWatcher.refreshFavoriteCards');
             const cards = document.querySelectorAll('.favorite-panel-popover .header-fav-card, #favorite-content-scroll .header-fav-card');
+            let processed = 0;
             cards.forEach(card => {
                 if (card.href && !card.closest(HEADER_SELECTOR)) {
                     this.observeLink(card);
                     this.processLink(card);
+                    processed++;
                 }
             });
+            done(`cards=${cards.length} processed=${processed}`);
         }
 
         getVideoKeyFromLink(el) {
@@ -1732,6 +1987,7 @@
                 if (this.getPlaylistItemInfo(el)) {
                     this.processedLinks.add(el);
                     this.intersectionObserver.observe(el);
+                    Utils.logEvery('observedPlaylistItems', 50, Utils.describeElement(el));
                 }
             }
         }
@@ -1821,14 +2077,19 @@
         }
 
         processPlaylistItem(el) {
+            const start = performance.now();
             const item = this.getPlaylistItemInfo(el);
             if (!item?.key) return;
 
             let record = StorageManager.getRecord(item.key);
             const isActionListItem = el.matches(ACTION_LIST_ITEM_SELECTOR);
             el.querySelectorAll(isActionListItem ? '.bvh-episode-tag, .bvh-action-list-cover-tag' : '.bvh-episode-tag').forEach(tag => tag.remove());
-            if (!record) return;
+            if (!record) {
+                Utils.logSlow('DOMWatcher.processPlaylistItem no-record', start, `key=${item.key} el=${Utils.describeElement(el)}`, 30);
+                return;
+            }
             if (record.status === RECORD_STATUS.VISITED && !CONFIG.showVisitedTag) {
+                Utils.logSlow('DOMWatcher.processPlaylistItem hidden-visited', start, `key=${item.key}`, 30);
                 return;
             }
 
@@ -1839,6 +2100,7 @@
                     if (!el._bvhActionListRetryCount) el._bvhActionListRetryCount = 0;
                     if (el._bvhActionListRetryCount < 5) {
                         el._bvhActionListRetryCount++;
+                        Utils.log('DOMWatcher.processPlaylistItem retry action-list cover', `key=${item.key}`, `retry=${el._bvhActionListRetryCount}`);
                         setTimeout(() => this.processPlaylistItem(el), 600);
                     }
                     return;
@@ -1851,6 +2113,7 @@
                 } else {
                     coverTarget.insertBefore(tagEl, coverTarget.firstChild);
                 }
+                Utils.logSlow('DOMWatcher.processPlaylistItem action-list', start, `key=${item.key}`, 30);
                 return;
             }
 
@@ -1865,9 +2128,11 @@
                         : (el.querySelector('.simple-base-item.normal > .title') || el.querySelector('.title') || el))
                     : (el.querySelector('.title-txt, .bpx-player-ctrl-eplist-multi-menu-item-text, .title') || el);
             target.appendChild(tagEl);
+            Utils.logSlow('DOMWatcher.processPlaylistItem', start, `key=${item.key} record=${record.status}${record.percent || ''}`, 30);
         }
 
         processLink(el) {
+            const start = performance.now();
             if (el.closest?.(HEADER_SELECTOR)) return;
 
             // 合集播放列表项走专用处理（它们是 div 而非 a）
@@ -1901,11 +2166,13 @@
                     this.removeExistingMark(el);
                 }
                 el._bvhLastVideoKey = bv;
+                Utils.logSlow('DOMWatcher.processLink no-record', start, `key=${bv} el=${Utils.describeElement(el)}`, 30);
                 return;
             }
             if (record.status === RECORD_STATUS.VISITED && !CONFIG.showVisitedTag) {
                 this.removeExistingMark(el);
                 el._bvhLastVideoKey = bv;
+                Utils.logSlow('DOMWatcher.processLink hidden-visited', start, `key=${bv}`, 30);
                 return;
             }
 
@@ -1929,7 +2196,10 @@
             const existingTags = el.querySelectorAll('.bvh-tag, .bvh-tag-small, .bvh-tag-big');
             const existingBars = el.querySelectorAll('.bvh-progress-bar');
             if (existingTags.length > 0 || existingBars.length > 0) {
-                if (existingTags.length === 1 && existingBars.length <= 1 && isSameVideoKey && existingTags[0].innerText === tagText) return;
+                if (existingTags.length === 1 && existingBars.length <= 1 && isSameVideoKey && existingTags[0].innerText === tagText) {
+                    Utils.logSlow('DOMWatcher.processLink unchanged', start, `key=${bv}`, 30);
+                    return;
+                }
                 this.removeExistingMark(el);
             }
 
@@ -1952,16 +2222,21 @@
                 // 图片可能尚未懒加载完成，安排一次重试
                 if (!el._bvhRetryCount) {
                     el._bvhRetryCount = 1;
+                    Utils.log('DOMWatcher.processLink retry: image not ready', `key=${bv}`, `retry=${el._bvhRetryCount}`, Utils.describeElement(el));
                     setTimeout(() => this.processLink(el), 800);
                 } else if (el._bvhRetryCount < 3) {
                     el._bvhRetryCount++;
+                    Utils.log('DOMWatcher.processLink retry: image not ready', `key=${bv}`, `retry=${el._bvhRetryCount}`, Utils.describeElement(el));
                     setTimeout(() => this.processLink(el), 800);
                 }
                 return;
             }
 
             // 确保标签不会注入到头像图片上
-            if (img.closest('.bili-avatar, .header-dynamic-avatar')) return;
+            if (img.closest('.bili-avatar, .header-dynamic-avatar')) {
+                Utils.logSlow('DOMWatcher.processLink skip avatar image', start, `key=${bv}`, 30);
+                return;
+            }
 
             if (img) {
                 const width = img.width || img.getBoundingClientRect().width;
@@ -1994,6 +2269,7 @@
                     img.parentNode.insertBefore(barEl, img);
                 }
             }
+            Utils.logSlow('DOMWatcher.processLink', start, `key=${bv} record=${record.status}${record.percent || ''} multi=${isMulti} el=${Utils.describeElement(el)}`, 30);
         }
     }
 
@@ -2007,8 +2283,9 @@
         }
 
         start() {
+            const done = Utils.debugTime('AppController.start');
             const currentVersion = typeof GM_info !== 'undefined' ? (GM_info.script?.version || 'unknown') : 'unknown';
-            Utils.log(`Script started v${currentVersion}`);
+            Utils.log(`Script started v${currentVersion}`, `url=${location.href}`, `readyState=${document.readyState}`, `debug=${CONFIG.debug}`);
 
             // 数据迁移（v1/v2 → v3 分片，仅首次执行）
             StorageManager.migrateIfNeeded();
@@ -2018,9 +2295,11 @@
             StorageManager.cleanupLocalStorageBackups();
 
             this.deferDomStart();
+            done('scheduled DOM start');
         }
 
         deferDomStart() {
+            Utils.log('AppController.deferDomStart', `readyState=${document.readyState}`);
             const startWhenIdle = (reason) => {
                 if (this._domStarted) return;
                 Utils.log('DOM phase scheduled:', reason);
@@ -2034,6 +2313,7 @@
 
             const waitForHeader = () => {
                 if (this._domStarted) return;
+                Utils.log('AppController.waitForHeader start', `hasHeader=${!!document.querySelector(HEADER_SELECTOR)}`);
 
                 let rootObserver = null;
                 let headerObserver = null;
@@ -2046,23 +2326,27 @@
                     if (settleTimer) clearTimeout(settleTimer);
                 };
                 const scheduleStart = (reason) => {
+                    Utils.log('AppController.waitForHeader scheduleStart', reason);
                     cleanup();
                     startWhenIdle(reason);
                 };
                 const scheduleSettledStart = (reason) => {
                     if (settleTimer) clearTimeout(settleTimer);
+                    Utils.log('AppController.waitForHeader scheduleSettledStart', reason);
                     settleTimer = setTimeout(() => {
                         scheduleStart(reason);
                     }, HEADER_SETTLE_DELAY);
                 };
                 const observeHeaderSettle = (header) => {
                     if (!header) return false;
+                    Utils.log('AppController.waitForHeader observe header', Utils.describeElement(header));
                     if (rootObserver) {
                         rootObserver.disconnect();
                         rootObserver = null;
                     }
                     if (headerObserver) headerObserver.disconnect();
                     headerObserver = new MutationObserver(() => {
+                        Utils.logEvery('headerMutationBatches', 10, 'header mutation observed');
                         scheduleSettledStart('header settled');
                     });
                     headerObserver.observe(header, { childList: true, subtree: true });
@@ -2071,6 +2355,7 @@
                 };
 
                 if (!observeHeaderSettle(document.querySelector(HEADER_SELECTOR))) {
+                    Utils.log('AppController.waitForHeader observe document root for header');
                     rootObserver = new MutationObserver(() => {
                         observeHeaderSettle(document.querySelector(HEADER_SELECTOR));
                     });
@@ -2095,7 +2380,9 @@
 
         startDomPhase() {
             if (this._domStarted) return;
+            const done = Utils.debugTime('AppController.startDomPhase');
             this._domStarted = true;
+            Utils.log('AppController.startDomPhase begin', `url=${location.href}`);
 
             this.checkFirstRun();
 
@@ -2110,9 +2397,11 @@
             this.checkAndInitVideoPage();
             UIComponent.showQuickEntry();
             this.hijackRouter();
+            done('initialized watchers/player/router');
 
             // 标签页切回时刷新缓存（从其他标签页观看视频后返回列表页）
             document.addEventListener('visibilitychange', () => {
+                Utils.log('visibilitychange', document.visibilityState);
                 if (document.visibilityState === 'visible') {
                     StorageManager.invalidateCache();
                     StorageManager._notifyChange();
@@ -2123,6 +2412,7 @@
         checkFirstRun() {
             const currentVersion = typeof GM_info !== 'undefined' ? (GM_info.script?.version || '2.1.0') : '2.1.0';
             const lastVersion = GM_getValue('bvh_last_version');
+            Utils.log('AppController.checkFirstRun', `last=${lastVersion || 'none'}`, `current=${currentVersion}`);
             if (lastVersion !== currentVersion) {
                 UIComponent.toast(`Bilibili视频观看历史记录 更新至 v${currentVersion}`, "success", 4000);
                 GM_setValue('bvh_last_version', currentVersion);
@@ -2130,7 +2420,11 @@
         }
 
         initMenuCommands() {
-            if (typeof GM_registerMenuCommand === 'undefined') return;
+            if (typeof GM_registerMenuCommand === 'undefined') {
+                Utils.warn('GM_registerMenuCommand unavailable');
+                return;
+            }
+            Utils.log('AppController.initMenuCommands');
 
             GM_registerMenuCommand('打开设置与历史管理', () => {
                 UIComponent.showManagerPanel({ activeTab: 'history' });
@@ -2197,6 +2491,7 @@
 
         checkAndInitVideoPage() {
             const isVideoPage = /\/(video|v|medialist\/play|list)\//.test(location.href) || window.__INITIAL_STATE__?.bvid || /[?&]bvid=/.test(location.href);
+            Utils.log('AppController.checkAndInitVideoPage', `isVideoPage=${!!isVideoPage}`, `url=${location.href}`, `stateBvid=${window.__INITIAL_STATE__?.bvid || 'none'}`);
             if (isVideoPage) {
                 if (this.playerObserver) {
                     this.playerObserver.destroy();
@@ -2208,6 +2503,7 @@
 
         hijackRouter() {
             if (!history.pushState.__bvh_patched) {
+                Utils.log('AppController.hijackRouter patch history methods');
                 const originalPushState = history.pushState;
                 const originalReplaceState = history.replaceState;
 
@@ -2234,12 +2530,14 @@
                     this.currentUrl = location.href;
                     Utils.log('Route changed:', this.currentUrl);
                     setTimeout(() => {
+                        const done = Utils.debugTime('AppController.locationchange delayed refresh');
                         this.checkAndInitVideoPage();
                         UIComponent.showQuickEntry();
                         // 合集/分 P 切换视频时强制刷新播放列表标签
                         if (this.domWatcher && (/\/list\//.test(location.href) || document.querySelector(PLAYLIST_ITEM_SELECTOR))) {
                             this.domWatcher.refreshPlaylistItems();
                         }
+                        done(`url=${location.href}`);
                     }, 500);
                 }
             });
