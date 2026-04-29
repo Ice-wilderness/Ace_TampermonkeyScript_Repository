@@ -1352,6 +1352,14 @@
         return state.firstPageNextIndex < state.firstPageImages.length;
     }
 
+    function appendRemainingFirstPageImages(state) {
+        if (!hasFirstPageRemainingImages(state)) return false;
+        const remaining = state.firstPageImages.slice(state.firstPageNextIndex);
+        state.firstPageNextIndex = state.firstPageImages.length;
+        appendImagePlaceholders(state, remaining, { silent: !canFetchExtraPages() });
+        return true;
+    }
+
     function updateMoreButton(state) {
         state.moreBtn.style.display = 'none';
         const hasMoreFirst = hasFirstPageRemainingImages(state);
@@ -1404,6 +1412,116 @@
         }
         updateMoreButton(state);
         updateButtonLabel(state);
+    }
+
+    function appendAutoPreviewCandidates(state, targetLimit, silent = true) {
+        if (!hasFirstPageRemainingImages(state) || state.validCountForTitle >= targetLimit) return false;
+        const neededCount = targetLimit - state.validCountForTitle;
+        const nextImages = [];
+        while (state.firstPageNextIndex < state.firstPageImages.length && nextImages.length < neededCount) {
+            const imgSrc = state.firstPageImages[state.firstPageNextIndex++];
+            if (state.renderedSrcSet.has(imgSrc)) continue;
+            nextImages.push(imgSrc);
+        }
+        if (nextImages.length === 0) return false;
+        appendImagePlaceholders(state, nextImages, { silent, autoFillLimit: targetLimit });
+        return true;
+    }
+
+    function appendImagePlaceholders(state, srcList, options = {}) {
+        const { previewContainer, previewOuter, fullBtn, progressBarFill,
+                progressContainer, threadUrl } = state;
+        const silent = options.silent === true;
+        const limit = Number.isFinite(options.limit) ? options.limit : null;
+        const autoFillLimit = Number.isFinite(options.autoFillLimit) ? options.autoFillLimit : null;
+        let acceptedInThisRun = 0;
+        const uniqueList = srcList.filter(src => {
+            if (state.renderedSrcSet.has(src)) return false;
+            state.renderedSrcSet.add(src);
+            return true;
+        });
+
+        if (uniqueList.length === 0) {
+            updateStatus(state);
+            return;
+        }
+
+        state.pendingCount += uniqueList.length;
+        state.checkedCount += uniqueList.length;
+
+        const observer = new IntersectionObserver((entries, obs) => {
+            entries.forEach(entry => {
+                if (!entry.isIntersecting) return;
+                const placeholder = entry.target;
+                obs.unobserve(placeholder);
+
+                const imgSrc = placeholder.dataset.src;
+                const finalSrc = (!imgSrc.startsWith('http') && !imgSrc.startsWith('//'))
+                    ? new URL(imgSrc, threadUrl).href : imgSrc;
+                const tempImg = new Image();
+                let isHandled = false;
+
+                const finish = (shouldShow) => {
+                    if (isHandled) return;
+                    isHandled = true;
+                    const overLimit = shouldShow && limit !== null && acceptedInThisRun >= limit;
+                    if (shouldShow && !overLimit) {
+                        acceptedInThisRun++;
+                        state.validCountForTitle++;
+                        const previewImg = document.createElement('img');
+                        previewImg.src = finalSrc;
+                        previewImg.className = 'preview-img-item';
+                        previewImg.style.aspectRatio = `${tempImg.naturalWidth} / ${tempImg.naturalHeight}`;
+                        placeholder.replaceWith(previewImg);
+                        syncFullButtonSize(state);
+                    } else {
+                        if (overLimit) state.renderedSrcSet.delete(imgSrc);
+                        placeholder.remove();
+                    }
+                    state.pendingCount--;
+                    progressBarFill.style.width = state.checkedCount
+                        ? `${Math.min(95, 40 + 55 * ((state.checkedCount - state.pendingCount) / state.checkedCount))}%`
+                        : '95%';
+                    if (state.pendingCount === 0) progressContainer.style.display = 'none';
+                    if (state.pendingCount === 0 && autoFillLimit !== null && state.validCountForTitle < autoFillLimit) {
+                        if (appendAutoPreviewCandidates(state, autoFillLimit, silent)) return;
+                    }
+                    updateStatus(state);
+                };
+
+                const pollDimension = () => {
+                    if (isHandled) return;
+                    if (tempImg.naturalWidth > 0 && tempImg.naturalHeight > 0) {
+                        const minDim = getMinDimension();
+                        finish(tempImg.naturalWidth >= minDim && tempImg.naturalHeight >= minDim);
+                    } else {
+                        requestAnimationFrame(pollDimension);
+                    }
+                };
+
+                requestAnimationFrame(pollDimension);
+                tempImg.onload = () => {
+                    const minDim = getMinDimension();
+                    finish(tempImg.naturalWidth >= minDim && tempImg.naturalHeight >= minDim);
+                };
+                tempImg.onerror = () => finish(false);
+                tempImg.src = finalSrc;
+            });
+        }, { root: previewOuter, rootMargin: '400px 0px', threshold: 0.01 });
+
+        uniqueList.forEach(imgSrc => {
+            const placeholder = document.createElement('div');
+            placeholder.className = 'preview-img-loading';
+            placeholder.textContent = silent ? '' : '等待呈现...';
+            placeholder.dataset.src = imgSrc;
+            if (fullBtn.parentNode === previewContainer) {
+                previewContainer.insertBefore(placeholder, fullBtn);
+            } else {
+                previewContainer.appendChild(placeholder);
+            }
+            observer.observe(placeholder);
+        });
+        updateStatus(state);
     }
 
     async function fetchPageImages(state, page, options = {}) {
@@ -1460,125 +1578,7 @@
         let firstPageImages = [];
         let firstPageNextIndex = 0;
         const renderedSrcSet = new Set();
-        let appendAutoPreviewCandidates = () => false;
-
-
         setManualFeedbackVisible(state, false);
-
-
-        const appendRemainingFirstPageImages = () => {
-            if (!hasFirstPageRemainingImages(state)) return false;
-            const remainingImages = firstPageImages.slice(firstPageNextIndex);
-            firstPageNextIndex = firstPageImages.length;
-            appendImagePlaceholders(remainingImages, { silent: !canFetchExtraPages() });
-            return true;
-        };
-
-
-        const appendImagePlaceholders = (srcList, options = {}) => {
-            const silent = options.silent === true;
-            const limit = Number.isFinite(options.limit) ? options.limit : null;
-            const autoFillLimit = Number.isFinite(options.autoFillLimit) ? options.autoFillLimit : null;
-            let acceptedInThisRun = 0;
-            const uniqueList = srcList.filter(src => {
-                if (renderedSrcSet.has(src)) return false;
-                renderedSrcSet.add(src);
-                return true;
-            });
-
-            if (uniqueList.length === 0) {
-                updateStatus(state);
-                return;
-            }
-
-            pendingCount += uniqueList.length;
-            checkedCount += uniqueList.length;
-
-            const observer = new IntersectionObserver((entries, obs) => {
-                entries.forEach(entry => {
-                    if (!entry.isIntersecting) return;
-                    const placeholder = entry.target;
-                    obs.unobserve(placeholder);
-
-                    const imgSrc = placeholder.dataset.src;
-                    const finalSrc = (!imgSrc.startsWith('http') && !imgSrc.startsWith('//')) ? new URL(imgSrc, threadUrl).href : imgSrc;
-                    const tempImg = new Image();
-                    let isHandled = false;
-
-                    const finish = (shouldShow) => {
-                        if (isHandled) return;
-                        isHandled = true;
-                        const overLimit = shouldShow && limit !== null && acceptedInThisRun >= limit;
-                        if (shouldShow && !overLimit) {
-                            acceptedInThisRun++;
-                            validCountForTitle++;
-                            const previewImg = document.createElement('img');
-                            previewImg.src = finalSrc;
-                            previewImg.className = 'preview-img-item';
-                            previewImg.style.aspectRatio = `${tempImg.naturalWidth} / ${tempImg.naturalHeight}`;
-                            placeholder.replaceWith(previewImg);
-                            syncFullButtonSize(state);
-                        } else {
-                            if (overLimit) renderedSrcSet.delete(imgSrc);
-                            placeholder.remove();
-                        }
-                        pendingCount--;
-                        progressBarFill.style.width = checkedCount ? `${Math.min(95, 40 + 55 * ((checkedCount - pendingCount) / checkedCount))}%` : '95%';
-                        if (pendingCount === 0) progressContainer.style.display = 'none';
-                        if (pendingCount === 0 && autoFillLimit !== null && validCountForTitle < autoFillLimit) {
-                            if (appendAutoPreviewCandidates(autoFillLimit, silent)) return;
-                        }
-                        updateStatus(state);
-                    };
-
-                    const pollDimension = () => {
-                        if (isHandled) return;
-                        if (tempImg.naturalWidth > 0 && tempImg.naturalHeight > 0) {
-                            const minDimension = getMinDimension();
-                            finish(tempImg.naturalWidth >= minDimension && tempImg.naturalHeight >= minDimension);
-                        } else {
-                            requestAnimationFrame(pollDimension);
-                        }
-                    };
-
-                    requestAnimationFrame(pollDimension);
-                    tempImg.onload = () => {
-                        const minDimension = getMinDimension();
-                        finish(tempImg.naturalWidth >= minDimension && tempImg.naturalHeight >= minDimension);
-                    };
-                    tempImg.onerror = () => finish(false);
-                    tempImg.src = finalSrc;
-                });
-            }, { root: previewOuter, rootMargin: '400px 0px', threshold: 0.01 });
-
-            uniqueList.forEach(imgSrc => {
-                const placeholder = document.createElement('div');
-                placeholder.className = 'preview-img-loading';
-                placeholder.textContent = silent ? '' : '等待呈现...';
-                placeholder.dataset.src = imgSrc;
-                if (fullBtn.parentNode === previewContainer) {
-                    previewContainer.insertBefore(placeholder, fullBtn);
-                } else {
-                    previewContainer.appendChild(placeholder);
-                }
-                observer.observe(placeholder);
-            });
-            updateStatus(state);
-        };
-
-        appendAutoPreviewCandidates = (targetLimit, silent = true) => {
-            if (!hasFirstPageRemainingImages(state) || validCountForTitle >= targetLimit) return false;
-            const neededCount = targetLimit - validCountForTitle;
-            const nextImages = [];
-            while (firstPageNextIndex < firstPageImages.length && nextImages.length < neededCount) {
-                const imgSrc = firstPageImages[firstPageNextIndex++];
-                if (renderedSrcSet.has(imgSrc)) continue;
-                nextImages.push(imgSrc);
-            }
-            if (nextImages.length === 0) return false;
-            appendImagePlaceholders(nextImages, { silent, autoFillLimit: targetLimit });
-            return true;
-        };
 
 
         const loadAutoPreview = async () => {
@@ -1597,7 +1597,7 @@
                 firstPageNextIndex = 0;
                 maxPage = cache.maxPage || maxPage || 1;
                 loadedPageUntil = Math.max(loadedPageUntil, 1);
-                appendAutoPreviewCandidates(getAutoPreviewLimit(), true);
+                appendAutoPreviewCandidates(state, getAutoPreviewLimit(), true);
                 previewContainer.dataset.loaded = 'true';
                 delete previewContainer.dataset.error;
                 updateStatus(state);
@@ -1648,7 +1648,7 @@
                     loadedPageUntil = Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE);
                 }
 
-                appendImagePlaceholders([...new Set(batchImages)], { silent: !canFetchExtraPages() });
+                appendImagePlaceholders(state, [...new Set(batchImages)], { silent: !canFetchExtraPages() });
                 previewContainer.dataset.loaded = 'true';
                 delete previewContainer.dataset.error;
                 updateThreadData(threadId, { viewedImages: true });
@@ -1683,7 +1683,7 @@
                         fullPreviewMode = true;
                         previewOuter.style.display = 'block';
                         button.textContent = '获取中...';
-                        if (appendRemainingFirstPageImages()) {
+                        if (appendRemainingFirstPageImages(state)) {
                             updateThreadData(threadId, { viewedImages: true });
                             refreshThreadMark(threadElement);
                             updateButtonLabel(state);
@@ -1720,7 +1720,7 @@
             previewOuter.style.display = 'block';
             updateThreadData(threadId, { viewedImages: true });
             refreshThreadMark(threadElement);
-            const appendedFirstPageRemaining = appendRemainingFirstPageImages();
+            const appendedFirstPageRemaining = appendRemainingFirstPageImages(state);
             updateStatus(state);
             if (!appendedFirstPageRemaining && canFetchExtraPages() && loadedPageUntil < maxPage) {
                 await loadPageBatch(loadedPageUntil + 1);
