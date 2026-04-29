@@ -632,17 +632,22 @@
         return Math.min(max, Math.max(min, Math.round(value)));
     }
 
-    function getMinDimension() {
-        return getNumberSetting('preview_min_dimension', DEFAULT_MIN_DIMENSION, 1, 2000);
+    const CONFIG_DEFS = {
+        preview_min_dimension:     { default: DEFAULT_MIN_DIMENSION,         min: 1,  max: 2000 },
+        auto_preview_limit:        { default: DEFAULT_AUTO_PREVIEW_LIMIT,    min: 1,  max: 20 },
+        auto_preview_concurrent:   { default: DEFAULT_AUTO_PREVIEW_CONCURRENT, min: 1, max: 5 },
+    };
+
+    function getConfig(key) {
+        const def = CONFIG_DEFS[key];
+        if (!def) return undefined;
+        return getNumberSetting(key, def.default, def.min, def.max);
     }
 
-    function getAutoPreviewLimit() {
-        return getNumberSetting('auto_preview_limit', DEFAULT_AUTO_PREVIEW_LIMIT, 1, 20);
-    }
-
-    function getAutoPreviewConcurrent() {
-        return getNumberSetting('auto_preview_concurrent', DEFAULT_AUTO_PREVIEW_CONCURRENT, 1, 5);
-    }
+    // 旧 wrapper 保留，内部委托给 getConfig，实现平滑过渡
+    function getMinDimension() { return getConfig('preview_min_dimension'); }
+    function getAutoPreviewLimit() { return getConfig('auto_preview_limit'); }
+    function getAutoPreviewConcurrent() { return getConfig('auto_preview_concurrent'); }
 
     function canFetchExtraPages() {
         return GM_getValue('enable_extra_page_preview', false);
