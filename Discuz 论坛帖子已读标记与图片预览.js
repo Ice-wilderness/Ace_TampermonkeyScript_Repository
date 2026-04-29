@@ -26,32 +26,192 @@
 
     // 注入自定义 CSS
     GM_addStyle(`
+        :root {
+            --dh-modal-bg: #fff;
+            --dh-modal-title: #333;
+            --dh-modal-label: #555;
+            --dh-section-bg: #fafafa;
+            --dh-section-border: #e5e7eb;
+            --dh-section-title: #333;
+            --dh-section-text: #777;
+            --dh-field-color: #555;
+            --dh-input-bg: #fff;
+            --dh-input-border: #d1d5db;
+            --dh-input-color: #333;
+            --dh-float-btn-bg: #ffffff;
+            --dh-float-btn-color: #333;
+            --dh-float-btn-border: rgba(0, 0, 0, 0.12);
+            --dh-float-btn-hover-bg: #f3f7ff;
+            --dh-float-btn-hover-border: #9fc5ff;
+            --dh-preview-btn-bg: #f9f9f9;
+            --dh-preview-btn-color: #333;
+            --dh-preview-btn-border: #dcdcdc;
+            --dh-preview-btn-hover-bg: #e0e0e0;
+            --dh-preview-container-bg: #f0f2f5;
+            --dh-preview-container-border: #e4e7ed;
+            --dh-preview-status-color: #666;
+            --dh-preview-more-bg: #fff;
+            --dh-preview-more-color: #333;
+            --dh-preview-more-border: #cfd6df;
+            --dh-preview-more-hover-bg: #eef5ff;
+            --dh-preview-more-hover-border: #9fc5ff;
+            --dh-preview-more-hover-color: #333;
+            --dh-preview-full-bg: #fff;
+            --dh-preview-full-color: #333;
+            --dh-preview-full-border: #cfd6df;
+            --dh-preview-full-hover-bg: #fff7e6;
+            --dh-preview-full-hover-border: #f0b35d;
+            --dh-preview-full-hover-color: #333;
+            --dh-progress-bg: #e0e0e0;
+            --dh-img-item-bg: #f8f9fa;
+            --dh-img-item-border: #ccc;
+            --dh-img-loading-bg: #f8f9fa;
+            --dh-img-loading-border: #dcdcdc;
+            --dh-img-loading-color: #aaa;
+            --dh-visited-default-bg: #a9a9a9;
+            --dh-visited-label-color: #363636;
+            --dh-viewed-images-bg: #d2d2d2;
+            --dh-viewed-images-label-color: #ff8c00;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --dh-modal-bg: #2a2a2a;
+                --dh-modal-title: #fff;
+                --dh-modal-label: #ccc;
+                --dh-section-bg: #222;
+                --dh-section-border: #3a3a3a;
+                --dh-section-title: #eee;
+                --dh-field-color: #ccc;
+                --dh-input-bg: #1f1f1f;
+                --dh-input-border: #555;
+                --dh-input-color: #eee;
+                --dh-float-btn-bg: #2d2d2d;
+                --dh-float-btn-color: #eee;
+                --dh-float-btn-border: #555;
+                --dh-float-btn-hover-bg: #3a3a3a;
+                --dh-preview-btn-bg: #333;
+                --dh-preview-btn-color: #ccc;
+                --dh-preview-btn-border: #555;
+                --dh-preview-btn-hover-bg: #444;
+                --dh-preview-container-bg: #1e1e1e;
+                --dh-preview-container-border: #333;
+                --dh-preview-more-bg: #2d2d2d;
+                --dh-preview-more-color: #ccc;
+                --dh-preview-more-border: #555;
+                --dh-preview-more-hover-bg: #3a3a3a;
+                --dh-preview-more-hover-border: #555;
+                --dh-preview-more-hover-color: #fff;
+                --dh-preview-full-bg: #2d2d2d;
+                --dh-preview-full-color: #ccc;
+                --dh-preview-full-border: #555;
+                --dh-preview-full-hover-bg: #3a3a3a;
+                --dh-preview-full-hover-border: #555;
+                --dh-preview-full-hover-color: #fff;
+                --dh-progress-bg: #444;
+                --dh-img-item-bg: #222;
+                --dh-img-item-border: #444;
+                --dh-img-loading-bg: #222;
+                --dh-img-loading-border: #444;
+                --dh-visited-default-bg: #2a2a2a;
+                --dh-viewed-images-bg: #364136;
+            }
+        }
+
         /* 设置与管理面板样式 */
         .custom-modal-overlay {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
             background-color: rgba(0, 0, 0, 0.5);
-            display: flex; justify-content: center; align-items: center; z-index: 10000;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            z-index: 10000;
         }
         .custom-modal-content {
-            background-color: #fff; padding: 20px; border-radius: 8px;
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16); max-width: 760px; width: 92%;
-            max-height: 86vh; overflow-y: auto; font-family: Arial, sans-serif; text-align: left;
+            background-color: var(--dh-modal-bg);
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.16);
+            max-width: 760px;
+            width: 92%;
+            max-height: 86vh;
+            overflow-y: auto;
+            font-family: Arial, sans-serif;
+            text-align: left;
         }
-        .custom-modal-content h3 { margin-top: 0; color: #333; }
-        .custom-modal-content label { display: block; margin: 12px 0; font-size: 14px; cursor: pointer; color: #555; text-align: left;}
+        .custom-modal-content h3 {
+            margin-top: 0;
+            color: var(--dh-modal-title);
+        }
+        .custom-modal-content label {
+            display: block;
+            margin: 12px 0;
+            font-size: 14px;
+            cursor: pointer;
+            color: var(--dh-modal-label);
+            text-align: left;
+        }
         .custom-modal-content input[type="checkbox"] { margin-right: 10px; }
-        .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 16px 0; }
-        .settings-section { border: 1px solid #e5e7eb; border-radius: 8px; padding: 12px; background: #fafafa; }
-        .settings-section h4 { margin: 0 0 10px; font-size: 15px; color: #333; }
-        .settings-section p { margin: 8px 0; color: #777; font-size: 12px; line-height: 1.6; }
-        .settings-field { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0; color: #555; font-size: 13px; }
-        .settings-field input[type="number"], .settings-field select {
-            width: 120px; max-width: 48%; padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 4px; background: #fff; color: #333;
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+            margin: 16px 0;
         }
-        .settings-actions { text-align: center; margin-top: 12px; }
+        .settings-section {
+            border: 1px solid var(--dh-section-border);
+            border-radius: 8px;
+            padding: 12px;
+            background: var(--dh-section-bg);
+        }
+        .settings-section h4 {
+            margin: 0 0 10px;
+            font-size: 15px;
+            color: var(--dh-section-title);
+        }
+        .settings-section p {
+            margin: 8px 0;
+            color: var(--dh-section-text);
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .settings-field {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+            margin: 10px 0;
+            color: var(--dh-field-color);
+            font-size: 13px;
+        }
+        .settings-field input[type="number"],
+        .settings-field select {
+            width: 120px;
+            max-width: 48%;
+            padding: 5px 8px;
+            border: 1px solid var(--dh-input-border);
+            border-radius: 4px;
+            background: var(--dh-input-bg);
+            color: var(--dh-input-color);
+        }
+        .settings-actions {
+            text-align: center;
+            margin-top: 12px;
+        }
         .custom-modal-btn {
-            padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; margin: 5px;
-            font-size: 14px; background-color: #007bff; color: #fff; transition: background-color 0.3s;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin: 5px;
+            font-size: 14px;
+            background-color: #007bff;
+            color: #fff;
+            transition: background-color 0.3s;
         }
         .custom-modal-btn:hover { background-color: #0056b3; }
         .custom-modal-btn.danger { background-color: #dc3545; }
@@ -60,75 +220,193 @@
         .custom-modal-btn.secondary:hover { background-color: #5a6268; }
         .custom-modal-file-input { display: none; }
         .discuz-helper-floating-btn {
-            position: fixed; right: 18px; bottom: 86px; width: 42px; height: 42px; border: 1px solid rgba(0,0,0,0.12);
-            border-radius: 50%; z-index: 99998; cursor: grab; background: #ffffff; color: #333; box-shadow: 0 4px 14px rgba(0,0,0,0.18);
-            display: flex; align-items: center; justify-content: center; font-size: 20px; line-height: 1; user-select: none;
+            position: fixed;
+            right: 18px;
+            bottom: 86px;
+            width: 42px;
+            height: 42px;
+            border: 1px solid var(--dh-float-btn-border);
+            border-radius: 50%;
+            z-index: 99998;
+            cursor: grab;
+            background: var(--dh-float-btn-bg);
+            color: var(--dh-float-btn-color);
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            line-height: 1;
+            user-select: none;
         }
-        .discuz-helper-floating-btn:hover { background: #f3f7ff; border-color: #9fc5ff; }
+        .discuz-helper-floating-btn:hover {
+            background: var(--dh-float-btn-hover-bg);
+            border-color: var(--dh-float-btn-hover-border);
+        }
         .discuz-helper-floating-btn:active { cursor: grabbing; }
 
         .temporary-message {
-            position: fixed; top: 20px; right: 20px; background-color: #4CAF50;
-            color: white; padding: 15px; border-radius: 5px; z-index: 10001;
-            opacity: 0; transition: opacity 0.5s ease-in-out; pointer-events: none;
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background-color: #4CAF50;
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            z-index: 10001;
+            opacity: 0;
+            transition: opacity 0.5s ease-in-out;
+            pointer-events: none;
         }
         .temporary-message.show { opacity: 1; }
 
         /* 预览按钮与容器 */
         .preview-button {
-            margin-left: 8px; padding: 2px 8px; border: 1px solid #dcdcdc; border-radius: 4px;
-            cursor: pointer; background-color: #f9f9f9; font-size: 12px; color: #333; transition: all 0.2s;
+            margin-left: 8px;
+            padding: 2px 8px;
+            border: 1px solid var(--dh-preview-btn-border);
+            border-radius: 4px;
+            cursor: pointer;
+            background-color: var(--dh-preview-btn-bg);
+            font-size: 12px;
+            color: var(--dh-preview-btn-color);
+            transition: all 0.2s;
         }
-        .preview-button:hover:not(:disabled) { background-color: #e0e0e0; }
+        .preview-button:hover:not(:disabled) {
+            background-color: var(--dh-preview-btn-hover-bg);
+        }
         .preview-container {
-            margin-top: 10px; padding: 10px; border-radius: 4px; border: 1px solid #e4e7ed;
-            background-color: #f0f2f5; line-height: 1.5; max-height: 50vh; overflow-y: auto; overflow-x: hidden;
-            display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; align-items: start;
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px solid var(--dh-preview-container-border);
+            background-color: var(--dh-preview-container-bg);
+            line-height: 1.5;
+            max-height: 50vh;
+            overflow-y: auto;
+            overflow-x: hidden;
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 8px;
+            align-items: start;
         }
 
-        .preview-status-text { color: #666; font-size: 12px; font-weight: bold; margin-bottom: 8px; grid-column: 1 / -1; }
-        .preview-more-button {
-            grid-column: 1 / -1; justify-self: start; padding: 4px 10px; border: 1px solid #cfd6df;
-            border-radius: 4px; cursor: pointer; background-color: #fff; color: #333; font-size: 12px;
+        .preview-status-text {
+            color: var(--dh-preview-status-color);
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 8px;
+            grid-column: 1 / -1;
         }
-        .preview-more-button:hover:not(:disabled) { background-color: #eef5ff; border-color: #9fc5ff; }
+        .preview-more-button {
+            grid-column: 1 / -1;
+            justify-self: start;
+            padding: 4px 10px;
+            border: 1px solid var(--dh-preview-more-border);
+            border-radius: 4px;
+            cursor: pointer;
+            background-color: var(--dh-preview-more-bg);
+            color: var(--dh-preview-more-color);
+            font-size: 12px;
+        }
+        .preview-more-button:hover:not(:disabled) {
+            background-color: var(--dh-preview-more-hover-bg);
+            border-color: var(--dh-preview-more-hover-border);
+            color: var(--dh-preview-more-hover-color);
+        }
         .preview-more-button:disabled { cursor: wait; opacity: 0.7; }
         .preview-full-button {
-            width: 100%; min-height: 0; height: 140px; padding: 10px; border: 1px dashed #cfd6df;
-            border-radius: 4px; cursor: pointer; background-color: #fff; color: #333; font-size: 12px;
-            display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
-            line-height: 1.4; text-align: center; box-sizing: border-box;
+            width: 100%;
+            min-height: 0;
+            height: 140px;
+            padding: 10px;
+            border: 1px dashed var(--dh-preview-full-border);
+            border-radius: 4px;
+            cursor: pointer;
+            background-color: var(--dh-preview-full-bg);
+            color: var(--dh-preview-full-color);
+            font-size: 12px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            line-height: 1.4;
+            text-align: center;
+            box-sizing: border-box;
         }
-        .preview-full-button::before { content: "+"; font-size: 28px; line-height: 1; font-weight: bold; }
-        .preview-full-button:hover:not(:disabled) { background-color: #fff7e6; border-color: #f0b35d; }
+        .preview-full-button::before {
+            content: "+";
+            font-size: 28px;
+            line-height: 1;
+            font-weight: bold;
+        }
+        .preview-full-button:hover:not(:disabled) {
+            background-color: var(--dh-preview-full-hover-bg);
+            border-color: var(--dh-preview-full-hover-border);
+            color: var(--dh-preview-full-hover-color);
+        }
         .preview-full-button:disabled { cursor: wait; opacity: 0.7; }
 
         /* 进度条 */
         .progress-container {
-            height: 4px; background: #e0e0e0; border-radius: 2px; overflow: hidden; margin-bottom: 8px; grid-column: 1 / -1;
+            height: 4px;
+            background: var(--dh-progress-bg);
+            border-radius: 2px;
+            overflow: hidden;
+            margin-bottom: 8px;
+            grid-column: 1 / -1;
         }
         .progress-bar-fill {
-            height: 100%; background: linear-gradient(90deg, #4CAF50, #8BC34A); transition: width 0.3s ease; width: 0%;
+            height: 100%;
+            background: linear-gradient(90deg, #4CAF50, #8BC34A);
+            transition: width 0.3s ease;
+            width: 0%;
         }
 
         /* 图片项 */
-        .preview-img-item, .preview-img-loading {
-            width: 100%; border-radius: 4px; overflow: hidden; text-align: center;
+        .preview-img-item,
+        .preview-img-loading {
+            width: 100%;
+            border-radius: 4px;
+            overflow: hidden;
+            text-align: center;
         }
         .preview-img-item {
-            max-height: 250px; border: 1px solid #ccc; background-color: #f8f9fa;
-            cursor: zoom-in; object-fit: cover; transition: transform 0.2s ease, box-shadow 0.2s ease;
+            max-height: 250px;
+            border: 1px solid var(--dh-img-item-border);
+            background-color: var(--dh-img-item-bg);
+            cursor: zoom-in;
+            object-fit: cover;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
         }
-        .preview-img-item:hover { transform: scale(1.03); box-shadow: 0 4px 8px rgba(0,0,0,0.2); z-index: 10; position: relative; }
+        .preview-img-item:hover {
+            transform: scale(1.03);
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+            z-index: 10;
+            position: relative;
+        }
 
         .preview-img-loading {
-            min-height: 100px; background-color: #f8f9fa; border: 1px dashed #dcdcdc;
-            display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 12px;
+            min-height: 100px;
+            background-color: var(--dh-img-loading-bg);
+            border: 1px dashed var(--dh-img-loading-border);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--dh-img-loading-color);
+            font-size: 12px;
         }
 
-        /* 帖子状态标记 - 核心：用 CSS class 替代 style 标签注入 */
-        body.thread-visited-mode-default .thread--visited { background-color: #a9a9a9 !important; }
-        body.thread-visited-mode-default .thread--visited a.xst::before { content: "[已访问] "; font-weight: bold; color: #363636; }
+        /* 帖子状态标记 - 用 CSS class 替代 style 标签注入 */
+        body.thread-visited-mode-default .thread--visited {
+            background-color: var(--dh-visited-default-bg) !important;
+        }
+        body.thread-visited-mode-default .thread--visited a.xst::before {
+            content: "[已访问] ";
+            font-weight: bold;
+            color: var(--dh-visited-label-color);
+        }
         body.thread-visited-mode-opacity .thread--visited { opacity: 0.45; }
         body.thread-visited-mode-strike .thread--visited a.xst { text-decoration: line-through !important; }
         body.thread-visited-mode-opacity-strike .thread--visited { opacity: 0.45; }
@@ -136,51 +414,61 @@
         body.thread-visited-mode-color .thread--visited a.xst { color: #8a8a00 !important; }
         body.thread-visited-mode-hidden .thread--visited { display: none !important; }
 
-        .thread--viewed-images { background-color: #d2d2d2 !important; }
-        .thread--viewed-images a.xst::before { content: "[已看图] "; font-weight: bold; color: #ff8c00; }
+        .thread--viewed-images { background-color: var(--dh-viewed-images-bg) !important; }
+        .thread--viewed-images a.xst::before {
+            content: "[已看图] ";
+            font-weight: bold;
+            color: var(--dh-viewed-images-label-color);
+        }
 
         /* 全局灯箱 */
         #global-lightbox {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.85);
-            display: none; justify-content: center; align-items: center; z-index: 99999; user-select: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.85);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 99999;
+            user-select: none;
         }
         #global-lightbox img {
-            max-width: 90%; max-height: 90%; object-fit: contain; box-shadow: 0 0 20px rgba(0,0,0,0.5); border-radius: 4px;
+            max-width: 90%;
+            max-height: 90%;
+            object-fit: contain;
+            box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+            border-radius: 4px;
         }
         .lightbox-nav-btn {
-            position: absolute; top: 50%; transform: translateY(-50%); color: white; font-size: 40px; cursor: pointer; padding: 20px;
-            background: rgba(0,0,0,0.1); transition: background 0.2s; border-radius: 4px; text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+            position: absolute;
+            top: 50%;
+            transform: translateY(-50%);
+            color: white;
+            font-size: 40px;
+            cursor: pointer;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.1);
+            transition: background 0.2s;
+            border-radius: 4px;
+            text-shadow: 0 2px 4px rgba(0, 0, 0, 0.5);
         }
-        .lightbox-nav-btn:hover { background: rgba(0,0,0,0.6); }
+        .lightbox-nav-btn:hover { background: rgba(0, 0, 0, 0.6); }
         #lightbox-prev { left: 20px; }
         #lightbox-next { right: 20px; }
         #lightbox-indicator {
-            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
-            color: white; font-size: 16px; background: rgba(0,0,0,0.6); padding: 5px 15px; border-radius: 15px; letter-spacing: 1px;
-        }
-
-        /* 暗黑模式适配 */
-        @media (prefers-color-scheme: dark) {
-            .custom-modal-content { background-color: #2a2a2a; color: #eee; }
-            .custom-modal-content h3 { color: #fff; }
-            .custom-modal-content label { color: #ccc; }
-            .discuz-helper-floating-btn { background: #2d2d2d; color: #eee; border-color: #555; }
-            .discuz-helper-floating-btn:hover { background: #3a3a3a; }
-            .settings-section { background: #222; border-color: #3a3a3a; }
-            .settings-section h4 { color: #eee; }
-            .settings-field { color: #ccc; }
-            .settings-field input[type="number"], .settings-field select { background: #1f1f1f; border-color: #555; color: #eee; }
-            .preview-container { background-color: #1e1e1e; border-color: #333; }
-            .preview-button { background-color: #333; color: #ccc; border-color: #555; }
-            .preview-button:hover:not(:disabled) { background-color: #444; }
-            .preview-more-button { background-color: #2d2d2d; color: #ccc; border-color: #555; }
-            .preview-more-button:hover:not(:disabled) { background-color: #3a3a3a; color: #fff; }
-            .preview-full-button { background-color: #2d2d2d; color: #ccc; border-color: #555; }
-            .preview-full-button:hover:not(:disabled) { background-color: #3a3a3a; color: #fff; }
-            .preview-img-item, .preview-img-loading { border-color: #444; background-color: #222; }
-            body.thread-visited-mode-default .thread--visited { background-color: #2a2a2a !important; }
-            .thread--viewed-images { background-color: #364136 !important; }
-            .progress-container { background-color: #444; }
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: white;
+            font-size: 16px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 5px 15px;
+            border-radius: 15px;
+            letter-spacing: 1px;
         }
     `);
 
