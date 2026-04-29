@@ -2,7 +2,7 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           4.6.1
+// @version           4.6.2
 // @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，支持列表页静默并发图片预览、可选后续分页抓取、已读样式配置和可拖动设置入口。
 // @description:en    Marks visited threads in Discuz! forum lists, with silent concurrent image previews, optional extra-page fetching, configurable visited styles, and a draggable settings entry.
 // @author            Ice_wilderness
@@ -739,7 +739,7 @@
             const concurrentField = createNumberField('自动预览并发', 1, 5, getAutoPreviewConcurrent());
             const minField = createNumberField('最小图片边长', 1, 2000, getMinDimension());
             const previewTip = document.createElement('p');
-            previewTip.textContent = '默认只抓取帖子第 1 页；开启后续分页后，预览网格末尾会出现”加载更多图片”卡片。';
+            previewTip.textContent = '默认只抓取帖子第 1 页；开启后续分页后，预览网格末尾会出现“加载更多图片”卡片。';
             const previewSection = createSettingsSection('图片预览', [
                 previewCb1, previewCb2, previewCb3,
                 limitField, concurrentField, minField,
@@ -749,7 +749,7 @@
             // 已读样式 section
             const styleSelect = createStyleSelect(getVisitedStyleMode());
             const styleTip = document.createElement('p');
-            styleTip.textContent = '已读记录仍只在真实进入帖子详情页后产生；仅看图帖子不受”隐藏已读帖子”影响。';
+            styleTip.textContent = '已读记录仍只在真实进入帖子详情页后产生；仅看图帖子不受“隐藏已读帖子”影响。';
             const styleSection = createSettingsSection('已读样式', [styleSelect, styleTip]);
 
             // 数据管理 section
