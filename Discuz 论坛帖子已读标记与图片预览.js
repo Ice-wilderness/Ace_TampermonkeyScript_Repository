@@ -1548,6 +1548,105 @@
         return srcList;
     }
 
+    async function loadAutoPreview(state) {
+        const { previewContainer, previewOuter, button, moreBtn, fullBtn, cache } = state;
+        if (previewContainer.dataset.loading === 'true' || previewContainer.dataset.loaded === 'true') return;
+        previewContainer.dataset.loading = 'true';
+        delete previewContainer.dataset.error;
+        button.disabled = true;
+        moreBtn.disabled = true;
+        fullBtn.disabled = true;
+        previewOuter.style.display = 'block';
+        setManualFeedbackVisible(state, false);
+
+        try {
+            const pageImages = await fetchPageImages(state, 1, { silent: true });
+            state.firstPageImages = pageImages;
+            state.firstPageNextIndex = 0;
+            state.maxPage = cache.maxPage || state.maxPage || 1;
+            state.loadedPageUntil = Math.max(state.loadedPageUntil, 1);
+            appendAutoPreviewCandidates(state, getAutoPreviewLimit(), true);
+            previewContainer.dataset.loaded = 'true';
+            delete previewContainer.dataset.error;
+            updateStatus(state);
+        } catch (err) {
+            console.error('[Discuz Marker] auto preview images fail', err);
+            previewOuter.style.display = 'none';
+        } finally {
+            button.disabled = false;
+            moreBtn.disabled = false;
+            fullBtn.disabled = false;
+            delete previewContainer.dataset.loading;
+            updateButtonLabel(state);
+        }
+    }
+
+    async function loadPageBatch(state, startPage) {
+        const { previewContainer, previewOuter, button, moreBtn, fullBtn,
+                statusText, progressContainer, progressBarFill,
+                threadElement, cache, threadId } = state;
+
+        if (previewContainer.dataset.loading === 'true') return;
+        if (startPage > 1 && !canFetchExtraPages()) return false;
+        previewContainer.dataset.loading = 'true';
+        delete previewContainer.dataset.error;
+        state.fullPreviewMode = true;
+        setManualFeedbackVisible(state, canFetchExtraPages());
+        button.disabled = true;
+        moreBtn.disabled = true;
+        fullBtn.disabled = true;
+        progressContainer.style.display = canFetchExtraPages() ? 'block' : 'none';
+        progressBarFill.style.width = canFetchExtraPages() ? '10%' : '0%';
+
+        try {
+            if (startPage === 1 || !cache.pages[1]) {
+                await fetchPageImages(state, 1, { silent: !canFetchExtraPages() });
+            }
+            state.maxPage = cache.maxPage || state.maxPage || 1;
+            if (startPage === 1 && cache.pages[1]) {
+                state.firstPageImages = cache.pages[1];
+                state.firstPageNextIndex = state.firstPageImages.length;
+            }
+
+            const actualStart = Math.max(startPage, state.loadedPageUntil + 1, 1);
+            const endPage = canFetchExtraPages()
+                ? Math.min(state.maxPage, actualStart + PREVIEW_PAGE_BATCH_SIZE - 1) : 1;
+            const batchImages = [];
+            for (let page = actualStart; page <= endPage; page++) {
+                batchImages.push(...await fetchPageImages(state, page));
+                state.loadedPageUntil = Math.max(state.loadedPageUntil, page);
+            }
+
+            if (canFetchExtraPages() && startPage === 1
+                && state.loadedPageUntil < Math.min(state.maxPage, PREVIEW_PAGE_BATCH_SIZE)) {
+                state.loadedPageUntil = Math.min(state.maxPage, PREVIEW_PAGE_BATCH_SIZE);
+            }
+
+            appendImagePlaceholders(state, [...new Set(batchImages)], { silent: !canFetchExtraPages() });
+            previewContainer.dataset.loaded = 'true';
+            delete previewContainer.dataset.error;
+            updateThreadData(threadId, { viewedImages: true });
+            refreshThreadMark(threadElement);
+            progressBarFill.style.width = '95%';
+            if (state.pendingCount === 0) progressContainer.style.display = 'none';
+            updateStatus(state);
+            return true;
+        } catch (err) {
+            console.error('[Discuz Marker] fetch images fail', err);
+            previewContainer.dataset.error = 'true';
+            statusText.textContent = `获取数据失败: ${err.message}`;
+            progressContainer.style.display = 'none';
+            button.textContent = '获取失败';
+            return false;
+        } finally {
+            button.disabled = false;
+            moreBtn.disabled = false;
+            fullBtn.disabled = false;
+            delete previewContainer.dataset.loading;
+            updateButtonLabel(state);
+        }
+    }
+
     function addPreviewButtonToThread(threadElement) {
         const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
         if (!titleLink) return;
@@ -1568,167 +1667,73 @@
         const state = new PreviewState(threadElement, threadId, threadUrl, dom);
         previewStateMap.set(threadElement, state);
 
-        let validCountForTitle = 0;
-        let cache = readPreviewCache(threadId) || { maxPage: 1, pages: {} };
-        let loadedPageUntil = 0;
-        let maxPage = cache.maxPage || 1;
-        let pendingCount = 0;
-        let checkedCount = 0;
-        let fullPreviewMode = false;
-        let firstPageImages = [];
-        let firstPageNextIndex = 0;
-        const renderedSrcSet = new Set();
+        // 从缓存恢复预览元数据
+        const cacheData = readPreviewCache(threadId) || { maxPage: 1, pages: {} };
+        state.cache = cacheData;
+        state.maxPage = cacheData.maxPage || 1;
+
         setManualFeedbackVisible(state, false);
 
 
-        const loadAutoPreview = async () => {
-            if (previewContainer.dataset.loading === 'true' || previewContainer.dataset.loaded === 'true') return;
-            previewContainer.dataset.loading = 'true';
-            delete previewContainer.dataset.error;
-            button.disabled = true;
-            moreBtn.disabled = true;
-            fullBtn.disabled = true;
-            previewOuter.style.display = 'block';
-            setManualFeedbackVisible(state, false);
-
-            try {
-                const pageImages = await fetchPageImages(state,1, { silent: true });
-                firstPageImages = pageImages;
-                firstPageNextIndex = 0;
-                maxPage = cache.maxPage || maxPage || 1;
-                loadedPageUntil = Math.max(loadedPageUntil, 1);
-                appendAutoPreviewCandidates(state, getAutoPreviewLimit(), true);
-                previewContainer.dataset.loaded = 'true';
-                delete previewContainer.dataset.error;
-                updateStatus(state);
-            } catch (err) {
-                console.error('[Discuz Marker] auto preview images fail', err);
-                previewOuter.style.display = 'none';
-            } finally {
-                button.disabled = false;
-                moreBtn.disabled = false;
-                fullBtn.disabled = false;
-                delete previewContainer.dataset.loading;
-                updateButtonLabel(state);
-            }
-        };
-
-        const loadPageBatch = async (startPage) => {
-            if (previewContainer.dataset.loading === 'true') return;
-            if (startPage > 1 && !canFetchExtraPages()) return false;
-            previewContainer.dataset.loading = 'true';
-            delete previewContainer.dataset.error;
-            fullPreviewMode = true;
-            setManualFeedbackVisible(state, canFetchExtraPages());
-            button.disabled = true;
-            moreBtn.disabled = true;
-            fullBtn.disabled = true;
-            progressContainer.style.display = canFetchExtraPages() ? 'block' : 'none';
-            progressBarFill.style.width = canFetchExtraPages() ? '10%' : '0%';
-
-            try {
-                if (startPage === 1 || !cache.pages[1]) {
-                    await fetchPageImages(state,1, { silent: !canFetchExtraPages() });
-                }
-                maxPage = cache.maxPage || maxPage || 1;
-                if (startPage === 1 && cache.pages[1]) {
-                    firstPageImages = cache.pages[1];
-                    firstPageNextIndex = firstPageImages.length;
-                }
-
-                const actualStart = Math.max(startPage, loadedPageUntil + 1, 1);
-                const endPage = canFetchExtraPages() ? Math.min(maxPage, actualStart + PREVIEW_PAGE_BATCH_SIZE - 1) : 1;
-                const batchImages = [];
-                for (let page = actualStart; page <= endPage; page++) {
-                    batchImages.push(...await fetchPageImages(state,page));
-                    loadedPageUntil = Math.max(loadedPageUntil, page);
-                }
-
-                if (canFetchExtraPages() && startPage === 1 && loadedPageUntil < Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE)) {
-                    loadedPageUntil = Math.min(maxPage, PREVIEW_PAGE_BATCH_SIZE);
-                }
-
-                appendImagePlaceholders(state, [...new Set(batchImages)], { silent: !canFetchExtraPages() });
-                previewContainer.dataset.loaded = 'true';
-                delete previewContainer.dataset.error;
-                updateThreadData(threadId, { viewedImages: true });
-                refreshThreadMark(threadElement);
-                progressBarFill.style.width = '95%';
-                if (pendingCount === 0) progressContainer.style.display = 'none';
-                updateStatus(state);
-                return true;
-            } catch (err) {
-                console.error('[Discuz Marker] fetch images fail', err);
-                previewContainer.dataset.error = 'true';
-                statusText.textContent = `获取数据失败: ${err.message}`;
-                progressContainer.style.display = 'none';
-                button.textContent = '获取失败';
-                return false;
-            } finally {
-                button.disabled = false;
-                moreBtn.disabled = false;
-                fullBtn.disabled = false;
-                delete previewContainer.dataset.loading;
-                updateButtonLabel(state);
-            }
-        };
 
         button.addEventListener('click', async (e) => {
             e.preventDefault(); e.stopPropagation();
 
-            const isDisplayed = previewOuter.style.display !== 'none';
-            if (previewContainer.dataset.loaded === "true") {
-                if (validCountForTitle === 0 && (hasFirstPageRemainingImages(state) || loadedPageUntil < maxPage)) {
+            const isDisplayed = state.previewOuter.style.display !== 'none';
+            if (state.previewContainer.dataset.loaded === 'true') {
+                if (state.validCountForTitle === 0
+                    && (hasFirstPageRemainingImages(state) || state.loadedPageUntil < state.maxPage)) {
                     if (hasFirstPageRemainingImages(state) || canFetchExtraPages()) {
-                        fullPreviewMode = true;
-                        previewOuter.style.display = 'block';
-                        button.textContent = '获取中...';
+                        state.fullPreviewMode = true;
+                        state.previewOuter.style.display = 'block';
+                        state.button.textContent = '获取中...';
                         if (appendRemainingFirstPageImages(state)) {
-                            updateThreadData(threadId, { viewedImages: true });
-                            refreshThreadMark(threadElement);
+                            updateThreadData(state.threadId, { viewedImages: true });
+                            refreshThreadMark(state.threadElement);
                             updateButtonLabel(state);
                         } else {
-                            await loadPageBatch(loadedPageUntil + 1);
+                            await loadPageBatch(state, state.loadedPageUntil + 1);
                         }
                     } else {
-                        previewOuter.style.display = 'none';
+                        state.previewOuter.style.display = 'none';
                         updateButtonLabel(state);
                     }
                     return;
                 }
-                previewOuter.style.display = isDisplayed ? 'none' : 'block';
+                state.previewOuter.style.display = isDisplayed ? 'none' : 'block';
                 updateButtonLabel(state);
                 return;
             }
 
-            fullPreviewMode = true;
-            previewOuter.style.display = 'block';
-            button.textContent = '获取中...';
-            await loadPageBatch(1);
+            state.fullPreviewMode = true;
+            state.previewOuter.style.display = 'block';
+            state.button.textContent = '获取中...';
+            await loadPageBatch(state, 1);
         });
 
         moreBtn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            await loadPageBatch(loadedPageUntil + 1);
+            await loadPageBatch(state, state.loadedPageUntil + 1);
         });
 
         fullBtn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
-            fullPreviewMode = true;
-            previewOuter.style.display = 'block';
-            updateThreadData(threadId, { viewedImages: true });
-            refreshThreadMark(threadElement);
+            state.fullPreviewMode = true;
+            state.previewOuter.style.display = 'block';
+            updateThreadData(state.threadId, { viewedImages: true });
+            refreshThreadMark(state.threadElement);
             const appendedFirstPageRemaining = appendRemainingFirstPageImages(state);
             updateStatus(state);
-            if (!appendedFirstPageRemaining && canFetchExtraPages() && loadedPageUntil < maxPage) {
-                await loadPageBatch(loadedPageUntil + 1);
+            if (!appendedFirstPageRemaining && canFetchExtraPages()
+                && state.loadedPageUntil < state.maxPage) {
+                await loadPageBatch(state, state.loadedPageUntil + 1);
             }
             updateStatus(state);
         });
 
-        threadElement.discuzStartAutoPreview = loadAutoPreview;
+        threadElement.discuzStartAutoPreview = () => loadAutoPreview(state);
         previewContainer.appendChild(moreBtn);
         previewContainer.appendChild(fullBtn);
     }
