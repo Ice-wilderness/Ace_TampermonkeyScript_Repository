@@ -709,8 +709,8 @@
     }
 
     function createStyleSelect(currentMode) {
-        const field = document.createElement('label');
-        field.className = 'settings-field';
+        const label = document.createElement('label');
+        label.className = 'settings-field';
         const select = document.createElement('select');
         STYLE_OPTIONS.forEach(([value, text]) => {
             const option = document.createElement('option');
@@ -719,8 +719,8 @@
             if (value === currentMode) option.selected = true;
             select.appendChild(option);
         });
-        field.append(document.createTextNode('显示模式'), select);
-        return { field, select };
+        label.append(document.createTextNode('显示模式'), select);
+        return { label, select };
     }
 
     function showSettingsPanel() {
@@ -1188,14 +1188,17 @@
             this.firstPageImages = [];
             this.firstPageNextIndex = 0;
             this.renderedSrcSet = new Set();
-            this.observer = null;
+            this.syncFullSizePending = false;
+            this.observers = new Set();
+        }
+
+        addObserver(obs) {
+            this.observers.add(obs);
         }
 
         destroy() {
-            if (this.observer) {
-                this.observer.disconnect();
-                this.observer = null;
-            }
+            this.observers.forEach(obs => obs.disconnect());
+            this.observers.clear();
             previewStateMap.delete(this.threadElement);
         }
     }
@@ -1329,12 +1332,11 @@
         if (!visible) state.progressContainer.style.display = 'none';
     }
 
-    let _syncFullSizePending = false;
     function syncFullButtonSize(state) {
-        if (_syncFullSizePending) return;
-        _syncFullSizePending = true;
+        if (state.syncFullSizePending) return;
+        state.syncFullSizePending = true;
         requestAnimationFrame(() => {
-            _syncFullSizePending = false;
+            state.syncFullSizePending = false;
             const images = Array.from(state.previewContainer.querySelectorAll('.preview-img-item'));
             const lastImage = images[images.length - 1];
             if (!lastImage) {
@@ -1508,6 +1510,7 @@
                 tempImg.src = finalSrc;
             });
         }, { root: previewOuter, rootMargin: '400px 0px', threshold: 0.01 });
+        state.addObserver(observer);
 
         uniqueList.forEach(imgSrc => {
             const placeholder = document.createElement('div');
