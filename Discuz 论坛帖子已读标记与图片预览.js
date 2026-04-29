@@ -276,12 +276,18 @@
         GM_setValue(STORAGE_KEY, JSON.stringify(data));
     }
 
+    function normalizeRecord(record) {
+        if (record === true) return { visited: true, ts: 0 };
+        if (record && typeof record === 'object') return record;
+        return {};
+    }
+
     function updateThreadData(threadId, patch) {
         if (!threadId) return;
         const visited = getVisitedThreads();
         const existing = visited[threadId];
         visited[threadId] = {
-            ...(typeof existing === 'object' ? existing : (existing === true ? { visited: true } : {})),
+            ...normalizeRecord(existing),
             ...patch,
             ts: Date.now()
         };
@@ -296,7 +302,7 @@
 
         keys.forEach(key => {
             const record = data[key];
-            const normalized = record === true ? { visited: true, ts: 0 } : (record || {});
+            const normalized = normalizeRecord(record);
             if (normalized.visited) visitedCount++;
             if (!normalized.visited && normalized.viewedImages) viewedOnlyCount++;
             if (normalized.ts && normalized.ts > latestTs) latestTs = normalized.ts;
