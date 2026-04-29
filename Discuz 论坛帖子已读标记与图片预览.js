@@ -1307,6 +1307,28 @@
         };
     }
 
+    // --- 预览状态操作函数（模块级，接收 state 为首参） ---
+
+    function updateButtonLabel(state) {
+        const { button, previewOuter, previewContainer, validCountForTitle } = state;
+        if (previewContainer.dataset.error === 'true') {
+            button.textContent = '获取失败';
+        } else if (previewContainer.dataset.loaded === 'true' && validCountForTitle === 0) {
+            button.textContent = '无图片';
+        } else if (previewOuter.style.display !== 'none') {
+            button.textContent = '隐藏图片';
+        } else if (validCountForTitle > 0) {
+            button.textContent = `预览图片 (${validCountForTitle})`;
+        } else {
+            button.textContent = '预览图片';
+        }
+    }
+
+    function setManualFeedbackVisible(state, visible) {
+        state.statusBar.style.display = visible ? '' : 'none';
+        if (!visible) state.progressContainer.style.display = 'none';
+    }
+
     function addPreviewButtonToThread(threadElement) {
         const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
         if (!titleLink) return;
@@ -1339,26 +1361,8 @@
         const renderedSrcSet = new Set();
         let appendAutoPreviewCandidates = () => false;
 
-        const updateButtonLabel = () => {
-            if (previewContainer.dataset.error === 'true') {
-                button.textContent = '获取失败';
-            } else if (previewContainer.dataset.loaded === 'true' && validCountForTitle === 0) {
-                button.textContent = '无图片';
-            } else if (previewOuter.style.display !== 'none') {
-                button.textContent = '隐藏图片';
-            } else if (validCountForTitle > 0) {
-                button.textContent = `预览图片 (${validCountForTitle})`;
-            } else {
-                button.textContent = '预览图片';
-            }
-        };
 
-        const setManualFeedbackVisible = (visible) => {
-            statusBar.style.display = visible ? '' : 'none';
-            if (!visible) progressContainer.style.display = 'none';
-        };
-
-        setManualFeedbackVisible(false);
+        setManualFeedbackVisible(state, false);
 
         const syncFullButtonSize = () => {
             const images = Array.from(previewContainer.querySelectorAll('.preview-img-item'));
@@ -1408,18 +1412,18 @@
                 if (previewContainer.dataset.loaded === 'true' && pendingCount === 0 && validCountForTitle === 0) {
                     previewOuter.style.display = 'none';
                 }
-                setManualFeedbackVisible(false);
+                setManualFeedbackVisible(state, false);
                 updateMoreButton();
-                updateButtonLabel();
+                updateButtonLabel(state);
                 return;
             }
             if (!canFetchExtraPages()) {
-                setManualFeedbackVisible(false);
+                setManualFeedbackVisible(state, false);
                 updateMoreButton();
-                updateButtonLabel();
+                updateButtonLabel(state);
                 return;
             }
-            setManualFeedbackVisible(true);
+            setManualFeedbackVisible(state, true);
             if (pendingCount > 0) {
                 statusText.textContent = `正在逐步呈现图片... (剩余 ${pendingCount} 张待查，符合要求展示 ${validCountForTitle} 张)`;
             } else if (validCountForTitle > 0) {
@@ -1430,7 +1434,7 @@
                 statusText.textContent = loadedPageUntil < maxPage ? `前 ${loadedPageUntil} 页未发现图片，可继续抓取后续页面。` : '该帖子内没有发现图片。';
             }
             updateMoreButton();
-            updateButtonLabel();
+            updateButtonLabel(state);
         };
 
         const appendImagePlaceholders = (srcList, options = {}) => {
@@ -1541,7 +1545,7 @@
         const fetchPageImages = async (page, options = {}) => {
             if (cache.pages[page]) return cache.pages[page];
             if (!options.silent) {
-                setManualFeedbackVisible(true);
+                setManualFeedbackVisible(state, true);
                 statusText.textContent = `正在拉取第 ${page} 页...`;
                 progressContainer.style.display = 'block';
                 progressBarFill.style.width = `${Math.min(80, 15 + page * 15)}%`;
@@ -1570,7 +1574,7 @@
             moreBtn.disabled = true;
             fullBtn.disabled = true;
             previewOuter.style.display = 'block';
-            setManualFeedbackVisible(false);
+            setManualFeedbackVisible(state, false);
 
             try {
                 const pageImages = await fetchPageImages(1, { silent: true });
@@ -1590,7 +1594,7 @@
                 moreBtn.disabled = false;
                 fullBtn.disabled = false;
                 delete previewContainer.dataset.loading;
-                updateButtonLabel();
+                updateButtonLabel(state);
             }
         };
 
@@ -1600,7 +1604,7 @@
             previewContainer.dataset.loading = 'true';
             delete previewContainer.dataset.error;
             fullPreviewMode = true;
-            setManualFeedbackVisible(canFetchExtraPages());
+            setManualFeedbackVisible(state, canFetchExtraPages());
             button.disabled = true;
             moreBtn.disabled = true;
             fullBtn.disabled = true;
@@ -1650,7 +1654,7 @@
                 moreBtn.disabled = false;
                 fullBtn.disabled = false;
                 delete previewContainer.dataset.loading;
-                updateButtonLabel();
+                updateButtonLabel(state);
             }
         };
 
@@ -1667,18 +1671,18 @@
                         if (appendRemainingFirstPageImages()) {
                             updateThreadData(threadId, { viewedImages: true });
                             refreshThreadMark(threadElement);
-                            updateButtonLabel();
+                            updateButtonLabel(state);
                         } else {
                             await loadPageBatch(loadedPageUntil + 1);
                         }
                     } else {
                         previewOuter.style.display = 'none';
-                        updateButtonLabel();
+                        updateButtonLabel(state);
                     }
                     return;
                 }
                 previewOuter.style.display = isDisplayed ? 'none' : 'block';
-                updateButtonLabel();
+                updateButtonLabel(state);
                 return;
             }
 
