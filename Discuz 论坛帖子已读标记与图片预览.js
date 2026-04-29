@@ -663,92 +663,124 @@
         document.body.classList.add(`thread-visited-mode-${getVisitedStyleMode()}`);
     }
 
+    // --- 设置面板 UI 工厂函数 ---
+
+    const STYLE_OPTIONS = [
+        ['default',        '灰底标签'],
+        ['opacity',        '半透明'],
+        ['strike',         '删除线'],
+        ['opacity-strike', '半透明 + 删除线'],
+        ['color',          '仅改变标题颜色'],
+        ['hidden',         '隐藏已读帖子'],
+    ];
+
+    function createLabeledCheckbox(labelText, checked) {
+        const label = document.createElement('label');
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = checked;
+        label.append(input, document.createTextNode(' ' + labelText));
+        return { label, input };
+    }
+
+    function createNumberField(labelText, min, max, value) {
+        const label = document.createElement('label');
+        label.className = 'settings-field';
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.min = String(min);
+        input.max = String(max);
+        input.value = String(value);
+        label.append(document.createTextNode(labelText), input);
+        return { label, input };
+    }
+
+    function createSettingsSection(title, children) {
+        const section = document.createElement('div');
+        section.className = 'settings-section';
+        const h4 = document.createElement('h4');
+        h4.textContent = title;
+        section.appendChild(h4);
+        children.forEach(child => {
+            if (child.label) section.appendChild(child.label);
+            else if (child instanceof Node) section.appendChild(child);
+        });
+        return section;
+    }
+
+    function createStyleSelect(currentMode) {
+        const field = document.createElement('label');
+        field.className = 'settings-field';
+        const select = document.createElement('select');
+        STYLE_OPTIONS.forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            if (value === currentMode) option.selected = true;
+            select.appendChild(option);
+        });
+        field.append(document.createTextNode('显示模式'), select);
+        return { field, select };
+    }
+
     function showSettingsPanel() {
         createModalBase('discuz-helper-settings-modal', (content, closeFn) => {
             const data = getVisitedThreads();
-            const keys = Object.keys(data);
             const stats = getThreadRecordStats(data);
-            const enablePreview = GM_getValue('enable_preview', true);
-            const enableAutoPreview = GM_getValue('enable_auto_preview', true);
-            const enableExtraPagePreview = canFetchExtraPages();
-            const autoPreviewLimit = getAutoPreviewLimit();
-            const autoPreviewConcurrent = getAutoPreviewConcurrent();
-            const minDimension = getMinDimension();
-            const visitedStyleMode = getVisitedStyleMode();
 
-            const title = document.createElement('h3'); title.textContent = 'Discuz 辅助设置';
+            const title = document.createElement('h3');
+            title.textContent = 'Discuz 辅助设置';
 
-            const grid = document.createElement('div');
-            grid.className = 'settings-grid';
-
-            const previewSection = document.createElement('div');
-            previewSection.className = 'settings-section';
-            const previewTitle = document.createElement('h4'); previewTitle.textContent = '图片预览';
-            const previewEnableLabel = document.createElement('label');
-            const previewEnableInput = document.createElement('input'); previewEnableInput.type = 'checkbox'; previewEnableInput.checked = enablePreview;
-            previewEnableLabel.append(previewEnableInput, document.createTextNode(' 启用图片预览功能'));
-            const autoPreviewLabel = document.createElement('label');
-            const autoPreviewInput = document.createElement('input'); autoPreviewInput.type = 'checkbox'; autoPreviewInput.checked = enableAutoPreview;
-            autoPreviewLabel.append(autoPreviewInput, document.createTextNode(' 列表页自动预览第一页'));
-            const extraPageLabel = document.createElement('label');
-            const extraPageInput = document.createElement('input'); extraPageInput.type = 'checkbox'; extraPageInput.checked = enableExtraPagePreview;
-            extraPageLabel.append(extraPageInput, document.createTextNode(' 允许手动抓取后续分页（每次 3 页）'));
-            const limitField = document.createElement('label'); limitField.className = 'settings-field';
-            const limitInput = document.createElement('input'); limitInput.type = 'number'; limitInput.min = '1'; limitInput.max = '20'; limitInput.value = String(autoPreviewLimit);
-            limitField.append(document.createTextNode('自动预览数量'), limitInput);
-            const concurrentField = document.createElement('label'); concurrentField.className = 'settings-field';
-            const concurrentInput = document.createElement('input'); concurrentInput.type = 'number'; concurrentInput.min = '1'; concurrentInput.max = '5'; concurrentInput.value = String(autoPreviewConcurrent);
-            concurrentField.append(document.createTextNode('自动预览并发'), concurrentInput);
-            const minField = document.createElement('label'); minField.className = 'settings-field';
-            const minInput = document.createElement('input'); minInput.type = 'number'; minInput.min = '1'; minInput.max = '2000'; minInput.value = String(minDimension);
-            minField.append(document.createTextNode('最小图片边长'), minInput);
+            // 图片预览 section
+            const previewCb1 = createLabeledCheckbox('启用图片预览功能', GM_getValue('enable_preview', true));
+            const previewCb2 = createLabeledCheckbox('列表页自动预览第一页', GM_getValue('enable_auto_preview', true));
+            const previewCb3 = createLabeledCheckbox('允许手动抓取后续分页（每次 3 页）', canFetchExtraPages());
+            const limitField = createNumberField('自动预览数量', 1, 20, getAutoPreviewLimit());
+            const concurrentField = createNumberField('自动预览并发', 1, 5, getAutoPreviewConcurrent());
+            const minField = createNumberField('最小图片边长', 1, 2000, getMinDimension());
             const previewTip = document.createElement('p');
-            previewTip.textContent = '默认只抓取帖子第 1 页；开启后续分页后，预览网格末尾会出现“加载更多图片”卡片。';
-            previewSection.append(previewTitle, previewEnableLabel, autoPreviewLabel, extraPageLabel, limitField, concurrentField, minField, previewTip);
+            previewTip.textContent = '默认只抓取帖子第 1 页；开启后续分页后，预览网格末尾会出现”加载更多图片”卡片。';
+            const previewSection = createSettingsSection('图片预览', [
+                previewCb1, previewCb2, previewCb3,
+                limitField, concurrentField, minField,
+                previewTip,
+            ]);
 
-            const styleSection = document.createElement('div');
-            styleSection.className = 'settings-section';
-            const styleTitle = document.createElement('h4'); styleTitle.textContent = '已读样式';
-            const styleField = document.createElement('label'); styleField.className = 'settings-field';
-            const styleSelect = document.createElement('select');
-            [
-                ['default', '灰底标签'],
-                ['opacity', '半透明'],
-                ['strike', '删除线'],
-                ['opacity-strike', '半透明 + 删除线'],
-                ['color', '仅改变标题颜色'],
-                ['hidden', '隐藏已读帖子']
-            ].forEach(([value, text]) => {
-                const option = document.createElement('option');
-                option.value = value;
-                option.textContent = text;
-                option.selected = visitedStyleMode === value;
-                styleSelect.appendChild(option);
-            });
-            styleField.append(document.createTextNode('显示模式'), styleSelect);
+            // 已读样式 section
+            const styleSelect = createStyleSelect(getVisitedStyleMode());
             const styleTip = document.createElement('p');
-            styleTip.textContent = '已读记录仍只在真实进入帖子详情页后产生；仅看图帖子不受“隐藏已读帖子”影响。';
-            styleSection.append(styleTitle, styleField, styleTip);
+            styleTip.textContent = '已读记录仍只在真实进入帖子详情页后产生；仅看图帖子不受”隐藏已读帖子”影响。';
+            const styleSection = createSettingsSection('已读样式', [styleSelect, styleTip]);
 
+            // 数据管理 section
             const dataSection = document.createElement('div');
             dataSection.className = 'settings-section';
-            const dataTitle = document.createElement('h4'); dataTitle.textContent = '数据管理';
+            const dataTitle = document.createElement('h4');
+            dataTitle.textContent = '数据管理';
             const info = document.createElement('p');
-            info.textContent = `当前论坛域存储了 ${keys.length} 条帖子足迹`;
+            info.textContent = `当前论坛域存储了 ${Object.keys(data).length} 条帖子足迹`;
             const statsInfo = document.createElement('p');
             statsInfo.innerHTML = `已访问：${stats.visitedCount} 条<br>仅看图：${stats.viewedOnlyCount} 条<br>最近记录：${stats.latestText}<br>存储键：${STORAGE_KEY}`;
             statsInfo.style.wordBreak = 'break-all';
 
-            const exportBtn = document.createElement('button'); exportBtn.textContent = '⬇️ 导出数据'; exportBtn.className = 'custom-modal-btn';
+            const exportBtn = document.createElement('button');
+            exportBtn.textContent = '⬇️ 导出数据';
+            exportBtn.className = 'custom-modal-btn';
             exportBtn.addEventListener('click', () => {
                 const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
                 a.download = `discuz_history_${forumName}_${hostName}.json`;
                 a.click();
             });
 
-            const importBtn = document.createElement('button'); importBtn.textContent = '⬆️ 导入数据'; importBtn.className = 'custom-modal-btn secondary';
-            const fileInput = document.createElement('input'); fileInput.type = 'file'; fileInput.accept = '.json'; fileInput.className = 'custom-modal-file-input';
+            const importBtn = document.createElement('button');
+            importBtn.textContent = '⬆️ 导入数据';
+            importBtn.className = 'custom-modal-btn secondary';
+            const fileInput = document.createElement('input');
+            fileInput.type = 'file';
+            fileInput.accept = '.json';
+            fileInput.className = 'custom-modal-file-input';
             importBtn.addEventListener('click', () => fileInput.click());
             fileInput.addEventListener('change', (e) => {
                 const file = e.target.files[0];
@@ -756,10 +788,8 @@
                 const reader = new FileReader();
                 reader.onload = (ev) => {
                     try {
-                        const importedStr = ev.target.result;
-                        const importedData = JSON.parse(importedStr);
+                        const importedData = JSON.parse(ev.target.result);
                         if (typeof importedData !== 'object' || Array.isArray(importedData)) throw new Error('无效的格式');
-
                         const merged = { ...getVisitedThreads() };
                         let added = 0;
                         for (const k in importedData) {
@@ -778,15 +808,16 @@
                 reader.readAsText(file);
             });
 
-            const cleanBtn = document.createElement('button'); cleanBtn.textContent = '🧹 清除 30 天前的足迹'; cleanBtn.className = 'custom-modal-btn secondary';
+            const cleanBtn = document.createElement('button');
+            cleanBtn.textContent = '🧹 清除 30 天前的足迹';
+            cleanBtn.className = 'custom-modal-btn secondary';
             cleanBtn.addEventListener('click', () => {
                 const currentData = getVisitedThreads();
                 const now = Date.now();
                 const threshold = 30 * 24 * 3600 * 1000;
                 let removed = 0;
                 for (const k in currentData) {
-                    const ts = currentData[k].ts || 0;
-                    if (now - ts > threshold) {
+                    if (now - (currentData[k].ts || 0) > threshold) {
                         delete currentData[k];
                         removed++;
                     }
@@ -796,7 +827,9 @@
                 info.style.color = 'green';
             });
 
-            const wipeBtn = document.createElement('button'); wipeBtn.textContent = '❌ 清空所有足迹'; wipeBtn.className = 'custom-modal-btn danger';
+            const wipeBtn = document.createElement('button');
+            wipeBtn.textContent = '❌ 清空所有足迹';
+            wipeBtn.className = 'custom-modal-btn danger';
             wipeBtn.addEventListener('click', () => {
                 if (confirm('确定要清空本论坛产生的所有已读与看图标记吗？此操作无法撤销！')) {
                     GM_deleteValue(STORAGE_KEY);
@@ -807,23 +840,29 @@
 
             dataSection.append(dataTitle, info, statsInfo, exportBtn, fileInput, importBtn, cleanBtn, wipeBtn);
 
+            const grid = document.createElement('div');
+            grid.className = 'settings-grid';
             grid.append(previewSection, styleSection, dataSection);
 
             const actions = document.createElement('div');
             actions.className = 'settings-actions';
-            const saveBtn = document.createElement('button'); saveBtn.textContent = '保存并刷新'; saveBtn.className = 'custom-modal-btn';
+            const saveBtn = document.createElement('button');
+            saveBtn.textContent = '保存并刷新';
+            saveBtn.className = 'custom-modal-btn';
             saveBtn.addEventListener('click', () => {
-                GM_setValue('enable_preview', previewEnableInput.checked);
-                GM_setValue('enable_auto_preview', autoPreviewInput.checked);
-                GM_setValue('enable_extra_page_preview', extraPageInput.checked);
-                GM_setValue('auto_preview_limit', getNumberFromInput(limitInput, DEFAULT_AUTO_PREVIEW_LIMIT, 1, 20));
-                GM_setValue('auto_preview_concurrent', getNumberFromInput(concurrentInput, DEFAULT_AUTO_PREVIEW_CONCURRENT, 1, 5));
-                GM_setValue('preview_min_dimension', getNumberFromInput(minInput, DEFAULT_MIN_DIMENSION, 1, 2000));
-                GM_setValue('visited_style_mode', VISITED_STYLE_MODES.includes(styleSelect.value) ? styleSelect.value : 'default');
+                GM_setValue('enable_preview', previewCb1.input.checked);
+                GM_setValue('enable_auto_preview', previewCb2.input.checked);
+                GM_setValue('enable_extra_page_preview', previewCb3.input.checked);
+                GM_setValue('auto_preview_limit', getNumberFromInput(limitField.input, DEFAULT_AUTO_PREVIEW_LIMIT, 1, 20));
+                GM_setValue('auto_preview_concurrent', getNumberFromInput(concurrentField.input, DEFAULT_AUTO_PREVIEW_CONCURRENT, 1, 5));
+                GM_setValue('preview_min_dimension', getNumberFromInput(minField.input, DEFAULT_MIN_DIMENSION, 1, 2000));
+                GM_setValue('visited_style_mode', VISITED_STYLE_MODES.includes(styleSelect.select.value) ? styleSelect.select.value : 'default');
                 showTemporaryMessage('设置已保存，即将刷新页面。');
                 setTimeout(() => window.location.reload(), 1000);
             });
-            const cancelBtn = document.createElement('button'); cancelBtn.textContent = '取消'; cancelBtn.className = 'custom-modal-btn secondary';
+            const cancelBtn = document.createElement('button');
+            cancelBtn.textContent = '取消';
+            cancelBtn.className = 'custom-modal-btn secondary';
             cancelBtn.addEventListener('click', closeFn);
             actions.append(saveBtn, cancelBtn);
 
