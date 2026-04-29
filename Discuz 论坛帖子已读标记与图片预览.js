@@ -197,6 +197,10 @@
     const RE_THREAD_PAGE_SHORT = /thread-(\d+)-(\d+)(-\d+)?\.html$/i;
     const RE_THREAD_PAGE_ARCHIVE = /thread-(\d+)-(\d+)-(\d+)\.html$/i;
 
+    // 灯箱自定义光标 (SVG Data URI)
+    const CURSOR_SVG_LEFT = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024' width='32' height='32'%3E%3Cpath d='M729.29 959.73c-10.02 0-20.04-3.82-27.69-11.47L292.83 539.47a39.18 39.18 0 0 1-11.47-27.69c0-10.38 4.13-20.34 11.47-27.69L701.61 75.34c15.3-15.3 40.08-15.3 55.37 0s15.3 40.08 0 55.37L375.89 511.79l381.09 381.1c15.3 15.3 15.3 40.08 0 55.37a39.073 39.073 0 0 1-27.69 11.47z' fill='white' stroke='black' stroke-width='40' stroke-linejoin='round'/%3E%3C/svg%3E") 16 16, pointer`;
+    const CURSOR_SVG_RIGHT = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024' width='32' height='32'%3E%3Cpath d='M295.28 959.73c-10.01 0-20.03-3.82-27.67-11.47-15.29-15.29-15.29-40.06 0-55.35l380.94-380.92-380.94-380.95c-15.29-15.29-15.29-40.06 0-55.35s40.06-15.29 55.35 0l408.62 408.62a39.15 39.15 0 0 1 11.47 27.67c0 10.37-4.13 20.34-11.47 27.67l-408.62 408.6a39.02 39.02 0 0 1-27.68 11.48z' fill='white' stroke='black' stroke-width='40' stroke-linejoin='round'/%3E%3C/svg%3E") 16 16, pointer`;
+
     // --- 工具函数 ---
 
     function getForumName() {
@@ -652,12 +656,6 @@
         prev.addEventListener('click', (e) => { e.stopPropagation(); prevImg(); });
         next.addEventListener('click', (e) => { e.stopPropagation(); nextImg(); });
 
-
-        // 左箭头
-        const cursorLeft = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024' width='32' height='32'%3E%3Cpath d='M729.29 959.73c-10.02 0-20.04-3.82-27.69-11.47L292.83 539.47a39.18 39.18 0 0 1-11.47-27.69c0-10.38 4.13-20.34 11.47-27.69L701.61 75.34c15.3-15.3 40.08-15.3 55.37 0s15.3 40.08 0 55.37L375.89 511.79l381.09 381.1c15.3 15.3 15.3 40.08 0 55.37a39.073 39.073 0 0 1-27.69 11.47z' fill='white' stroke='black' stroke-width='40' stroke-linejoin='round'/%3E%3C/svg%3E") 16 16, pointer`;
-        
-        // 右箭头
-        const cursorRight = `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1024 1024' width='32' height='32'%3E%3Cpath d='M295.28 959.73c-10.01 0-20.03-3.82-27.67-11.47-15.29-15.29-15.29-40.06 0-55.35l380.94-380.92-380.94-380.95c-15.29-15.29-15.29-40.06 0-55.35s40.06-15.29 55.35 0l408.62 408.62a39.15 39.15 0 0 1 11.47 27.67c0 10.37-4.13 20.34-11.47 27.67l-408.62 408.6a39.02 39.02 0 0 1-27.68 11.48z' fill='white' stroke='black' stroke-width='40' stroke-linejoin='round'/%3E%3C/svg%3E") 16 16, pointer`;
         img.addEventListener('click', (e) => {
             e.stopPropagation();
             if (e.offsetX < img.offsetWidth / 2) {
@@ -669,7 +667,7 @@
 
         let lastCursorState = '';
         img.addEventListener('mousemove', (e) => {
-            const targetCursor = (e.offsetX < img.offsetWidth / 2) ? cursorLeft : cursorRight;
+            const targetCursor = (e.offsetX < img.offsetWidth / 2) ? CURSOR_SVG_LEFT : CURSOR_SVG_RIGHT;
 
             if (lastCursorState !== targetCursor) {
                 img.style.cursor = targetCursor;
