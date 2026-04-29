@@ -2,7 +2,7 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           4.6.2
+// @version           4.6.3
 // @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，支持列表页静默并发图片预览、可选后续分页抓取、已读样式配置和可拖动设置入口。
 // @description:en    Marks visited threads in Discuz! forum lists, with silent concurrent image previews, optional extra-page fetching, configurable visited styles, and a draggable settings entry.
 // @author            Ice_wilderness
@@ -441,6 +441,22 @@
             object-fit: contain;
             box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
             border-radius: 4px;
+        }
+        #global-lightbox img.is-loading {
+            opacity: 0;
+        }
+        #global-lightbox[data-loading="true"]::after {
+            content: '加载中...';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 16px;
+            background: rgba(0, 0, 0, 0.6);
+            padding: 8px 16px;
+            border-radius: 15px;
+            pointer-events: none;
         }
         .lightbox-nav-btn {
             position: absolute;
@@ -959,7 +975,50 @@
 
     let lightboxImages = [];
     let currentLightboxIndex = 0;
+    let lightboxLoadToken = 0;
+    let lightboxPreloader = null;
     const lightboxDOM = { container: null, img: null, indicator: null };
+
+    function setLightboxLoading(isLoading) {
+        const { container, img } = lightboxDOM;
+        if (!container || !img) return;
+        if (isLoading) {
+            container.dataset.loading = 'true';
+            img.classList.add('is-loading');
+        } else {
+            delete container.dataset.loading;
+            img.classList.remove('is-loading');
+        }
+    }
+
+    function updateLightboxImage() {
+        const { img, indicator } = lightboxDOM;
+        if (!img || !indicator || lightboxImages.length === 0) return;
+
+        const targetSrc = lightboxImages[currentLightboxIndex];
+        const loadToken = ++lightboxLoadToken;
+        let isFinished = false;
+        indicator.textContent = `${currentLightboxIndex + 1} / ${lightboxImages.length}`;
+        setLightboxLoading(true);
+        img.alt = `正在加载第 ${currentLightboxIndex + 1} 张图片`;
+
+        const loader = new Image();
+        lightboxPreloader = loader;
+        const finish = (loaded) => {
+            if (isFinished) return;
+            isFinished = true;
+            if (lightboxPreloader === loader) lightboxPreloader = null;
+            if (loadToken !== lightboxLoadToken) return;
+            img.src = targetSrc;
+            img.alt = loaded ? '' : '图片加载失败';
+            setLightboxLoading(false);
+        };
+
+        loader.onload = () => finish(true);
+        loader.onerror = () => finish(false);
+        loader.src = targetSrc;
+        if (loader.complete) finish(loader.naturalWidth > 0 && loader.naturalHeight > 0);
+    }
 
     function initLightbox() {
         if (lightboxDOM.container) return;
@@ -975,14 +1034,14 @@
 
         lightboxDOM.container = lb; lightboxDOM.img = img; lightboxDOM.indicator = indicator;
 
-        function update() {
-            if (lightboxImages.length === 0) return;
-            img.src = lightboxImages[currentLightboxIndex];
-            indicator.textContent = `${currentLightboxIndex + 1} / ${lightboxImages.length}`;
+        function nextImg() { if (lightboxImages.length) { currentLightboxIndex = (currentLightboxIndex + 1) % lightboxImages.length; updateLightboxImage(); } }
+        function prevImg() { if (lightboxImages.length) { currentLightboxIndex = (currentLightboxIndex - 1 + lightboxImages.length) % lightboxImages.length; updateLightboxImage(); } }
+        function closeLb() {
+            lightboxLoadToken++;
+            lightboxPreloader = null;
+            lb.style.display = 'none';
+            setLightboxLoading(false);
         }
-        function nextImg() { if (lightboxImages.length) { currentLightboxIndex = (currentLightboxIndex + 1) % lightboxImages.length; update(); } }
-        function prevImg() { if (lightboxImages.length) { currentLightboxIndex = (currentLightboxIndex - 1 + lightboxImages.length) % lightboxImages.length; update(); } }
-        function closeLb() { lb.style.display = 'none'; }
 
         lb.addEventListener('click', (e) => { if (e.target === lb || e.target === indicator) closeLb(); });
         prev.addEventListener('click', (e) => { e.stopPropagation(); prevImg(); });
@@ -1026,9 +1085,8 @@
         initLightbox();
         lightboxImages = urls;
         currentLightboxIndex = startIndex >= 0 && startIndex < urls.length ? startIndex : 0;
-        lightboxDOM.img.src = lightboxImages[currentLightboxIndex];
-        lightboxDOM.indicator.textContent = `${currentLightboxIndex + 1} / ${lightboxImages.length}`;
         lightboxDOM.container.style.display = 'flex';
+        updateLightboxImage();
     }
 
 
