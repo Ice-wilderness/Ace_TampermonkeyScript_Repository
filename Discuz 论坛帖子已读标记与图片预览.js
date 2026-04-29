@@ -1647,36 +1647,11 @@
         }
     }
 
-    function addPreviewButtonToThread(threadElement) {
-        const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
-        if (!titleLink) return;
+    function wirePreviewEvents(threadElement, dom) {
+        const state = previewStateMap.get(threadElement);
+        if (!state) return;
 
-        const threadUrl = titleLink.href;
-        const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
-
-        if (threadElement.querySelector('.preview-button')) return;
-
-        const dom = createPreviewDOM(threadElement, titleLink);
-        const {
-            button, previewOuter, previewContainer,
-            statusBar, statusText, progressContainer, progressBarFill,
-            moreBtn, fullBtn,
-        } = dom;
-
-        // 创建预览状态并绑定到 DOM 节点 (WeakMap 保证自动 GC)
-        const state = new PreviewState(threadElement, threadId, threadUrl, dom);
-        previewStateMap.set(threadElement, state);
-
-        // 从缓存恢复预览元数据
-        const cacheData = readPreviewCache(threadId) || { maxPage: 1, pages: {} };
-        state.cache = cacheData;
-        state.maxPage = cacheData.maxPage || 1;
-
-        setManualFeedbackVisible(state, false);
-
-
-
-        button.addEventListener('click', async (e) => {
+        dom.button.addEventListener('click', async (e) => {
             e.preventDefault(); e.stopPropagation();
 
             const isDisplayed = state.previewOuter.style.display !== 'none';
@@ -1711,13 +1686,13 @@
             await loadPageBatch(state, 1);
         });
 
-        moreBtn.addEventListener('click', async (e) => {
+        dom.moreBtn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
             await loadPageBatch(state, state.loadedPageUntil + 1);
         });
 
-        fullBtn.addEventListener('click', async (e) => {
+        dom.fullBtn.addEventListener('click', async (e) => {
             e.preventDefault();
             e.stopPropagation();
             state.fullPreviewMode = true;
@@ -1733,9 +1708,32 @@
             updateStatus(state);
         });
 
+        // 追加操作按钮到预览容器
+        dom.previewContainer.appendChild(dom.moreBtn);
+        dom.previewContainer.appendChild(dom.fullBtn);
+    }
+
+    function addPreviewButtonToThread(threadElement) {
+        const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
+        if (!titleLink) return;
+        if (threadElement.querySelector('.preview-button')) return;
+
+        const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
+        const dom = createPreviewDOM(threadElement, titleLink);
+
+        // 创建预览状态并绑定到 DOM 节点 (WeakMap 保证自动 GC)
+        const state = new PreviewState(threadElement, threadId, titleLink.href, dom);
+        previewStateMap.set(threadElement, state);
+
+        // 从缓存恢复预览元数据
+        const cacheData = readPreviewCache(threadId) || { maxPage: 1, pages: {} };
+        state.cache = cacheData;
+        state.maxPage = cacheData.maxPage || 1;
+
+        setManualFeedbackVisible(state, false);
+        wirePreviewEvents(threadElement, dom);
+
         threadElement.discuzStartAutoPreview = () => loadAutoPreview(state);
-        previewContainer.appendChild(moreBtn);
-        previewContainer.appendChild(fullBtn);
     }
 
     function addPreviewButtons() {
