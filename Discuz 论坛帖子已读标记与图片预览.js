@@ -1204,15 +1204,7 @@
         return autoPreviewObserver;
     }
 
-    function addPreviewButtonToThread(threadElement) {
-        const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
-        if (!titleLink) return;
-
-        const threadUrl = titleLink.href;
-        const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
-
-        if (threadElement.querySelector('.preview-button')) return;
-
+    function createPreviewDOM(threadElement, titleLink) {
         const button = document.createElement('button');
         button.type = 'button';
         button.textContent = '预览图片';
@@ -1223,9 +1215,13 @@
 
         const statusBar = document.createElement('div');
         statusBar.style.gridColumn = '1 / -1';
-        const statusText = document.createElement('div'); statusText.className = 'preview-status-text';
-        const progressContainer = document.createElement('div'); progressContainer.className = 'progress-container'; progressContainer.style.display = 'none';
-        const progressBarFill = document.createElement('div'); progressBarFill.className = 'progress-bar-fill';
+        const statusText = document.createElement('div');
+        statusText.className = 'preview-status-text';
+        const progressContainer = document.createElement('div');
+        progressContainer.className = 'progress-container';
+        progressContainer.style.display = 'none';
+        const progressBarFill = document.createElement('div');
+        progressBarFill.className = 'progress-bar-fill';
         progressContainer.appendChild(progressBarFill);
 
         const previewContainer = document.createElement('div');
@@ -1249,6 +1245,40 @@
         titleLink.insertAdjacentElement('afterend', button);
         const titleCell = titleLink.closest('th');
         if (titleCell) titleCell.appendChild(previewOuter);
+
+        // 事件委托：在容器上统一处理图片点击，触发灯箱
+        previewContainer.addEventListener('click', (e) => {
+            const img = e.target.closest('.preview-img-item');
+            if (!img) return;
+            e.stopPropagation();
+            const allImgs = Array.from(previewContainer.querySelectorAll('.preview-img-item'));
+            const urls = allImgs.map(im => im.src);
+            const idx = allImgs.indexOf(img);
+            openLightbox(urls, idx);
+        });
+
+        return {
+            button, previewOuter, previewContainer,
+            statusBar, statusText, progressContainer, progressBarFill,
+            moreBtn, fullBtn,
+        };
+    }
+
+    function addPreviewButtonToThread(threadElement) {
+        const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
+        if (!titleLink) return;
+
+        const threadUrl = titleLink.href;
+        const threadId = threadElement.id.replace(/^(normalthread_|stickthread_)/, '');
+
+        if (threadElement.querySelector('.preview-button')) return;
+
+        const dom = createPreviewDOM(threadElement, titleLink);
+        const {
+            button, previewOuter, previewContainer,
+            statusBar, statusText, progressContainer, progressBarFill,
+            moreBtn, fullBtn,
+        } = dom;
 
         let validCountForTitle = 0;
         let cache = readPreviewCache(threadId) || { maxPage: 1, pages: {} };
@@ -1397,13 +1427,6 @@
                             previewImg.src = finalSrc;
                             previewImg.className = 'preview-img-item';
                             previewImg.style.aspectRatio = `${tempImg.naturalWidth} / ${tempImg.naturalHeight}`;
-                            previewImg.addEventListener('click', (evt) => {
-                                evt.stopPropagation();
-                                const allImgs = Array.from(previewContainer.querySelectorAll('.preview-img-item'));
-                                const urls = allImgs.map(img => img.src);
-                                const idx = allImgs.indexOf(previewImg);
-                                openLightbox(urls, idx);
-                            });
                             placeholder.replaceWith(previewImg);
                             requestAnimationFrame(syncFullButtonSize);
                         } else {
