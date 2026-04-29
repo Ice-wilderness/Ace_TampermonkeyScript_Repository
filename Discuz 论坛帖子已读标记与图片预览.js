@@ -1160,6 +1160,49 @@
         } catch (e) { }
     }
 
+    // --- PreviewState: 管理每个帖子的预览状态与 DOM 引用 ---
+
+    class PreviewState {
+        constructor(threadElement, threadId, threadUrl, dom) {
+            this.threadElement = threadElement;
+            this.threadId = threadId;
+            this.threadUrl = threadUrl;
+            // DOM 引用
+            this.button = dom.button;
+            this.previewOuter = dom.previewOuter;
+            this.previewContainer = dom.previewContainer;
+            this.statusBar = dom.statusBar;
+            this.statusText = dom.statusText;
+            this.progressContainer = dom.progressContainer;
+            this.progressBarFill = dom.progressBarFill;
+            this.moreBtn = dom.moreBtn;
+            this.fullBtn = dom.fullBtn;
+            // 可变状态
+            this.validCountForTitle = 0;
+            this.cache = { maxPage: 1, pages: {} };
+            this.loadedPageUntil = 0;
+            this.maxPage = 1;
+            this.pendingCount = 0;
+            this.checkedCount = 0;
+            this.fullPreviewMode = false;
+            this.firstPageImages = [];
+            this.firstPageNextIndex = 0;
+            this.renderedSrcSet = new Set();
+            this.observer = null;
+        }
+
+        destroy() {
+            if (this.observer) {
+                this.observer.disconnect();
+                this.observer = null;
+            }
+            previewStateMap.delete(this.threadElement);
+        }
+    }
+
+    /** WeakMap<threadElement, PreviewState> — DOM 节点为键，自动 GC */
+    const previewStateMap = new WeakMap();
+
     const autoPreviewQueue = [];
     let autoPreviewActiveCount = 0;
     let autoPreviewObserver = null;
@@ -1279,6 +1322,10 @@
             statusBar, statusText, progressContainer, progressBarFill,
             moreBtn, fullBtn,
         } = dom;
+
+        // 创建预览状态并绑定到 DOM 节点 (WeakMap 保证自动 GC)
+        const state = new PreviewState(threadElement, threadId, threadUrl, dom);
+        previewStateMap.set(threadElement, state);
 
         let validCountForTitle = 0;
         let cache = readPreviewCache(threadId) || { maxPage: 1, pages: {} };
