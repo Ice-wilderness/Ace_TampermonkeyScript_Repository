@@ -1329,6 +1329,83 @@
         if (!visible) state.progressContainer.style.display = 'none';
     }
 
+    let _syncFullSizePending = false;
+    function syncFullButtonSize(state) {
+        if (_syncFullSizePending) return;
+        _syncFullSizePending = true;
+        requestAnimationFrame(() => {
+            _syncFullSizePending = false;
+            const images = Array.from(state.previewContainer.querySelectorAll('.preview-img-item'));
+            const lastImage = images[images.length - 1];
+            if (!lastImage) {
+                state.fullBtn.style.height = '140px';
+                return;
+            }
+            const rect = lastImage.getBoundingClientRect();
+            if (rect.height > 0) {
+                state.fullBtn.style.height = `${Math.round(rect.height)}px`;
+            }
+        });
+    }
+
+    function hasFirstPageRemainingImages(state) {
+        return state.firstPageNextIndex < state.firstPageImages.length;
+    }
+
+    function updateMoreButton(state) {
+        state.moreBtn.style.display = 'none';
+        const hasMoreFirst = hasFirstPageRemainingImages(state);
+        const hasMorePages = canFetchExtraPages() && state.loadedPageUntil < state.maxPage;
+        if (state.previewContainer.dataset.loaded === 'true' && state.validCountForTitle > 0 && (hasMoreFirst || hasMorePages)) {
+            const nextStart = state.loadedPageUntil + 1;
+            const nextEnd = Math.min(state.maxPage, state.loadedPageUntil + PREVIEW_PAGE_BATCH_SIZE);
+            state.fullBtn.textContent = '加载更多图片';
+            state.fullBtn.title = hasMoreFirst
+                ? '继续显示第 1 页剩余图片'
+                : `继续抓取第 ${nextStart}-${nextEnd} 页（共 ${state.maxPage} 页）`;
+            state.fullBtn.style.display = '';
+            syncFullButtonSize(state);
+        } else {
+            state.fullBtn.title = '';
+            state.fullBtn.style.display = 'none';
+        }
+    }
+
+    function updateStatus(state) {
+        const { previewOuter, previewContainer, statusText, validCountForTitle,
+                pendingCount, checkedCount, loadedPageUntil, maxPage, fullPreviewMode } = state;
+
+        if (!fullPreviewMode) {
+            if (previewContainer.dataset.loaded === 'true' && pendingCount === 0 && validCountForTitle === 0) {
+                previewOuter.style.display = 'none';
+            }
+            setManualFeedbackVisible(state, false);
+            updateMoreButton(state);
+            updateButtonLabel(state);
+            return;
+        }
+        if (!canFetchExtraPages()) {
+            setManualFeedbackVisible(state, false);
+            updateMoreButton(state);
+            updateButtonLabel(state);
+            return;
+        }
+        setManualFeedbackVisible(state, true);
+        if (pendingCount > 0) {
+            statusText.textContent = `正在逐步呈现图片... (剩余 ${pendingCount} 张待查，符合要求展示 ${validCountForTitle} 张)`;
+        } else if (validCountForTitle > 0) {
+            statusText.textContent = `已抓取 ${loadedPageUntil}/${maxPage} 页，共加载 ${validCountForTitle} 张图片。`;
+        } else if (checkedCount > 0) {
+            statusText.textContent = '没有满足尺寸要求的图片。';
+        } else {
+            statusText.textContent = loadedPageUntil < maxPage
+                ? `前 ${loadedPageUntil} 页未发现图片，可继续抓取后续页面。`
+                : '该帖子内没有发现图片。';
+        }
+        updateMoreButton(state);
+        updateButtonLabel(state);
+    }
+
     function addPreviewButtonToThread(threadElement) {
         const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
         if (!titleLink) return;
@@ -1364,78 +1441,15 @@
 
         setManualFeedbackVisible(state, false);
 
-        const syncFullButtonSize = () => {
-            const images = Array.from(previewContainer.querySelectorAll('.preview-img-item'));
-            const lastImage = images[images.length - 1];
-            if (!lastImage) {
-                fullBtn.style.height = '140px';
-                return;
-            }
-
-            const rect = lastImage.getBoundingClientRect();
-            if (rect.height > 0) {
-                fullBtn.style.height = `${Math.round(rect.height)}px`;
-            }
-        };
-
-        const hasFirstPageRemainingImages = () => firstPageNextIndex < firstPageImages.length;
 
         const appendRemainingFirstPageImages = () => {
-            if (!hasFirstPageRemainingImages()) return false;
+            if (!hasFirstPageRemainingImages(state)) return false;
             const remainingImages = firstPageImages.slice(firstPageNextIndex);
             firstPageNextIndex = firstPageImages.length;
             appendImagePlaceholders(remainingImages, { silent: !canFetchExtraPages() });
             return true;
         };
 
-        const updateMoreButton = () => {
-            moreBtn.style.display = 'none';
-            const hasMoreFirstPageImages = hasFirstPageRemainingImages();
-            const hasMorePages = canFetchExtraPages() && loadedPageUntil < maxPage;
-            if (previewContainer.dataset.loaded === 'true' && validCountForTitle > 0 && (hasMoreFirstPageImages || hasMorePages)) {
-                const nextStart = loadedPageUntil + 1;
-                const nextEnd = Math.min(maxPage, loadedPageUntil + PREVIEW_PAGE_BATCH_SIZE);
-                fullBtn.textContent = '加载更多图片';
-                fullBtn.title = hasMoreFirstPageImages
-                    ? '继续显示第 1 页剩余图片'
-                    : `继续抓取第 ${nextStart}-${nextEnd} 页（共 ${maxPage} 页）`;
-                fullBtn.style.display = '';
-                requestAnimationFrame(syncFullButtonSize);
-            } else {
-                fullBtn.title = '';
-                fullBtn.style.display = 'none';
-            }
-        };
-
-        const updateStatus = () => {
-            if (!fullPreviewMode) {
-                if (previewContainer.dataset.loaded === 'true' && pendingCount === 0 && validCountForTitle === 0) {
-                    previewOuter.style.display = 'none';
-                }
-                setManualFeedbackVisible(state, false);
-                updateMoreButton();
-                updateButtonLabel(state);
-                return;
-            }
-            if (!canFetchExtraPages()) {
-                setManualFeedbackVisible(state, false);
-                updateMoreButton();
-                updateButtonLabel(state);
-                return;
-            }
-            setManualFeedbackVisible(state, true);
-            if (pendingCount > 0) {
-                statusText.textContent = `正在逐步呈现图片... (剩余 ${pendingCount} 张待查，符合要求展示 ${validCountForTitle} 张)`;
-            } else if (validCountForTitle > 0) {
-                statusText.textContent = `已抓取 ${loadedPageUntil}/${maxPage} 页，共加载 ${validCountForTitle} 张图片。`;
-            } else if (checkedCount > 0) {
-                statusText.textContent = '没有满足尺寸要求的图片。';
-            } else {
-                statusText.textContent = loadedPageUntil < maxPage ? `前 ${loadedPageUntil} 页未发现图片，可继续抓取后续页面。` : '该帖子内没有发现图片。';
-            }
-            updateMoreButton();
-            updateButtonLabel(state);
-        };
 
         const appendImagePlaceholders = (srcList, options = {}) => {
             const silent = options.silent === true;
@@ -1449,7 +1463,7 @@
             });
 
             if (uniqueList.length === 0) {
-                updateStatus();
+                updateStatus(state);
                 return;
             }
 
@@ -1479,7 +1493,7 @@
                             previewImg.className = 'preview-img-item';
                             previewImg.style.aspectRatio = `${tempImg.naturalWidth} / ${tempImg.naturalHeight}`;
                             placeholder.replaceWith(previewImg);
-                            requestAnimationFrame(syncFullButtonSize);
+                            syncFullButtonSize(state);
                         } else {
                             if (overLimit) renderedSrcSet.delete(imgSrc);
                             placeholder.remove();
@@ -1490,7 +1504,7 @@
                         if (pendingCount === 0 && autoFillLimit !== null && validCountForTitle < autoFillLimit) {
                             if (appendAutoPreviewCandidates(autoFillLimit, silent)) return;
                         }
-                        updateStatus();
+                        updateStatus(state);
                     };
 
                     const pollDimension = () => {
@@ -1525,11 +1539,11 @@
                 }
                 observer.observe(placeholder);
             });
-            updateStatus();
+            updateStatus(state);
         };
 
         appendAutoPreviewCandidates = (targetLimit, silent = true) => {
-            if (!hasFirstPageRemainingImages() || validCountForTitle >= targetLimit) return false;
+            if (!hasFirstPageRemainingImages(state) || validCountForTitle >= targetLimit) return false;
             const neededCount = targetLimit - validCountForTitle;
             const nextImages = [];
             while (firstPageNextIndex < firstPageImages.length && nextImages.length < neededCount) {
@@ -1585,7 +1599,7 @@
                 appendAutoPreviewCandidates(getAutoPreviewLimit(), true);
                 previewContainer.dataset.loaded = 'true';
                 delete previewContainer.dataset.error;
-                updateStatus();
+                updateStatus(state);
             } catch (err) {
                 console.error('[Discuz Marker] auto preview images fail', err);
                 previewOuter.style.display = 'none';
@@ -1640,7 +1654,7 @@
                 refreshThreadMark(threadElement);
                 progressBarFill.style.width = '95%';
                 if (pendingCount === 0) progressContainer.style.display = 'none';
-                updateStatus();
+                updateStatus(state);
                 return true;
             } catch (err) {
                 console.error('[Discuz Marker] fetch images fail', err);
@@ -1663,8 +1677,8 @@
 
             const isDisplayed = previewOuter.style.display !== 'none';
             if (previewContainer.dataset.loaded === "true") {
-                if (validCountForTitle === 0 && (hasFirstPageRemainingImages() || loadedPageUntil < maxPage)) {
-                    if (hasFirstPageRemainingImages() || canFetchExtraPages()) {
+                if (validCountForTitle === 0 && (hasFirstPageRemainingImages(state) || loadedPageUntil < maxPage)) {
+                    if (hasFirstPageRemainingImages(state) || canFetchExtraPages()) {
                         fullPreviewMode = true;
                         previewOuter.style.display = 'block';
                         button.textContent = '获取中...';
@@ -1706,11 +1720,11 @@
             updateThreadData(threadId, { viewedImages: true });
             refreshThreadMark(threadElement);
             const appendedFirstPageRemaining = appendRemainingFirstPageImages();
-            updateStatus();
+            updateStatus(state);
             if (!appendedFirstPageRemaining && canFetchExtraPages() && loadedPageUntil < maxPage) {
                 await loadPageBatch(loadedPageUntil + 1);
             }
-            updateStatus();
+            updateStatus(state);
         });
 
         threadElement.discuzStartAutoPreview = loadAutoPreview;
