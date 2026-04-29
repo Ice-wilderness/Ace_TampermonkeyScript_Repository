@@ -1670,6 +1670,8 @@
         }
         setTimeout(observeNewThreads, 1500);
     } else if (currentUrl.includes('mod=viewthread') || currentUrl.includes('thread-')) {
+        // 立即记录访问；部分 Discuz 环境下异步存储可能存在时序问题，
+        // 因此 3 秒后做二次确认：若仍无 visited 标记则补写一次。
         recordThreadVisit();
 
         setTimeout(() => {
