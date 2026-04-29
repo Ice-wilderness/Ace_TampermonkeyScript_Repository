@@ -263,6 +263,7 @@
 
     function saveVisitedThreads(data) {
         const keys = Object.keys(data);
+        let dataToSave = data;
         if (keys.length > MAX_HISTORY_RECORDS * 1.1) {
             console.log(`[Discuz Marker] 记录数超出阈值 (${keys.length})，自动清理旧数据...`);
             const arr = keys.map(id => ({ id, ts: (typeof data[id] === 'object' && data[id].ts) ? data[id].ts : 0 }));
@@ -271,9 +272,9 @@
             for (let i = 0; i < MAX_HISTORY_RECORDS; i++) {
                 newData[arr[i].id] = data[arr[i].id];
             }
-            data = newData;
+            dataToSave = newData;
         }
-        GM_setValue(STORAGE_KEY, JSON.stringify(data));
+        GM_setValue(STORAGE_KEY, JSON.stringify(dataToSave));
     }
 
     function normalizeRecord(record) {
