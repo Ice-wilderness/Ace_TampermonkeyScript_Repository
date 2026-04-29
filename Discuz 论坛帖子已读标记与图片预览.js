@@ -194,6 +194,8 @@
     const DEFAULT_AUTO_PREVIEW_CONCURRENT = 1;
     const AUTO_PREVIEW_DELAY_MS = 300;
     const VISITED_STYLE_MODES = ['default', 'opacity', 'strike', 'opacity-strike', 'color', 'hidden'];
+    const RE_THREAD_PAGE_SHORT = /thread-(\d+)-(\d+)(-\d+)?\.html$/i;
+    const RE_THREAD_PAGE_ARCHIVE = /thread-(\d+)-(\d+)-(\d+)\.html$/i;
 
     // --- 工具函数 ---
 
@@ -769,9 +771,9 @@
         }
 
         const path = url.pathname;
-        let nextPath = path.replace(/thread-(\d+)-(\d+)(-\d+)?\.html$/i, (all, tid, _page, extra = '') => `thread-${tid}-${page}${extra}.html`);
+        let nextPath = path.replace(RE_THREAD_PAGE_SHORT, (all, tid, _page, extra = '') => `thread-${tid}-${page}${extra}.html`);
         if (nextPath === path) {
-            nextPath = path.replace(/thread-(\d+)-(\d+)-(\d+)\.html$/i, (_all, tid, _page, archive) => `thread-${tid}-${page}-${archive}.html`);
+            nextPath = path.replace(RE_THREAD_PAGE_ARCHIVE, (_all, tid, _page, archive) => `thread-${tid}-${page}-${archive}.html`);
         }
 
         if (nextPath !== path) {
