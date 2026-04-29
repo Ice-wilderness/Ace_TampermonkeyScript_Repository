@@ -1406,6 +1406,30 @@
         updateButtonLabel(state);
     }
 
+    async function fetchPageImages(state, page, options = {}) {
+        const { cache, threadUrl, threadId, statusText, progressContainer, progressBarFill } = state;
+        if (cache.pages[page]) return cache.pages[page];
+        if (!options.silent) {
+            setManualFeedbackVisible(state, true);
+            statusText.textContent = `正在拉取第 ${page} 页...`;
+            progressContainer.style.display = 'block';
+            progressBarFill.style.width = `${Math.min(80, 15 + page * 15)}%`;
+        }
+        const response = await fetch(buildThreadPageUrl(threadUrl, page));
+        if (!response.ok) throw new Error(`第 ${page} 页 HTTP Error: ${response.status}`);
+        const text = await response.text();
+        const doc = new DOMParser().parseFromString(text, 'text/html');
+        const srcList = extractImagesFromDoc(doc);
+        cache.pages[page] = srcList;
+        if (page === 1) {
+            state.firstPageImages = srcList;
+            state.maxPage = getMaxPageFromDoc(doc);
+            cache.maxPage = state.maxPage;
+        }
+        writePreviewCache(threadId, cache);
+        return srcList;
+    }
+
     function addPreviewButtonToThread(threadElement) {
         const titleLink = threadElement.querySelector('th a.s.xst') || threadElement.querySelector('th a.xst');
         if (!titleLink) return;
@@ -1556,29 +1580,6 @@
             return true;
         };
 
-        const fetchPageImages = async (page, options = {}) => {
-            if (cache.pages[page]) return cache.pages[page];
-            if (!options.silent) {
-                setManualFeedbackVisible(state, true);
-                statusText.textContent = `正在拉取第 ${page} 页...`;
-                progressContainer.style.display = 'block';
-                progressBarFill.style.width = `${Math.min(80, 15 + page * 15)}%`;
-            }
-
-            const response = await fetch(buildThreadPageUrl(threadUrl, page));
-            if (!response.ok) throw new Error(`第 ${page} 页 HTTP Error: ${response.status}`);
-            const text = await response.text();
-            const doc = new DOMParser().parseFromString(text, 'text/html');
-            const srcList = extractImagesFromDoc(doc);
-            cache.pages[page] = srcList;
-            if (page === 1) {
-                firstPageImages = srcList;
-                maxPage = getMaxPageFromDoc(doc);
-                cache.maxPage = maxPage;
-            }
-            writePreviewCache(threadId, cache);
-            return srcList;
-        };
 
         const loadAutoPreview = async () => {
             if (previewContainer.dataset.loading === 'true' || previewContainer.dataset.loaded === 'true') return;
@@ -1591,7 +1592,7 @@
             setManualFeedbackVisible(state, false);
 
             try {
-                const pageImages = await fetchPageImages(1, { silent: true });
+                const pageImages = await fetchPageImages(state,1, { silent: true });
                 firstPageImages = pageImages;
                 firstPageNextIndex = 0;
                 maxPage = cache.maxPage || maxPage || 1;
@@ -1627,7 +1628,7 @@
 
             try {
                 if (startPage === 1 || !cache.pages[1]) {
-                    await fetchPageImages(1, { silent: !canFetchExtraPages() });
+                    await fetchPageImages(state,1, { silent: !canFetchExtraPages() });
                 }
                 maxPage = cache.maxPage || maxPage || 1;
                 if (startPage === 1 && cache.pages[1]) {
@@ -1639,7 +1640,7 @@
                 const endPage = canFetchExtraPages() ? Math.min(maxPage, actualStart + PREVIEW_PAGE_BATCH_SIZE - 1) : 1;
                 const batchImages = [];
                 for (let page = actualStart; page <= endPage; page++) {
-                    batchImages.push(...await fetchPageImages(page));
+                    batchImages.push(...await fetchPageImages(state,page));
                     loadedPageUntil = Math.max(loadedPageUntil, page);
                 }
 
