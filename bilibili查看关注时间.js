@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         bilibili查看关注时间
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.1.2
 // @description  bilibili查看关注时间。
 // @author       Ice_wilderness
 // @match        https://space.bilibili.com/*
@@ -26,6 +26,10 @@
 
     function log(msg, data = '') {
         console.log(`%c[B站关注时间助手] %c${msg}`, 'color: #00a1d6; font-weight: bold;', 'color: inherit;', data);
+    }
+
+    function isVideoPlaybackPage(url = location.href) {
+        return /https:\/\/www\.bilibili\.com\/(?:video|v|medialist\/play|list)\//.test(url);
     }
 
     // 获取当前登录用户的 UID (用于隔离本地数据库)
@@ -120,6 +124,10 @@
     // 核心引擎：全量同步爬虫
     // ==========================================
     async function startFullSync(vmid, type) {
+        if (isVideoPlaybackPage()) {
+            log('当前为视频播放相关页面，跳过关注列表全量同步。');
+            return;
+        }
         if (isSyncing) return;
         isSyncing = true;
         log(`触发全量同步: 账号(${vmid}) 类型(${type})`);
@@ -195,6 +203,8 @@
 
     // 后台静默检测机制：在任意页面均可触发当前账号的数据同步
     function checkBackgroundSync() {
+        if (isVideoPlaybackPage()) return; // 视频播放页只做标签注入，不触发后台全量同步
+
         let loginUid = getLoginUid();
         if (!loginUid) return; // 未登录时不执行
 
@@ -253,7 +263,7 @@
         // 1. 如果有当前屏幕上有查不到的人
         // 2. 或者距离上次全量同步超过 12 个小时 (12 * 60 * 60 * 1000)
         let hoursSinceSync = (Date.now() - db.lastSync) / (1000 * 60 * 60);
-        if ((missingCount > 0 || hoursSinceSync > 12) && !isSyncing) {
+        if ((missingCount > 0 || hoursSinceSync > 12) && !isSyncing && !isVideoPlaybackPage()) {
             startFullSync(vmid, type);
         }
     }

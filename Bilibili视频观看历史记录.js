@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.22
+// @version      3.1.24
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -60,8 +60,12 @@
     const HEADER_SETTLE_DELAY = 900;
     const DOM_START_FALLBACK_DELAY = 4500;
     const DOM_IDLE_TIMEOUT = 800;
+    const MIN_WATCH_SAVE_SECONDS = 2;
+    const MIN_RESUME_SECONDS = 5;
     const ACTION_LIST_ITEM_SELECTOR = '.action-list-item-wrap[data-key]';
     const PLAYLIST_ITEM_SELECTOR = `${ACTION_LIST_ITEM_SELECTOR}, .video-pod__item[data-key], .bpx-player-ctrl-eplist-multi-menu-item[data-cid], .video-pod__list.section .simple-base-item.page-item`;
+    const VIDEO_LINK_SELECTOR = 'a[href*="/video/"], a[href*="/v/"], a[href*="bvid="]';
+    const MUTATION_RELEVANT_SELECTOR = `${VIDEO_LINK_SELECTOR}, ${PLAYLIST_ITEM_SELECTOR}, .favorite-panel-popover, #favorite-content-scroll, .header-fav-card`;
 
     const VideoKey = {
         fromUrl: (value) => {
@@ -490,6 +494,7 @@
             keys.forEach(key => {
                 const record = StorageManager.getRecord(key);
                 if (!record || record.status !== RECORD_STATUS.WATCHED || !record.currentTime) return;
+                if (Utils.timeToSeconds(record.currentTime) < MIN_RESUME_SECONDS) return;
                 const t = record.savedAt ? new Date(record.savedAt).getTime() : 0;
                 if (!best || t > best.time) {
                     best = { key, record, page: VideoKey.page(key), time: t };
@@ -1110,8 +1115,9 @@
         },
         showResumePrompt: (target, onStartFresh) => {
             const record = target?.record || target;
-            if (!CONFIG.autoResumePrompt || !record?.currentTime) {
-                Utils.log('UIComponent.showResumePrompt skipped', `auto=${CONFIG.autoResumePrompt}`, `hasTime=${!!record?.currentTime}`);
+            const resumeSeconds = Utils.timeToSeconds(record?.currentTime);
+            if (!CONFIG.autoResumePrompt || !record?.currentTime || resumeSeconds < MIN_RESUME_SECONDS) {
+                Utils.log('UIComponent.showResumePrompt skipped', `auto=${CONFIG.autoResumePrompt}`, `hasTime=${!!record?.currentTime}`, `seconds=${resumeSeconds}`);
                 return;
             }
             if (document.getElementById('bvh-resume')) {
@@ -1686,6 +1692,10 @@
 
             const current = this.videoEl.currentTime || 0;
             const duration = this.videoEl.duration || 1;
+            if (current < MIN_WATCH_SAVE_SECONDS) {
+                Utils.logEvery('saveProgressSkippedTooEarly', 20, `force=${force}`, `key=${this.bvId}`, `current=${current.toFixed(2)}`);
+                return;
+            }
 
             const format = (sec) => {
                 const h = Math.floor(sec / 3600);
@@ -1750,6 +1760,11 @@
             this.schedulePlaylistRefresh = Utils.debounce(() => this.refreshPlaylistItems(), 120);
             this.initIntersectionObserver();
             this.initMutationObserver();
+            document.addEventListener('pointerover', (e) => {
+                if (e.target?.closest?.('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
+                    this.scheduleFavoriteRefresh();
+                }
+            }, true);
             Utils.log('DOMWatcher constructed');
 
             // 事件驱动而非定时盲扫
@@ -1827,11 +1842,21 @@
                         m.addedNodes.forEach(node => {
                             addedNodeCount++;
                             if (node.nodeType === Node.ELEMENT_NODE) {
+                                if (node.matches?.('[class*="bvh-"]') || node.closest?.('[class*="bvh-"]')) {
+                                    return;
+                                }
                                 if (node.closest?.(HEADER_SELECTOR) || node.matches?.(HEADER_SELECTOR)) {
                                     return;
                                 }
 
-                                if (node.matches && node.matches('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
+                                const selfIsRelevantLink = node.matches?.(VIDEO_LINK_SELECTOR);
+                                const selfIsPlaylistItem = node.matches?.(PLAYLIST_ITEM_SELECTOR);
+                                const selfIsFavoriteCard = node.matches?.('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card');
+                                if (!selfIsRelevantLink && !selfIsPlaylistItem && !selfIsFavoriteCard && !node.querySelector?.(MUTATION_RELEVANT_SELECTOR)) {
+                                    return;
+                                }
+
+                                if (selfIsFavoriteCard) {
                                     shouldRefreshFavoriteCards = true;
                                 } else if (node.querySelector && node.querySelector('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
                                     shouldRefreshFavoriteCards = true;
@@ -1848,7 +1873,7 @@
                                     items.forEach(item => addedPlaylistItems.push(item));
                                 }
                                 // 节点自身是合集/分 P 列表项
-                                if (node.matches && node.matches(PLAYLIST_ITEM_SELECTOR)) {
+                                if (selfIsPlaylistItem) {
                                     addedPlaylistItems.push(node);
                                 }
                             }
@@ -1866,16 +1891,18 @@
                 if (shouldRefreshFavoriteCards) {
                     this.scheduleFavoriteRefresh();
                 }
-                Utils.logEvery('mutationBatches', 20, `mutations=${mutations.length}`, `attr=${attributeCount}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `links=${addedLinks.length}`, `playlist=${addedPlaylistItems.length}`, `favorite=${shouldRefreshFavoriteCards}`);
+                const cost = performance.now() - start;
+                const hasWork = addedLinks.length > 0 || addedPlaylistItems.length > 0 || shouldRefreshFavoriteCards;
+                if (hasWork || cost >= 50) {
+                    Utils.logEvery('mutationBatches', 20, `mutations=${mutations.length}`, `attr=${attributeCount}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `links=${addedLinks.length}`, `playlist=${addedPlaylistItems.length}`, `favorite=${shouldRefreshFavoriteCards}`, `cost=${cost.toFixed(1)}ms`);
+                }
                 Utils.logSlow('DOMWatcher MutationObserver batch', start, `mutations=${mutations.length} attr=${attributeCount} child=${childListCount} links=${addedLinks.length} playlist=${addedPlaylistItems.length}`, 50);
             });
             this.mutationObserver.observe(document.body, {
                 childList: true,
-                subtree: true,
-                attributes: true,
-                attributeFilter: ['href', 'data-bsb-bvid', 'data-key', 'data-cid', 'class', 'src', 'srcset', 'title']
+                subtree: true
             });
-            Utils.log('DOMWatcher MutationObserver initialized');
+            Utils.log('DOMWatcher MutationObserver initialized: childList only');
         }
 
         observeLink(el) {
@@ -2277,6 +2304,7 @@
     class AppController {
         constructor() {
             this.currentUrl = location.href;
+            this.currentVideoKey = '';
             this.playerObserver = null;
             this.domWatcher = null;
             this._domStarted = false;
@@ -2489,15 +2517,32 @@
             });
         }
 
+        getRouteVideoKey() {
+            return VideoKey.fromUrl(location.href) || VideoKey.normalize(window.__INITIAL_STATE__?.bvid) || '';
+        }
+
         checkAndInitVideoPage() {
             const isVideoPage = /\/(video|v|medialist\/play|list)\//.test(location.href) || window.__INITIAL_STATE__?.bvid || /[?&]bvid=/.test(location.href);
-            Utils.log('AppController.checkAndInitVideoPage', `isVideoPage=${!!isVideoPage}`, `url=${location.href}`, `stateBvid=${window.__INITIAL_STATE__?.bvid || 'none'}`);
+            const routeKey = this.getRouteVideoKey();
+            const observerKey = this.playerObserver?.bvId ? VideoKey.normalize(this.playerObserver.bvId) : '';
+            Utils.log('AppController.checkAndInitVideoPage', `isVideoPage=${!!isVideoPage}`, `routeKey=${routeKey || 'none'}`, `observerKey=${observerKey || 'none'}`, `url=${location.href}`, `stateBvid=${window.__INITIAL_STATE__?.bvid || 'none'}`);
             if (isVideoPage) {
+                if (this.playerObserver && routeKey && observerKey === VideoKey.normalize(routeKey)) {
+                    Utils.log('AppController.checkAndInitVideoPage skip: same video key');
+                    this.currentVideoKey = routeKey;
+                    return;
+                }
                 if (this.playerObserver) {
                     this.playerObserver.destroy();
                 }
+                this.currentVideoKey = routeKey;
                 this.playerObserver = new VideoPlayerObserver();
                 this.playerObserver.init();
+            } else if (this.playerObserver) {
+                Utils.log('AppController.checkAndInitVideoPage destroy: leave video page');
+                this.playerObserver.destroy();
+                this.playerObserver = null;
+                this.currentVideoKey = '';
             }
         }
 
