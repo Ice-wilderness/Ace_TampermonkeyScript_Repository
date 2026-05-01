@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.2.0
+// @version      2.2.1
 // @description  论坛辅助签到工具 - 优化了性能与结构，采用异步等待与策略模式，新增SSTM支持
 // @author       Ice_wilderness
 // @match        http*://bbs.wcccc.cc/*
@@ -503,17 +503,31 @@
                     return false;
                 }
 
-                const btnVisited = document.querySelector('.btnvisted');
-                const btnSign = document.querySelector('#JD_sign');
-                const statusText = document.querySelector('.qdleft .font');
+                const isSigned = () => {
+                    const btnVisited = document.querySelector('.btnvisted');
+                    const statusText = document.querySelector('.qdleft .font');
+                    return btnVisited || (statusText && !statusText.innerText.includes("您今天还没有签到"));
+                };
 
-                if (btnVisited || (statusText && !statusText.innerText.includes("您今天还没有签到"))) {
+                if (isSigned()) {
                     console.log('已签到!');
                     return true;
-                } else if (btnSign) {
+                }
+
+                const btnSign = document.querySelector('#JD_sign');
+                if (btnSign) {
                     btnSign.click();
-                    console.log('签到成功');
-                    return true;
+                    console.log('已点击签到，等待页面确认...');
+
+                    for (let i = 0; i < 10; i++) {
+                        await delay(500);
+                        if (isSigned()) {
+                            console.log('签到成功');
+                            return true;
+                        }
+                    }
+
+                    console.log('签到点击后未检测到已签到状态，暂不记录签到时间。');
                 }
                 return false;
             }
