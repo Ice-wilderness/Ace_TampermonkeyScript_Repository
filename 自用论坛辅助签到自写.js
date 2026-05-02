@@ -13,7 +13,7 @@
 // @match        http*://bbs.kfpromax.com/*
 // @match        http*://sjs47.com/*
 // @match        http*://www.vikacg.com/*
-// @match        http*://feixueacg.com/*
+// @match        http*://feixueacg.org/*
 // @match        http*://www.galgamex.org/*
 // @match        http*://www.acgndog.com/*
 // @match        http*://www.galgamex.top/*
@@ -302,7 +302,7 @@
         },
         {
             name: "飞雪论坛",
-            matches: ["feixueacg.com"],
+            matches: ["feixueacg.org"],
             key: "fxacg",
             async run() {
                 if (!location.href.includes('dc_signin') && !location.href.includes('login')) {
