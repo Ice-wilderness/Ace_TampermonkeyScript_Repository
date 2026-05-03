@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.24
+// @version      3.1.26
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -65,7 +65,17 @@
     const ACTION_LIST_ITEM_SELECTOR = '.action-list-item-wrap[data-key]';
     const PLAYLIST_ITEM_SELECTOR = `${ACTION_LIST_ITEM_SELECTOR}, .video-pod__item[data-key], .bpx-player-ctrl-eplist-multi-menu-item[data-cid], .video-pod__list.section .simple-base-item.page-item`;
     const VIDEO_LINK_SELECTOR = 'a[href*="/video/"], a[href*="/v/"], a[href*="bvid="]';
-    const MUTATION_RELEVANT_SELECTOR = `${VIDEO_LINK_SELECTOR}, ${PLAYLIST_ITEM_SELECTOR}, .favorite-panel-popover, #favorite-content-scroll, .header-fav-card`;
+    const HEADER_POPOVER_SELECTOR = '.dynamic-panel-popover, .history-panel-popover, .favorite-panel-popover, #biliHeaderDynScrollCon, #favorite-content-scroll, .header-favorite-popover';
+    const HEADER_POPOVER_VIDEO_LINK_SELECTOR = [
+        '.dynamic-panel-popover .header-dynamic__box--right[href*="/video/"]',
+        '.history-panel-popover .header-history-card[href*="/video/"]',
+        '.favorite-panel-popover .header-fav-card[href*="/video/"]',
+        '.favorite-panel-popover .header-fav-card[href*="bvid="]',
+        '#favorite-content-scroll .header-fav-card[href*="/video/"]',
+        '#favorite-content-scroll .header-fav-card[href*="bvid="]'
+    ].join(', ');
+    const HEADER_POPOVER_COVER_SELECTOR = '.header-dynamic__box--right .cover, .header-history-video__image, .header-fav-card__image';
+    const MUTATION_RELEVANT_SELECTOR = `${VIDEO_LINK_SELECTOR}, ${PLAYLIST_ITEM_SELECTOR}, ${HEADER_POPOVER_SELECTOR}, ${HEADER_POPOVER_VIDEO_LINK_SELECTOR}`;
 
     const VideoKey = {
         fromUrl: (value) => {
@@ -124,6 +134,7 @@
         .bvh-tag-big { height: 22px; line-height: 23px; font-size: 14px; }
         .bvh-episode-tag { display: inline-block; margin-left: 6px; padding: 0 4px; height: 16px; line-height: 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 600; vertical-align: middle; white-space: nowrap; pointer-events: none; }
         .action-list-item-wrap .cover, .action-list-item-wrap .cover-img { position: relative; }
+        ${HEADER_POPOVER_COVER_SELECTOR} { position: relative; }
         .bvh-action-list-cover-tag { z-index: 109 !important; }
         .video-pod__list.grid .video-pod__item.page { position: relative; }
         .bvh-episode-tag-grid { position: absolute; top: 2px; right: 2px; margin: 0; padding: 0 3px; min-width: 14px; max-width: 30px; height: 14px; line-height: 14px; font-size: 9px; text-align: center; overflow: hidden; text-overflow: ellipsis; }
@@ -1756,13 +1767,19 @@
             this.mutationObserver = null;
             this.processedLinks = new WeakSet();
             this.visibleElements = new Set();
-            this.scheduleFavoriteRefresh = Utils.debounce(() => this.refreshFavoriteCards(), 120);
+            this.scheduleHeaderPopoverRefresh = Utils.debounce(() => this.refreshHeaderPopoverCards(), 120);
             this.schedulePlaylistRefresh = Utils.debounce(() => this.refreshPlaylistItems(), 120);
             this.initIntersectionObserver();
             this.initMutationObserver();
             document.addEventListener('pointerover', (e) => {
-                if (e.target?.closest?.('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
-                    this.scheduleFavoriteRefresh();
+                if (e.target?.closest?.(HEADER_POPOVER_SELECTOR)) {
+                    this.scheduleHeaderPopoverRefresh();
+                }
+            }, true);
+            document.addEventListener('click', (e) => {
+                if (e.target?.closest?.(HEADER_POPOVER_SELECTOR)) {
+                    this.scheduleHeaderPopoverRefresh();
+                    setTimeout(() => this.scheduleHeaderPopoverRefresh(), 450);
                 }
             }, true);
             Utils.log('DOMWatcher constructed');
@@ -1807,25 +1824,42 @@
             Utils.log('DOMWatcher IntersectionObserver initialized');
         }
 
+        isHeaderPopoverNode(el) {
+            return !!(el?.matches?.(HEADER_POPOVER_SELECTOR) || el?.closest?.(HEADER_POPOVER_SELECTOR));
+        }
+
+        isSkippedHeaderNode(el) {
+            return !!(el?.closest?.(HEADER_SELECTOR) && !this.isHeaderPopoverNode(el) && !el?.querySelector?.(HEADER_POPOVER_SELECTOR));
+        }
+
+        isHeaderPopoverVideoLink(el) {
+            return !!el?.matches?.(HEADER_POPOVER_VIDEO_LINK_SELECTOR);
+        }
+
+        getHeaderPopoverCover(el) {
+            if (!this.isHeaderPopoverVideoLink(el)) return null;
+            return el.querySelector('.cover, .header-history-video__image, .header-fav-card__image');
+        }
+
         initMutationObserver() {
             this.mutationObserver = new MutationObserver((mutations) => {
                 const start = performance.now();
                 let addedLinks = [];
                 let addedPlaylistItems = [];
-                let shouldRefreshFavoriteCards = false;
+                let shouldRefreshHeaderPopoverCards = false;
                 let attributeCount = 0;
                 let childListCount = 0;
                 let addedNodeCount = 0;
                 mutations.forEach(m => {
-                    if (m.target?.nodeType === Node.ELEMENT_NODE && m.target.closest(HEADER_SELECTOR)) {
+                    if (m.target?.nodeType === Node.ELEMENT_NODE && this.isSkippedHeaderNode(m.target)) {
                         return;
                     }
 
                     if (m.type === 'attributes') {
                         attributeCount++;
                         const target = m.target;
-                        if (target.nodeType === Node.ELEMENT_NODE && target.closest('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
-                            shouldRefreshFavoriteCards = true;
+                        if (target.nodeType === Node.ELEMENT_NODE && this.isHeaderPopoverNode(target)) {
+                            shouldRefreshHeaderPopoverCards = true;
                         }
                         if (target.nodeType === Node.ELEMENT_NODE && target.matches) {
                             const playlistItem = target.matches(PLAYLIST_ITEM_SELECTOR)
@@ -1845,21 +1879,22 @@
                                 if (node.matches?.('[class*="bvh-"]') || node.closest?.('[class*="bvh-"]')) {
                                     return;
                                 }
-                                if (node.closest?.(HEADER_SELECTOR) || node.matches?.(HEADER_SELECTOR)) {
+                                if (this.isSkippedHeaderNode(node)) {
                                     return;
                                 }
 
                                 const selfIsRelevantLink = node.matches?.(VIDEO_LINK_SELECTOR);
                                 const selfIsPlaylistItem = node.matches?.(PLAYLIST_ITEM_SELECTOR);
-                                const selfIsFavoriteCard = node.matches?.('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card');
-                                if (!selfIsRelevantLink && !selfIsPlaylistItem && !selfIsFavoriteCard && !node.querySelector?.(MUTATION_RELEVANT_SELECTOR)) {
+                                const selfIsHeaderPopover = node.matches?.(HEADER_POPOVER_SELECTOR);
+                                const selfIsHeaderPopoverCard = node.matches?.(HEADER_POPOVER_VIDEO_LINK_SELECTOR);
+                                if (!selfIsRelevantLink && !selfIsPlaylistItem && !selfIsHeaderPopover && !selfIsHeaderPopoverCard && !node.querySelector?.(MUTATION_RELEVANT_SELECTOR)) {
                                     return;
                                 }
 
-                                if (selfIsFavoriteCard) {
-                                    shouldRefreshFavoriteCards = true;
-                                } else if (node.querySelector && node.querySelector('.favorite-panel-popover, #favorite-content-scroll, .header-fav-card')) {
-                                    shouldRefreshFavoriteCards = true;
+                                if (selfIsHeaderPopover || selfIsHeaderPopoverCard) {
+                                    shouldRefreshHeaderPopoverCards = true;
+                                } else if (node.querySelector && (node.querySelector(HEADER_POPOVER_SELECTOR) || node.querySelector(HEADER_POPOVER_VIDEO_LINK_SELECTOR))) {
+                                    shouldRefreshHeaderPopoverCards = true;
                                 }
 
                                 if (node.tagName === 'A' && node.href) {
@@ -1888,13 +1923,13 @@
                 if (addedPlaylistItems.length > 0) {
                     this.schedulePlaylistRefresh();
                 }
-                if (shouldRefreshFavoriteCards) {
-                    this.scheduleFavoriteRefresh();
+                if (shouldRefreshHeaderPopoverCards) {
+                    this.scheduleHeaderPopoverRefresh();
                 }
                 const cost = performance.now() - start;
-                const hasWork = addedLinks.length > 0 || addedPlaylistItems.length > 0 || shouldRefreshFavoriteCards;
+                const hasWork = addedLinks.length > 0 || addedPlaylistItems.length > 0 || shouldRefreshHeaderPopoverCards;
                 if (hasWork || cost >= 50) {
-                    Utils.logEvery('mutationBatches', 20, `mutations=${mutations.length}`, `attr=${attributeCount}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `links=${addedLinks.length}`, `playlist=${addedPlaylistItems.length}`, `favorite=${shouldRefreshFavoriteCards}`, `cost=${cost.toFixed(1)}ms`);
+                    Utils.logEvery('mutationBatches', 20, `mutations=${mutations.length}`, `attr=${attributeCount}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `links=${addedLinks.length}`, `playlist=${addedPlaylistItems.length}`, `headerPopover=${shouldRefreshHeaderPopoverCards}`, `cost=${cost.toFixed(1)}ms`);
                 }
                 Utils.logSlow('DOMWatcher MutationObserver batch', start, `mutations=${mutations.length} attr=${attributeCount} child=${childListCount} links=${addedLinks.length} playlist=${addedPlaylistItems.length}`, 50);
             });
@@ -1906,7 +1941,7 @@
         }
 
         observeLink(el) {
-            if (el.closest(HEADER_SELECTOR)) return;
+            if (this.isSkippedHeaderNode(el)) return;
             if (!this.processedLinks.has(el) && this.isValidLink(el)) {
                 this.processedLinks.add(el);
                 this.intersectionObserver.observe(el);
@@ -1924,7 +1959,7 @@
                 this.observePlaylistItem(item);
                 this.processPlaylistItem(item);
             });
-            this.refreshFavoriteCards();
+            this.refreshHeaderPopoverCards();
             done(`links=${links.length} playlist=${playlistItems.length} visible=${this.visibleElements.size}`);
         }
 
@@ -1943,13 +1978,13 @@
             done(`items=${items.length} processed=${processed}`);
         }
 
-        // 收藏夹弹窗会复用卡片节点并改写 href / 图片 / 标题，必须绕过 WeakSet 直接刷新
-        refreshFavoriteCards() {
-            const done = Utils.debugTime('DOMWatcher.refreshFavoriteCards');
-            const cards = document.querySelectorAll('.favorite-panel-popover .header-fav-card, #favorite-content-scroll .header-fav-card');
+        // 头部弹窗会复用卡片节点并改写 href / 图片 / 标题，必须绕过 WeakSet 直接刷新
+        refreshHeaderPopoverCards() {
+            const done = Utils.debugTime('DOMWatcher.refreshHeaderPopoverCards');
+            const cards = document.querySelectorAll(HEADER_POPOVER_VIDEO_LINK_SELECTOR);
             let processed = 0;
             cards.forEach(card => {
-                if (card.href && !card.closest(HEADER_SELECTOR)) {
+                if (card.href) {
                     this.observeLink(card);
                     this.processLink(card);
                     processed++;
@@ -1973,8 +2008,17 @@
         isValidLink(el) {
             const href = el.href;
             if (!href || !this.getVideoKeyFromLink(el)) return false;
+            const isHeaderPopoverLink = this.isHeaderPopoverVideoLink(el);
 
-            if (el.closest(`${HEADER_SELECTOR}, .bili-footer, #biliMainFooter`)) {
+            if (this.isHeaderPopoverNode(el) && !isHeaderPopoverLink) {
+                return false;
+            }
+
+            if (el.closest(HEADER_SELECTOR) && !isHeaderPopoverLink) {
+                return false;
+            }
+
+            if (el.closest('.bili-footer, #biliMainFooter')) {
                 return false;
             }
 
@@ -1989,6 +2033,10 @@
             if (el.closest('.bili-avatar, .header-dynamic-avatar')) return false;
             // 排除指向用户空间 dynamic 的链接（头像/用户名链接）
             if (/space\.bilibili\.com\/\d+\/dynamic/.test(href)) return false;
+
+            if (isHeaderPopoverLink) {
+                return true;
+            }
 
             // 直接包含封面图的链接
             if (el.querySelector('img') || el.querySelector('picture') || el.querySelector('.bili-dyn-card-video__cover .bili-awesome-img')) {
@@ -2160,7 +2208,7 @@
 
         processLink(el) {
             const start = performance.now();
-            if (el.closest?.(HEADER_SELECTOR)) return;
+            if (this.isSkippedHeaderNode(el)) return;
 
             // 合集播放列表项走专用处理（它们是 div 而非 a）
             if (el.matches && el.matches(PLAYLIST_ITEM_SELECTOR)) {
@@ -2170,7 +2218,9 @@
             let bv = this.getVideoKeyFromLink(el);
             if (!bv) return;
             let bvBase = VideoKey.base(bv);
-            const isHistoryCard = !!el.closest('.history-card');
+            const isHeaderPopoverLink = this.isHeaderPopoverVideoLink(el);
+            const headerPopoverCover = this.getHeaderPopoverCover(el);
+            const isHistoryCard = !!el.closest('.history-card, .header-history-card');
             const existingVideoKey = el._bvhLastVideoKey;
             const isSameVideoKey = existingVideoKey === bv;
 
@@ -2230,7 +2280,9 @@
                 this.removeExistingMark(el);
             }
 
-            let img = el.querySelector('img') || el.querySelector('picture');
+            let img = headerPopoverCover
+                ? (headerPopoverCover.querySelector('picture') || headerPopoverCover.querySelector('img'))
+                : (el.querySelector('img') || el.querySelector('picture'));
             let isSmall = false;
 
             if (!img) {
@@ -2270,6 +2322,12 @@
                 if (width > 0 && width < 83) isSmall = true;
             }
 
+            const markParent = headerPopoverCover || img.parentNode;
+            let markBeforeNode = img;
+            if (headerPopoverCover) {
+                markBeforeNode = Array.from(headerPopoverCover.children).find(child => child === img || child.contains(img)) || headerPopoverCover.firstChild;
+            }
+
             let tagColorClass = 'bvh-tag-visited';
             if (isMulti) {
                 // 多P统一使用蓝色 (方案A)
@@ -2284,16 +2342,16 @@
             }
 
             const tagEl = UIComponent.createTag(tagText, tagTitle, `bvh-tag ${tagColorClass} ${isSmall ? 'bvh-tag-small' : ''}`);
-            img.parentNode.insertBefore(tagEl, img);
+            markParent.insertBefore(tagEl, markBeforeNode);
             el._bvhLastVideoKey = bv;
 
             if (CONFIG.showProgressBar && record.percent && !isMulti) {
                 const barEl = UIComponent.createProgressBar(record.percent);
                 const statsNode = el.querySelector('.bili-video-card__stats');
-                if (statsNode && el.children.length > 0) {
+                if (!isHeaderPopoverLink && statsNode && el.children.length > 0) {
                     el.children[0].insertBefore(barEl, el.children[0].firstChild);
                 } else {
-                    img.parentNode.insertBefore(barEl, img);
+                    markParent.insertBefore(barEl, markBeforeNode);
                 }
             }
             Utils.logSlow('DOMWatcher.processLink', start, `key=${bv} record=${record.status}${record.percent || ''} multi=${isMulti} el=${Utils.describeElement(el)}`, 30);
