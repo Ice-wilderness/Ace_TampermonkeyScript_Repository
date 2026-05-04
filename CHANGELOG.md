@@ -2,14 +2,18 @@
 
 本文件按脚本分区记录更新。新增脚本时，请增加新的脚本分区。
 
+各脚本分区使用 Markdown 内嵌 HTML 的 `<details>` 折叠块；在支持该语法的阅读器中，可点击脚本名展开查看。
+
 ## 目录
 
-- [Bilibili 视频观看历史记录](#bilibili-视频观看历史记录)
-- [bilibili 查看关注时间](#bilibili-查看关注时间)
-- [Discuz 论坛帖子已读标记与图片预览](#discuz-论坛帖子已读标记与图片预览)
-- [自用论坛辅助签到](#自用论坛辅助签到)
+- [Bilibili 视频观看历史记录](#bilibili-history)
+- [bilibili 查看关注时间](#bilibili-follow-time)
+- [Discuz 论坛帖子已读标记与图片预览](#discuz-read-image-preview)
+- [自用论坛辅助签到](#forum-auto-signin)
 
-## Bilibili 视频观看历史记录
+<a id="bilibili-history"></a>
+<details>
+<summary><strong>Bilibili 视频观看历史记录</strong></summary>
 
 文件：[Bilibili视频观看历史记录.js](./Bilibili视频观看历史记录.js)
 
@@ -113,7 +117,11 @@
 - 优化设置页 UI，将配置拆分为“显示与提示”和“标签样式”两个区域。
 - 优化管理面板视觉层级、间距、输入框、按钮和分页控件样式。
 
-## bilibili 查看关注时间
+</details>
+
+<a id="bilibili-follow-time"></a>
+<details>
+<summary><strong>bilibili 查看关注时间</strong></summary>
 
 文件：[bilibili查看关注时间.js](./bilibili查看关注时间.js)
 
@@ -127,7 +135,11 @@
 - 支持在关注/粉丝列表、用户主页和全站用户悬浮名片中显示关注时间。
 - 支持按登录账号缓存关注时间数据，并在缓存缺失或过期时自动同步。
 
-## Discuz 论坛帖子已读标记与图片预览
+</details>
+
+<a id="discuz-read-image-preview"></a>
+<details>
+<summary><strong>Discuz 论坛帖子已读标记与图片预览</strong></summary>
 
 文件：[Discuz 论坛帖子已读标记与图片预览.js](./Discuz%20论坛帖子已读标记与图片预览.js)
 
@@ -208,10 +220,16 @@
 - 数据管理面板新增足迹统计、最近记录时间和当前存储 key。
 - 增强异步加载帖子列表的按钮补扫与状态标记刷新。
 
-## 自用论坛辅助签到
+</details>
+
+<a id="forum-auto-signin"></a>
+<details>
+<summary><strong>自用论坛辅助签到</strong></summary>
 
 文件：[【自写】自用论坛辅助签到自写.js](./【自写】自用论坛辅助签到自写.js)
 
 ### 2.2.1
 
 - 修复司机社点击签到后未等待页面确认，导致首次签到完成后本地签到日期可能延迟到下一次访问才记录的问题。
+
+</details>

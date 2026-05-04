@@ -8,7 +8,7 @@ AI 在修改本仓库时，必须优先判断“当前改动属于哪个脚本�
 
 AI 在开发过程中，不得因为每一次小修改、修复、重构、调试或阶段性代码编辑，就自动更新版本号、CHANGELOG.md 或 README.md。
 
-只有在以下任一情况发生时，才允许统一检查并更新版本号、CHANGELOG.md、README.md 和 userscript 元信息：
+只有在以下任一情况发生时，才允许统一检查并更新版本号@version、CHANGELOG.md、README.md 和 userscript 元信息：
 
 1. 用户明确表示当前这段工作已经完成，例如：
    - “这个功能完成了”
