@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.27
+// @version      3.2.0
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -378,11 +378,23 @@
         }
     };
 
+    const DISPLAY_SETTINGS = new Set([
+        'showProgressBar',
+        'showVisitedTag',
+        'tagOpacity',
+        'tagPosition',
+        'lowThreshold',
+        'highThreshold'
+    ]);
+
     const SettingsManager = {
         save: (patch = {}) => {
             Object.assign(CONFIG, patch);
             GM_setValue('bvh_settings', Object.assign({}, CONFIG));
-            StorageManager._notifyChange();
+            const needsDomRefresh = Object.keys(patch).some(key => DISPLAY_SETTINGS.has(key));
+            if (needsDomRefresh) {
+                StorageManager._notifyChange();
+            }
         },
         reset: () => {
             Object.keys(CONFIG).forEach(key => delete CONFIG[key]);
@@ -485,14 +497,38 @@
 
             return items;
         },
+        _itemsCache: null,
+        _itemsCacheInvalidator: null,
+        _invalidateItemsCache: () => {
+            EpisodeResolver._itemsCache = null;
+            EpisodeResolver._itemsCacheInvalidator = null;
+        },
+        _scheduleItemsCacheInvalidation: () => {
+            if (EpisodeResolver._itemsCacheInvalidator) return;
+            const schedule = typeof queueMicrotask === 'function'
+                ? (cb) => queueMicrotask(cb)
+                : (cb) => setTimeout(cb, 0);
+            EpisodeResolver._itemsCacheInvalidator = schedule(() => {
+                EpisodeResolver._invalidateItemsCache();
+            });
+        },
         getItems: () => {
+            if (EpisodeResolver._itemsCache) return EpisodeResolver._itemsCache;
             const base = EpisodeResolver.getBaseKey();
-            if (!base && !EpisodeResolver._collectItems().some(item => item.key)) return [];
-            return EpisodeResolver._collectItems().map(item => ({
+            const items = EpisodeResolver._collectItems();
+            if (items.length === 0) {
+                EpisodeResolver._itemsCache = [];
+                EpisodeResolver._scheduleItemsCacheInvalidation();
+                return EpisodeResolver._itemsCache;
+            }
+            const mapped = items.map(item => ({
                 ...item,
                 base: item.base || base,
                 key: item.key || VideoKey.withPage(base, item.page)
             }));
+            EpisodeResolver._itemsCache = mapped;
+            EpisodeResolver._scheduleItemsCacheInvalidation();
+            return mapped;
         },
         getActiveItem: () => {
             const currentBase = EpisodeResolver.getBaseKey();
@@ -585,9 +621,11 @@
     const StorageManager = {
         _shardCache: new Map(),       // shardId → { data: {...}, dirty: false }
         _bvBaseIndex: new Map(),      // bvBase → Set<fullKey>
+        _shardForBase: new Map(),     // bvBase → Set<shardId>  二级索引（按需加载用）
         _allKeysCache: null,
         _changeCallbacks: [],
         _migrationCount: 0,
+        _lastKnownRevision: 0,       // 多标签页同步：记录本地已知的存储版本号
 
         onDataChange: (cb) => {
             StorageManager._changeCallbacks.push(cb);
@@ -622,7 +660,7 @@
             const keys = Object.keys(data);
             // 加载时增量构建 BV 基础 ID 索引
             for (const key of keys) {
-                StorageManager._indexKey(key);
+                StorageManager._indexKey(key, shardId);
             }
             Utils.logSlow('StorageManager._loadShard', start, `shard=${shardId} records=${keys.length}`, 30);
             return shard;
@@ -648,12 +686,17 @@
         },
 
         // --- 索引管理 ---
-        _indexKey: (key) => {
+        _indexKey: (key, shardId) => {
             const base = VideoKey.base(key);
             if (base) {
                 let set = StorageManager._bvBaseIndex.get(base);
                 if (!set) { set = new Set(); StorageManager._bvBaseIndex.set(base, set); }
                 set.add(key);
+                // 二级索引：base → shards
+                const sid = shardId !== undefined ? shardId : StorageManager._getShardId(key);
+                let shardSet = StorageManager._shardForBase.get(base);
+                if (!shardSet) { shardSet = new Set(); StorageManager._shardForBase.set(base, shardSet); }
+                shardSet.add(sid);
             }
         },
 
@@ -662,6 +705,7 @@
             if (base) {
                 const set = StorageManager._bvBaseIndex.get(base);
                 if (set) { set.delete(key); if (set.size === 0) StorageManager._bvBaseIndex.delete(base); }
+                // 仅清除内存中的 keys，不清除 base→shard 映射（因为同一个 base 可能还有其他 key 在同一 shard 中）
             }
         },
 
@@ -725,11 +769,19 @@
             const shardId = StorageManager._getShardId(id);
             const start = performance.now();
             const shard = StorageManager._loadShard(shardId);
+            const base = VideoKey.base(id);
+            // 检测 base→shard 映射是否变化（仅在新 base 出现或新增 shard 时才持久化索引）
+            const shardSetBefore = base ? StorageManager._shardForBase.get(base) : null;
+            const isNewShardForBase = base && (!shardSetBefore || !shardSetBefore.has(shardId));
             shard.data[id] = StorageManager._compact(record);
             shard.dirty = true;
             StorageManager._flushShard(shardId);
-            StorageManager._indexKey(id);
+            StorageManager._indexKey(id, shardId);
             StorageManager._allKeysCache = null;
+            StorageManager._incrementRevision();
+            if (isNewShardForBase) {
+                StorageManager._persistBaseIndex();
+            }
             if (notify) StorageManager._notifyChange();
             Utils.logSlow('StorageManager.saveRecord', start, `key=${id} shard=${shardId} notify=${notify}`, 30);
         },
@@ -740,13 +792,60 @@
             const shardId = StorageManager._getShardId(id);
             const start = performance.now();
             const shard = StorageManager._loadShard(shardId);
+            const base = VideoKey.base(id);
+
             delete shard.data[id];
             shard.dirty = true;
             StorageManager._flushShard(shardId);
             StorageManager._removeFromIndex(id);
             StorageManager._allKeysCache = null;
+            StorageManager._incrementRevision();
+
+            if (base) {
+                const hasSameBaseInThisShard = Object.keys(shard.data).some(k => VideoKey.base(k) === base);
+                const shardSet = StorageManager._shardForBase.get(base);
+
+                if (shardSet && !hasSameBaseInThisShard) {
+                    shardSet.delete(shardId);
+                    if (shardSet.size === 0) {
+                        StorageManager._shardForBase.delete(base);
+                    }
+                    StorageManager._persistBaseIndex();
+                }
+            }
+
             if (notify) StorageManager._notifyChange();
             Utils.logSlow('StorageManager.deleteRecord', start, `key=${id} shard=${shardId} notify=${notify}`, 30);
+        },
+
+        // 批量导入：defer flush / revision / index persist，最后一次性提交
+        importRecords: (data) => {
+            const start = performance.now();
+            let count = 0;
+            let skipCount = 0;
+            for (const k in data) {
+                if (!(typeof data[k] === 'object' || Array.isArray(data[k]))) continue;
+                const id = VideoKey.normalize(k) || k;
+                if (!id) continue;
+                if (StorageManager.getRecord(id)) { skipCount++; continue; }
+                const shardId = StorageManager._getShardId(id);
+                const shard = StorageManager._loadShard(shardId);
+                shard.data[id] = StorageManager._compact(data[k]);
+                shard.dirty = true;
+                StorageManager._indexKey(id, shardId);
+                StorageManager._allKeysCache = null;
+                count++;
+            }
+            // 批量 flush 所有脏分片
+            for (const [shardId, shard] of StorageManager._shardCache) {
+                if (shard.dirty) StorageManager._flushShard(shardId);
+            }
+            // 重建索引并写入版本号
+            StorageManager._rebuildBaseIndex();
+            StorageManager._incrementRevision();
+            StorageManager._notifyChange();
+            Utils.logSlow('StorageManager.importRecords', start, `imported=${count} skipped=${skipCount}`, 80);
+            return { count, skipCount };
         },
 
         getAllKeys: () => {
@@ -768,11 +867,40 @@
         getRelatedKeys: (bvBase, options = {}) => {
             const start = performance.now();
             const shouldLoadAll = options.loadAll !== false;
-            if (shouldLoadAll) StorageManager._ensureAllShardsLoaded();
-            const set = StorageManager._bvBaseIndex.get(bvBase);
-            const keys = set ? Array.from(set) : [];
-            Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} loadAll=${shouldLoadAll} keys=${keys.length}`, 50);
-            return keys;
+
+            // 1. 已加载分片命中（内存 _bvBaseIndex）
+            if (StorageManager._bvBaseIndex.has(bvBase)) {
+                const keys = Array.from(StorageManager._bvBaseIndex.get(bvBase));
+                Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=memory keys=${keys.length}`, 30);
+                return keys;
+            }
+
+            // 2. 从持久化索引或内存 _shardForBase 获取目标分片，按需加载
+            if (!StorageManager._shardForBase.has(bvBase)) {
+                StorageManager._loadPersistedBaseIndex();
+            }
+            const targetShards = StorageManager._shardForBase.get(bvBase);
+            if (targetShards && targetShards.size > 0) {
+                targetShards.forEach(sid => StorageManager._loadShard(sid));
+                if (StorageManager._bvBaseIndex.has(bvBase)) {
+                    const keys = Array.from(StorageManager._bvBaseIndex.get(bvBase));
+                    Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=on-demand shards=${targetShards.size} keys=${keys.length}`, 50);
+                    return keys;
+                }
+            }
+
+            // 3. 安全降级：全量加载并重建索引
+            if (shouldLoadAll) {
+                StorageManager._ensureAllShardsLoaded();
+                StorageManager._rebuildBaseIndex();
+                const set = StorageManager._bvBaseIndex.get(bvBase);
+                const keys = set ? Array.from(set) : [];
+                Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=fallback keys=${keys.length}`, 80);
+                return keys;
+            }
+
+            Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=miss`, 30);
+            return [];
         },
 
         getAllRecords: () => {
@@ -870,6 +998,14 @@
             const done = Utils.debugTime('StorageManager.migrateIfNeeded');
             const meta = GM_getValue('bvh_meta');
             if (meta && meta.version === 3) {
+                // 初始化版本号，避免首次 visibilitychange 误判 stale
+                StorageManager._lastKnownRevision = GM_getValue(StorageManager._REVISION_KEY, 0) || 0;
+                // 已有 v3 用户首次升级到含 base 索引的版本：检查并重建持久化索引
+                if (!GM_getValue(StorageManager._BASE_INDEX_KEY)) {
+                    Utils.log('migrateIfNeeded: v3 user upgrading to base-index, rebuilding...');
+                    StorageManager._rebuildBaseIndex();
+                    StorageManager._lastKnownRevision = GM_getValue(StorageManager._REVISION_KEY, 0) || 0;
+                }
                 done('already v3');
                 return; // 已完成迁移
             }
@@ -880,6 +1016,8 @@
             if (bvKeys.length === 0) {
                 // 全新安装，直接标记为 v3
                 GM_setValue('bvh_meta', { version: 3, shardCount: SHARD_COUNT, totalRecords: 0, migratedAt: Date.now() });
+                StorageManager._lastKnownRevision = StorageManager._incrementRevision();
+                StorageManager._persistBaseIndex();
                 done('new install');
                 return;
             }
@@ -924,14 +1062,92 @@
 
             Utils.log(`迁移完成：${migratedCount} 条记录`);
             StorageManager._migrationCount = migratedCount;
+            // 重建持久化 base 索引
+            StorageManager._rebuildBaseIndex();
+            StorageManager._lastKnownRevision = StorageManager._incrementRevision();
             done(`migrated=${migratedCount}`);
         },
 
-        // --- 多标签页切换时刷新缓存 ---
+        // --- 持久化 base→shard 索引 + 存储版本号 ---
+        _BASE_INDEX_KEY: 'bvh_base_index',
+        _REVISION_KEY: 'bvh_storage_revision',
+        _BASE_INDEX_VERSION: 1,
+
+        _incrementRevision: () => {
+            const rev = (GM_getValue(StorageManager._REVISION_KEY, 0) || 0) + 1;
+            GM_setValue(StorageManager._REVISION_KEY, rev);
+            StorageManager._lastKnownRevision = rev;
+            return rev;
+        },
+
+        _persistBaseIndex: () => {
+            const index = {};
+            StorageManager._shardForBase.forEach((shardIds, base) => {
+                index[base] = Array.from(shardIds);
+            });
+            GM_setValue(StorageManager._BASE_INDEX_KEY, {
+                version: StorageManager._BASE_INDEX_VERSION,
+                revision: GM_getValue(StorageManager._REVISION_KEY, 0) || 0,
+                index
+            });
+        },
+
+        _loadPersistedBaseIndex: () => {
+            const persisted = GM_getValue(StorageManager._BASE_INDEX_KEY);
+            if (!persisted || persisted.version !== StorageManager._BASE_INDEX_VERSION) return false;
+            const index = persisted.index;
+            if (!index || typeof index !== 'object') return false;
+            let loaded = 0;
+            for (const base of Object.keys(index)) {
+                const shardIds = index[base];
+                if (Array.isArray(shardIds) && shardIds.length > 0) {
+                    const shardSet = new Set(shardIds);
+                    StorageManager._shardForBase.set(base, shardSet);
+                    loaded++;
+                }
+            }
+            Utils.log('StorageManager._loadPersistedBaseIndex', `loaded=${loaded} bases`);
+            return loaded > 0;
+        },
+
+        _rebuildBaseIndex: () => {
+            const start = performance.now();
+            StorageManager._bvBaseIndex.clear();
+            StorageManager._shardForBase.clear();
+            for (let i = 0; i < SHARD_COUNT; i++) {
+                StorageManager._loadShard(i);
+            }
+            // 对已缓存的分片确保全部键被重新索引（_loadShard 对已缓存分片不会重复索引）
+            for (const [shardId, shard] of StorageManager._shardCache) {
+                for (const key of Object.keys(shard.data)) {
+                    StorageManager._indexKey(key, shardId);
+                }
+            }
+            StorageManager._persistBaseIndex();
+            Utils.logSlow('StorageManager._rebuildBaseIndex', start, `bases=${StorageManager._shardForBase.size} shards=${StorageManager._shardCache.size}`, 80);
+        },
+
+        // --- 多标签页切换时同步（基于版本号） ---
+        _syncIfStale: () => {
+            const remoteRev = GM_getValue(StorageManager._REVISION_KEY, 0) || 0;
+            if (remoteRev > StorageManager._lastKnownRevision) {
+                Utils.log('StorageManager._syncIfStale: stale detected', `local=${StorageManager._lastKnownRevision}`, `remote=${remoteRev}`);
+                StorageManager._shardCache.clear();
+                StorageManager._bvBaseIndex.clear();
+                StorageManager._shardForBase.clear();
+                StorageManager._allKeysCache = null;
+                StorageManager._lastKnownRevision = remoteRev;
+                StorageManager._loadPersistedBaseIndex();
+                return true;
+            }
+            return false;
+        },
+
         invalidateCache: () => {
             Utils.log('StorageManager.invalidateCache', `cachedShards=${StorageManager._shardCache.size}`, `indexedBases=${StorageManager._bvBaseIndex.size}`);
             StorageManager._shardCache.clear();
             StorageManager._bvBaseIndex.clear();
+            StorageManager._shardForBase.clear();
             StorageManager._allKeysCache = null;
         }
     };
@@ -1237,7 +1453,8 @@
                 sort: 'savedAt-desc',
                 page: 1,
                 pageSize: 50,
-                selected: new Set()
+                selected: new Set(),
+                _cachedRows: null
             };
 
             const renderTabs = () => {
@@ -1285,6 +1502,7 @@
             };
 
             const getFilteredRows = () => {
+                if (state._cachedRows) return state._cachedRows;
                 const query = state.query.trim().toLowerCase();
                 let rows = StorageManager.getAllRecords();
                 if (query) {
@@ -1301,6 +1519,7 @@
                     const bt = new Date(b.record.savedAt || 0).getTime();
                     return state.sort === 'savedAt-asc' ? at - bt : bt - at;
                 });
+                state._cachedRows = rows;
                 return rows;
             };
 
@@ -1380,6 +1599,7 @@
             };
 
             const render = () => {
+                state._cachedRows = null;
                 renderTabs();
                 if (state.tab === 'settings') renderSettings();
                 if (state.tab === 'history') renderHistory();
@@ -1414,19 +1634,8 @@
                     reader.onload = ev => {
                         try {
                             const data = JSON.parse(ev.target.result);
-                            let count = 0;
-                            let skipCount = 0;
-                            for (let k in data) {
-                                const key = VideoKey.normalize(k) || k;
-                                if ((typeof data[k] === 'object' || Array.isArray(data[k])) && !StorageManager.getRecord(key)) {
-                                    StorageManager.saveRecord(key, data[k], false);
-                                    count++;
-                                } else {
-                                    skipCount++;
-                                }
-                            }
-                            StorageManager._notifyChange();
-                            UIComponent.toast(`成功导入 ${count} 条新记录 (跳过 ${skipCount} 条已有记录)`, 'success', 4000);
+                            const result = StorageManager.importRecords(data);
+                            UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有记录)`, 'success', 4000);
                             render();
                         } catch (err) {
                             UIComponent.toast('导入失败：文件格式错误', 'error');
@@ -1775,9 +1984,17 @@
                 title: this.title
             };
 
-            StorageManager.saveRecord(this.bvId, value);
-            localStorage.setItem(`${BACKUP_PREFIX}${this.bvId}`, JSON.stringify({ key: this.bvId, value: value, savedAt: Date.now() }));
-            StorageManager.cleanupLocalStorageBackupsThrottled();
+            try {
+                StorageManager.saveRecord(this.bvId, value);
+            } catch (e) {
+                // GM_setValue 写入失败时，用 localStorage 作为异常兜底
+                Utils.error('StorageManager.saveRecord failed, falling back to localStorage', e);
+                localStorage.setItem(`${BACKUP_PREFIX}${this.bvId}`, JSON.stringify({ key: this.bvId, value: value, savedAt: Date.now() }));
+            }
+            if (force) {
+                localStorage.setItem(`${BACKUP_PREFIX}${this.bvId}`, JSON.stringify({ key: this.bvId, value: value, savedAt: Date.now() }));
+                StorageManager.cleanupLocalStorageBackupsThrottled();
+            }
 
             // 缓存最近一次有效进度
             this._lastKnownState = { key: this.bvId, value };
@@ -1822,6 +2039,7 @@
             this.pendingRescanRoots = new Map();
             this.flushScheduled = false;
             this.relatedKeysCache = new Map();
+            this._initialScanInProgress = false;
             this.pageMode = this.getPageMode();
             this.scheduleHeaderPopoverRefresh = Utils.debounce(() => this.refreshHeaderPopoverCards(), 120);
             this.schedulePlaylistRefresh = Utils.debounce(() => this.refreshPlaylistItems(), 120);
@@ -1914,6 +2132,7 @@
                 this.disconnectContentObservers();
             }
             this.relatedKeysCache.clear();
+            EpisodeResolver._invalidateItemsCache();
             this.refreshObserverRoots();
             this.scanExistingLinks();
         }
@@ -2014,7 +2233,9 @@
             const observer = new MutationObserver(mutations => this.handleContentMutations(mutations, root));
             observer.observe(root, { childList: true, subtree: true });
             this.contentObservers.set(root, observer);
-            this.rescanContentRoot(root, 'observe root');
+            if (!this._initialScanInProgress) {
+                this.rescanContentRoot(root, 'observe root');
+            }
             return true;
         }
 
@@ -2216,15 +2437,20 @@
 
         scanExistingLinks() {
             const done = Utils.debugTime('DOMWatcher.scanExistingLinks');
-            this.refreshObserverRoots();
-            const links = new Set();
-            const playlistItems = new Set();
-            const roots = Array.from(this.contentObservers.keys());
-            roots.forEach(root => this.collectExistingFromRoot(root, links, playlistItems));
-            this.enqueueLinks(links);
-            this.enqueuePlaylistItems(playlistItems);
-            this.refreshHeaderPopoverCards();
-            done(`mode=${this.pageMode} roots=${this.contentObservers.size} links=${links.size} playlist=${playlistItems.size} visible=${this.visibleElements.size}`);
+            this._initialScanInProgress = true;
+            try {
+                this.refreshObserverRoots();
+                const links = new Set();
+                const playlistItems = new Set();
+                const roots = Array.from(this.contentObservers.keys());
+                roots.forEach(root => this.collectExistingFromRoot(root, links, playlistItems));
+                this.enqueueLinks(links);
+                this.enqueuePlaylistItems(playlistItems);
+                this.refreshHeaderPopoverCards();
+                done(`mode=${this.pageMode} roots=${this.contentObservers.size} links=${links.size} playlist=${playlistItems.size} visible=${this.visibleElements.size}`);
+            } finally {
+                this._initialScanInProgress = false;
+            }
         }
 
         // 强制刷新所有播放列表项标签（绕过 processedLinks 检查）
@@ -2758,12 +2984,14 @@
             this.hijackRouter();
             done('initialized watchers/player/router');
 
-            // 标签页切回时刷新缓存（从其他标签页观看视频后返回列表页）
+            // 标签页切回时基于版本号判断是否需要同步（避免盲目全量刷新）
             document.addEventListener('visibilitychange', () => {
                 Utils.log('visibilitychange', document.visibilityState);
                 if (document.visibilityState === 'visible') {
-                    StorageManager.invalidateCache();
-                    StorageManager._notifyChange();
+                    const stale = StorageManager._syncIfStale();
+                    if (stale) {
+                        StorageManager._notifyChange();
+                    }
                 }
             });
         }
@@ -2823,21 +3051,8 @@
                     reader.onload = ev => {
                         try {
                             const data = JSON.parse(ev.target.result);
-                            let count = 0;
-                            let skipCount = 0;
-                            for (let k in data) {
-                                if (typeof data[k] === 'object' || Array.isArray(data[k])) {
-                                    const key = VideoKey.normalize(k) || k;
-                                    if (!StorageManager.getRecord(key)) {
-                                        StorageManager.saveRecord(key, data[k], false);
-                                        count++;
-                                    } else {
-                                        skipCount++;
-                                    }
-                                }
-                            }
-                            StorageManager._notifyChange();
-                            UIComponent.toast(`成功导入 ${count} 条新记录 (跳过 ${skipCount} 条已有记录)`, 'success', 4000);
+                            const result = StorageManager.importRecords(data);
+                            UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有记录)`, 'success', 4000);
                         } catch (err) {
                             UIComponent.toast('导入失败：文件格式错误', 'error');
                         }
@@ -2911,10 +3126,6 @@
                         UIComponent.showQuickEntry();
                         if (this.domWatcher) {
                             this.domWatcher.refreshForRoute();
-                        }
-                        // 合集/分 P 切换视频时强制刷新播放列表标签
-                        if (this.domWatcher && (/\/list\//.test(location.href) || document.querySelector(PLAYLIST_ITEM_SELECTOR))) {
-                            this.domWatcher.refreshPlaylistItems();
                         }
                         done(`url=${location.href}`);
                     }, 500);

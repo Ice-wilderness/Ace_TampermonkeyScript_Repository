@@ -13,7 +13,19 @@
 
 文件：[Bilibili视频观看历史记录.js](./Bilibili视频观看历史记录.js)
 
-### 3.1.27
+### 3.2.0
+
+- 优化存储层：新增持久化 `bvh_base_index`（base→shard 索引），`getRelatedKeys` 按需加载目标分片替代遍历 64 分片，大幅减少冷启动 GM 读取次数。
+- 新增 `bvh_storage_revision` 版本号，多标签页切回时基于版本号判断是否需要同步，避免盲目全量刷新缓存。
+- 优化 `EpisodeResolver._collectItems()` 缓存策略，同一同步周期内复用 DOM 扫描结果，消除 `getItems()` 内的重复 `querySelectorAll`。
+- 消除初始加载时 `scanExistingLinks` 与 `observeContentRoot` 对同一 root 的双重扫描。
+- `SettingsManager.save` 仅在显示相关配置变更时才触发 DOM 重绘，避免无关设置保存导致全量刷新。
+- 播放进度常规保存改为仅写 GM 分片存储，localStorage 备份仅在 pause/beforeunload 或异常兜底时写入。
+- 新增 `StorageManager.importRecords` 批量导入 API，defer flush/revision/index-persist 到最后一次性提交，减少大量 GM 写入。
+- 修复 `deleteRecord` 中跨分片 base 索引误删除的潜在缺陷。
+- 修复已有 v3 用户首次升级后 `_lastKnownRevision` 未初始化导致首次切回误判 stale 的问题。
+- 路由切换时去除冗余 `refreshPlaylistItems` 调用，由 `refreshForRoute` 统一处理。
+- 历史管理面板 `getFilteredRows` 在单次 render 周期内复用过滤结果。
 
 - 修复播放页加载时全局 DOM 监听可能持续抢占主线程，导致视频页无法加载或浏览器卡死的问题。
 - 将视频卡片和选集标记改为容器级监听与分批处理，保留推荐、分 P、合集、动态、搜索、历史、稍后再看和头部弹窗标记能力。
