@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.1.26
+// @version      3.1.27
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -76,6 +76,55 @@
     ].join(', ');
     const HEADER_POPOVER_COVER_SELECTOR = '.header-dynamic__box--right .cover, .header-history-video__image, .header-fav-card__image';
     const MUTATION_RELEVANT_SELECTOR = `${VIDEO_LINK_SELECTOR}, ${PLAYLIST_ITEM_SELECTOR}, ${HEADER_POPOVER_SELECTOR}, ${HEADER_POPOVER_VIDEO_LINK_SELECTOR}`;
+    const VIDEO_OBSERVER_ROOT_SELECTOR = [
+        '#reco_list',
+        '.right-container',
+        '.right-container-inner',
+        '.recommend-list',
+        '.recommend-list-v1',
+        '.rec-list',
+        '.rcmd-list',
+        '.next-play',
+        '.video-page-card-small',
+        '.video-page-card',
+        '.video-card-small',
+        '.video-card-ad-small',
+        '.bili-video-card',
+        '.video-card',
+        '.card-box',
+        '.video-pod',
+        '.video-pod__list',
+        '.base-video-sections-v1',
+        '.video-sections-v1',
+        '.playlist-container',
+        '.list-box',
+        '.action-list',
+        '.bpx-player-ctrl-eplist',
+        '.bpx-player-ctrl-eplist-multi-menu',
+        '.bpx-player-ctrl-eplist-episodes'
+    ].join(', ');
+    const LIST_OBSERVER_ROOT_SELECTOR = [
+        '#app',
+        '#i_cecream',
+        '.bili-feed4-layout',
+        '.bili-dyn-list__items',
+        '.bili-dyn-card',
+        '.bili-video-card',
+        '.history-list',
+        '.history-card',
+        '.watch-later-list',
+        '.search-page',
+        '.video-list',
+        '.fav-video-list',
+        '.space-video',
+        '.channel-list'
+    ].join(', ');
+    const OBSERVER_ROOT_DISCOVERY_SELECTOR = `${VIDEO_OBSERVER_ROOT_SELECTOR}, ${LIST_OBSERVER_ROOT_SELECTOR}, ${HEADER_POPOVER_SELECTOR}`;
+    const DOM_MUTATION_WORK_LIMIT = 160;
+    const DOM_LINK_BATCH_SIZE = 60;
+    const DOM_PLAYLIST_BATCH_SIZE = 40;
+    const DOM_PROCESS_TIME_BUDGET = 12;
+    const DOM_RESCAN_DELAY = 350;
 
     const VideoKey = {
         fromUrl: (value) => {
@@ -1764,11 +1813,20 @@
     class DOMWatcher {
         constructor() {
             this.intersectionObserver = null;
-            this.mutationObserver = null;
+            this.rootObserver = null;
+            this.contentObservers = new Map();
             this.processedLinks = new WeakSet();
             this.visibleElements = new Set();
+            this.pendingLinks = new Set();
+            this.pendingPlaylistItems = new Set();
+            this.pendingRescanRoots = new Map();
+            this.flushScheduled = false;
+            this.relatedKeysCache = new Map();
+            this.pageMode = this.getPageMode();
             this.scheduleHeaderPopoverRefresh = Utils.debounce(() => this.refreshHeaderPopoverCards(), 120);
             this.schedulePlaylistRefresh = Utils.debounce(() => this.refreshPlaylistItems(), 120);
+            this.scheduleObserverRootRefresh = Utils.debounce(() => this.refreshObserverRoots(), 180);
+            this.scheduleFullRescan = Utils.debounce(() => this.flushRescanRoots(), DOM_RESCAN_DELAY);
             this.initIntersectionObserver();
             this.initMutationObserver();
             document.addEventListener('pointerover', (e) => {
@@ -1782,16 +1840,17 @@
                     setTimeout(() => this.scheduleHeaderPopoverRefresh(), 450);
                 }
             }, true);
-            Utils.log('DOMWatcher constructed');
+            Utils.log('DOMWatcher constructed', `mode=${this.pageMode}`);
 
             // 事件驱动而非定时盲扫
             StorageManager.onDataChange(() => {
                 const start = performance.now();
                 let processed = 0;
                 let removed = 0;
+                this.relatedKeysCache.clear();
                 this.visibleElements.forEach(el => {
                     if (document.contains(el)) {
-                        this.processLink(el);
+                        this.enqueueElement(el);
                         processed++;
                     } else {
                         this.visibleElements.delete(el);
@@ -1811,7 +1870,7 @@
                 entries.forEach(entry => {
                     if (entry.isIntersecting) {
                         this.visibleElements.add(entry.target);
-                        this.processLink(entry.target);
+                        this.enqueueElement(entry.target);
                         enterCount++;
                     } else {
                         this.visibleElements.delete(entry.target);
@@ -1841,103 +1900,309 @@
             return el.querySelector('.cover, .header-history-video__image, .header-fav-card__image');
         }
 
+        getPageMode() {
+            return /\/(video|v|medialist\/play|list)\//.test(location.href) || /[?&]bvid=/.test(location.href) || window.__INITIAL_STATE__?.bvid
+                ? 'video'
+                : 'list';
+        }
+
+        refreshForRoute() {
+            const nextMode = this.getPageMode();
+            if (nextMode !== this.pageMode) {
+                Utils.log('DOMWatcher mode changed', `from=${this.pageMode}`, `to=${nextMode}`, `url=${location.href}`);
+                this.pageMode = nextMode;
+                this.disconnectContentObservers();
+            }
+            this.relatedKeysCache.clear();
+            this.refreshObserverRoots();
+            this.scanExistingLinks();
+        }
+
         initMutationObserver() {
-            this.mutationObserver = new MutationObserver((mutations) => {
+            this.rootObserver = new MutationObserver((mutations) => {
                 const start = performance.now();
-                let addedLinks = [];
-                let addedPlaylistItems = [];
+                let shouldRefreshRoots = false;
                 let shouldRefreshHeaderPopoverCards = false;
-                let attributeCount = 0;
                 let childListCount = 0;
                 let addedNodeCount = 0;
                 mutations.forEach(m => {
-                    if (m.target?.nodeType === Node.ELEMENT_NODE && this.isSkippedHeaderNode(m.target)) {
-                        return;
-                    }
-
-                    if (m.type === 'attributes') {
-                        attributeCount++;
-                        const target = m.target;
-                        if (target.nodeType === Node.ELEMENT_NODE && this.isHeaderPopoverNode(target)) {
+                    if (m.type !== 'childList') return;
+                    childListCount++;
+                    m.addedNodes.forEach(node => {
+                        addedNodeCount++;
+                        if (node.nodeType !== Node.ELEMENT_NODE) return;
+                        if (node.matches?.('[class*="bvh-"]') || node.closest?.('[class*="bvh-"]')) return;
+                        if (node.matches?.(HEADER_POPOVER_SELECTOR) || node.querySelector?.(HEADER_POPOVER_SELECTOR)) {
                             shouldRefreshHeaderPopoverCards = true;
                         }
-                        if (target.nodeType === Node.ELEMENT_NODE && target.matches) {
-                            const playlistItem = target.matches(PLAYLIST_ITEM_SELECTOR)
-                                ? target
-                                : target.closest?.(ACTION_LIST_ITEM_SELECTOR);
-                            if (playlistItem) {
-                                addedPlaylistItems.push(playlistItem);
-                            }
+                        const discoverySelector = this.pageMode === 'video'
+                            ? `${VIDEO_OBSERVER_ROOT_SELECTOR}, ${HEADER_POPOVER_SELECTOR}`
+                            : OBSERVER_ROOT_DISCOVERY_SELECTOR;
+                        if (node.matches?.(discoverySelector) || node.querySelector?.(discoverySelector)) {
+                            shouldRefreshRoots = true;
                         }
-                    }
-
-                    if (m.type === 'childList') {
-                        childListCount++;
-                        m.addedNodes.forEach(node => {
-                            addedNodeCount++;
-                            if (node.nodeType === Node.ELEMENT_NODE) {
-                                if (node.matches?.('[class*="bvh-"]') || node.closest?.('[class*="bvh-"]')) {
-                                    return;
-                                }
-                                if (this.isSkippedHeaderNode(node)) {
-                                    return;
-                                }
-
-                                const selfIsRelevantLink = node.matches?.(VIDEO_LINK_SELECTOR);
-                                const selfIsPlaylistItem = node.matches?.(PLAYLIST_ITEM_SELECTOR);
-                                const selfIsHeaderPopover = node.matches?.(HEADER_POPOVER_SELECTOR);
-                                const selfIsHeaderPopoverCard = node.matches?.(HEADER_POPOVER_VIDEO_LINK_SELECTOR);
-                                if (!selfIsRelevantLink && !selfIsPlaylistItem && !selfIsHeaderPopover && !selfIsHeaderPopoverCard && !node.querySelector?.(MUTATION_RELEVANT_SELECTOR)) {
-                                    return;
-                                }
-
-                                if (selfIsHeaderPopover || selfIsHeaderPopoverCard) {
-                                    shouldRefreshHeaderPopoverCards = true;
-                                } else if (node.querySelector && (node.querySelector(HEADER_POPOVER_SELECTOR) || node.querySelector(HEADER_POPOVER_VIDEO_LINK_SELECTOR))) {
-                                    shouldRefreshHeaderPopoverCards = true;
-                                }
-
-                                if (node.tagName === 'A' && node.href) {
-                                    addedLinks.push(node);
-                                }
-                                if (node.querySelectorAll) {
-                                    const links = node.querySelectorAll('a[href]');
-                                    links.forEach(link => addedLinks.push(link));
-                                    // 合集/分 P 播放列表项
-                                    const items = node.querySelectorAll(PLAYLIST_ITEM_SELECTOR);
-                                    items.forEach(item => addedPlaylistItems.push(item));
-                                }
-                                // 节点自身是合集/分 P 列表项
-                                if (selfIsPlaylistItem) {
-                                    addedPlaylistItems.push(node);
-                                }
-                            }
-                        });
-                    }
+                    });
                 });
-                addedLinks.forEach(link => this.observeLink(link));
-                addedPlaylistItems.forEach(item => {
-                    this.observePlaylistItem(item);
-                    this.processPlaylistItem(item);
-                });
-                if (addedPlaylistItems.length > 0) {
-                    this.schedulePlaylistRefresh();
-                }
-                if (shouldRefreshHeaderPopoverCards) {
-                    this.scheduleHeaderPopoverRefresh();
-                }
+                if (shouldRefreshRoots) this.scheduleObserverRootRefresh();
+                if (shouldRefreshHeaderPopoverCards) this.scheduleHeaderPopoverRefresh();
                 const cost = performance.now() - start;
-                const hasWork = addedLinks.length > 0 || addedPlaylistItems.length > 0 || shouldRefreshHeaderPopoverCards;
-                if (hasWork || cost >= 50) {
-                    Utils.logEvery('mutationBatches', 20, `mutations=${mutations.length}`, `attr=${attributeCount}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `links=${addedLinks.length}`, `playlist=${addedPlaylistItems.length}`, `headerPopover=${shouldRefreshHeaderPopoverCards}`, `cost=${cost.toFixed(1)}ms`);
+                if (shouldRefreshRoots || shouldRefreshHeaderPopoverCards || cost >= 50) {
+                    Utils.logEvery('rootMutationBatches', 50, `mode=${this.pageMode}`, `mutations=${mutations.length}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `refreshRoots=${shouldRefreshRoots}`, `headerPopover=${shouldRefreshHeaderPopoverCards}`, `cost=${cost.toFixed(1)}ms`);
                 }
-                Utils.logSlow('DOMWatcher MutationObserver batch', start, `mutations=${mutations.length} attr=${attributeCount} child=${childListCount} links=${addedLinks.length} playlist=${addedPlaylistItems.length}`, 50);
+                Utils.logSlow('DOMWatcher root MutationObserver batch', start, `mutations=${mutations.length} child=${childListCount}`, 50);
             });
-            this.mutationObserver.observe(document.body, {
+            this.rootObserver.observe(document.body, {
                 childList: true,
                 subtree: true
             });
-            Utils.log('DOMWatcher MutationObserver initialized: childList only');
+            Utils.log('DOMWatcher root MutationObserver initialized: root discovery only');
+            this.refreshObserverRoots();
+        }
+
+        getObserverRoots() {
+            const selector = this.pageMode === 'video' ? VIDEO_OBSERVER_ROOT_SELECTOR : LIST_OBSERVER_ROOT_SELECTOR;
+            const roots = new Set();
+            document.querySelectorAll(selector).forEach(root => roots.add(root));
+            document.querySelectorAll(HEADER_POPOVER_SELECTOR).forEach(root => roots.add(root));
+            if (this.pageMode !== 'video' && roots.size === 0 && document.body) {
+                roots.add(document.body);
+            }
+            return Array.from(roots).filter(root => {
+                if (!root || !document.contains(root)) return false;
+                if (root.matches?.('[class*="bvh-"]') || root.closest?.('[class*="bvh-"]')) return false;
+                if (this.pageMode === 'video' && root === document.body) return false;
+                if (this.isSkippedHeaderNode(root)) return false;
+                return true;
+            });
+        }
+
+        disconnectContentObservers() {
+            this.contentObservers.forEach(observer => observer.disconnect());
+            this.contentObservers.clear();
+        }
+
+        refreshObserverRoots() {
+            const start = performance.now();
+            let removed = 0;
+            this.contentObservers.forEach((observer, root) => {
+                if (!document.contains(root) || (this.pageMode === 'video' && root === document.body)) {
+                    observer.disconnect();
+                    this.contentObservers.delete(root);
+                    removed++;
+                }
+            });
+
+            let added = 0;
+            this.getObserverRoots().forEach(root => {
+                if (this.observeContentRoot(root)) added++;
+            });
+            Utils.log('DOMWatcher.refreshObserverRoots', `mode=${this.pageMode}`, `roots=${this.contentObservers.size}`, `added=${added}`, `removed=${removed}`, `cost=${(performance.now() - start).toFixed(1)}ms`);
+            Utils.logSlow('DOMWatcher.refreshObserverRoots', start, `mode=${this.pageMode} roots=${this.contentObservers.size}`, 50);
+        }
+
+        observeContentRoot(root) {
+            if (!root || this.contentObservers.has(root)) return false;
+            if (this.pageMode === 'video' && root === document.body) return false;
+            if (this.isSkippedHeaderNode(root)) return false;
+
+            for (const existingRoot of this.contentObservers.keys()) {
+                if (existingRoot !== root && existingRoot.contains(root) && !this.isHeaderPopoverNode(root)) {
+                    return false;
+                }
+            }
+
+            const observer = new MutationObserver(mutations => this.handleContentMutations(mutations, root));
+            observer.observe(root, { childList: true, subtree: true });
+            this.contentObservers.set(root, observer);
+            this.rescanContentRoot(root, 'observe root');
+            return true;
+        }
+
+        handleContentMutations(mutations, root) {
+            const start = performance.now();
+            const links = new Set();
+            const playlistItems = new Set();
+            let shouldRefreshHeaderPopoverCards = false;
+            let childListCount = 0;
+            let addedNodeCount = 0;
+            let limited = false;
+
+            mutations.forEach(m => {
+                if (limited || m.type !== 'childList') return;
+                childListCount++;
+                m.addedNodes.forEach(node => {
+                    if (limited) return;
+                    addedNodeCount++;
+                    if (node.nodeType !== Node.ELEMENT_NODE) return;
+                    const result = this.collectWorkFromNode(node, links, playlistItems);
+                    if (result.headerPopover) shouldRefreshHeaderPopoverCards = true;
+                    if (links.size + playlistItems.size >= DOM_MUTATION_WORK_LIMIT) {
+                        limited = true;
+                    }
+                });
+            });
+
+            if (limited) {
+                Utils.warn('DOMWatcher content mutation limited, schedule rescan', `mode=${this.pageMode}`, `root=${Utils.describeElement(root)}`, `links=${links.size}`, `playlist=${playlistItems.size}`);
+                this.requestContentRescan(root, 'mutation limit');
+            } else {
+                this.enqueueLinks(links);
+                this.enqueuePlaylistItems(playlistItems);
+            }
+            if (playlistItems.size > 0) this.schedulePlaylistRefresh();
+            if (shouldRefreshHeaderPopoverCards) this.scheduleHeaderPopoverRefresh();
+
+            const cost = performance.now() - start;
+            const hasWork = links.size > 0 || playlistItems.size > 0 || shouldRefreshHeaderPopoverCards || limited;
+            if (hasWork || cost >= 50) {
+                Utils.logEvery('mutationBatches', 20, `mode=${this.pageMode}`, `mutations=${mutations.length}`, `child=${childListCount}`, `nodes=${addedNodeCount}`, `links=${links.size}`, `playlist=${playlistItems.size}`, `limited=${limited}`, `headerPopover=${shouldRefreshHeaderPopoverCards}`, `cost=${cost.toFixed(1)}ms`);
+            }
+            Utils.logSlow('DOMWatcher content MutationObserver batch', start, `mode=${this.pageMode} child=${childListCount} links=${links.size} playlist=${playlistItems.size} limited=${limited}`, 50);
+        }
+
+        collectWorkFromNode(node, links, playlistItems) {
+            if (node.matches?.('[class*="bvh-"]') || node.closest?.('[class*="bvh-"]')) {
+                return { headerPopover: false };
+            }
+            if (this.isSkippedHeaderNode(node)) {
+                return { headerPopover: false };
+            }
+
+            const selfIsRelevantLink = node.matches?.(VIDEO_LINK_SELECTOR);
+            const selfIsPlaylistItem = node.matches?.(PLAYLIST_ITEM_SELECTOR);
+            const selfIsHeaderPopover = node.matches?.(HEADER_POPOVER_SELECTOR);
+            const selfIsHeaderPopoverCard = node.matches?.(HEADER_POPOVER_VIDEO_LINK_SELECTOR);
+            const hasRelevantChild = node.querySelector?.(MUTATION_RELEVANT_SELECTOR);
+            if (!selfIsRelevantLink && !selfIsPlaylistItem && !selfIsHeaderPopover && !selfIsHeaderPopoverCard && !hasRelevantChild) {
+                return { headerPopover: false };
+            }
+
+            if (selfIsRelevantLink && node.href) {
+                links.add(node);
+            }
+            if (node.querySelectorAll) {
+                node.querySelectorAll(VIDEO_LINK_SELECTOR).forEach(link => links.add(link));
+                node.querySelectorAll(PLAYLIST_ITEM_SELECTOR).forEach(item => playlistItems.add(item));
+            }
+            if (selfIsPlaylistItem) {
+                playlistItems.add(node);
+            }
+
+            const headerPopover = !!(selfIsHeaderPopover || selfIsHeaderPopoverCard || node.querySelector?.(HEADER_POPOVER_SELECTOR) || node.querySelector?.(HEADER_POPOVER_VIDEO_LINK_SELECTOR));
+            return { headerPopover };
+        }
+
+        rescanContentRoot(root, reason = 'manual') {
+            if (!root || !document.contains(root)) return;
+            if (this.pageMode === 'video' && root === document.body) return;
+            const start = performance.now();
+            const links = new Set();
+            const playlistItems = new Set();
+            this.collectExistingFromRoot(root, links, playlistItems);
+            this.enqueueLinks(links);
+            this.enqueuePlaylistItems(playlistItems);
+            Utils.log('DOMWatcher.rescanContentRoot', `mode=${this.pageMode}`, `reason=${reason}`, `root=${Utils.describeElement(root)}`, `links=${links.size}`, `playlist=${playlistItems.size}`, `cost=${(performance.now() - start).toFixed(1)}ms`);
+            Utils.logSlow('DOMWatcher.rescanContentRoot', start, `mode=${this.pageMode} root=${Utils.describeElement(root)} links=${links.size} playlist=${playlistItems.size}`, 50);
+        }
+
+        requestContentRescan(root, reason = 'queued') {
+            if (!root || !document.contains(root)) return;
+            this.pendingRescanRoots.set(root, reason);
+            this.scheduleFullRescan();
+        }
+
+        flushRescanRoots() {
+            const roots = Array.from(this.pendingRescanRoots.entries());
+            this.pendingRescanRoots.clear();
+            roots.forEach(([root, reason]) => this.rescanContentRoot(root, reason));
+            if (roots.length > 0) {
+                Utils.log('DOMWatcher.flushRescanRoots', `count=${roots.length}`);
+            }
+        }
+
+        collectExistingFromRoot(root, links, playlistItems) {
+            if (!root || this.isSkippedHeaderNode(root)) return;
+            if (root.matches?.(VIDEO_LINK_SELECTOR) && root.href) links.add(root);
+            if (root.querySelectorAll) root.querySelectorAll(VIDEO_LINK_SELECTOR).forEach(link => links.add(link));
+            if (root.matches?.(PLAYLIST_ITEM_SELECTOR)) playlistItems.add(root);
+            if (root.querySelectorAll) root.querySelectorAll(PLAYLIST_ITEM_SELECTOR).forEach(item => playlistItems.add(item));
+        }
+
+        enqueueElement(el) {
+            if (!el) return;
+            if (el.matches?.(PLAYLIST_ITEM_SELECTOR)) {
+                this.enqueuePlaylistItems([el]);
+            } else {
+                this.enqueueLinks([el]);
+            }
+        }
+
+        enqueueLinks(links) {
+            links.forEach(link => {
+                if (!link || !document.contains(link)) return;
+                this.observeLink(link);
+                this.pendingLinks.add(link);
+            });
+            this.scheduleQueueFlush();
+        }
+
+        enqueuePlaylistItems(items) {
+            items.forEach(item => {
+                if (!item || !document.contains(item)) return;
+                this.observePlaylistItem(item);
+                this.pendingPlaylistItems.add(item);
+            });
+            this.scheduleQueueFlush();
+        }
+
+        scheduleQueueFlush() {
+            if (this.flushScheduled || (this.pendingLinks.size === 0 && this.pendingPlaylistItems.size === 0)) return;
+            this.flushScheduled = true;
+            const run = (deadline) => this.flushQueues(deadline);
+            if (typeof requestIdleCallback === 'function') {
+                requestIdleCallback(run, { timeout: DOM_IDLE_TIMEOUT });
+            } else {
+                setTimeout(() => run(null), 0);
+            }
+        }
+
+        flushQueues(deadline) {
+            this.flushScheduled = false;
+            const start = performance.now();
+            let links = 0;
+            let playlist = 0;
+            let processedTotal = 0;
+            const hasBudget = () => {
+                if (processedTotal === 0) return true;
+                if (performance.now() - start >= DOM_PROCESS_TIME_BUDGET) return false;
+                if (deadline && typeof deadline.timeRemaining === 'function') return deadline.timeRemaining() > 3;
+                return true;
+            };
+            const take = (set) => {
+                const next = set.values().next().value;
+                set.delete(next);
+                return next;
+            };
+
+            while (this.pendingPlaylistItems.size > 0 && playlist < DOM_PLAYLIST_BATCH_SIZE && hasBudget()) {
+                const item = take(this.pendingPlaylistItems);
+                if (item && document.contains(item)) this.processPlaylistItem(item);
+                playlist++;
+                processedTotal++;
+            }
+            while (this.pendingLinks.size > 0 && links < DOM_LINK_BATCH_SIZE && hasBudget()) {
+                const link = take(this.pendingLinks);
+                if (link && document.contains(link)) this.processLink(link);
+                links++;
+                processedTotal++;
+            }
+
+            if (links > 0 || playlist > 0) {
+                Utils.logEvery('domProcessBatches', 20, `mode=${this.pageMode}`, `links=${links}`, `playlist=${playlist}`, `pendingLinks=${this.pendingLinks.size}`, `pendingPlaylist=${this.pendingPlaylistItems.size}`, `cost=${(performance.now() - start).toFixed(1)}ms`);
+            }
+            if (this.pendingLinks.size > 0 || this.pendingPlaylistItems.size > 0) {
+                this.scheduleQueueFlush();
+            }
         }
 
         observeLink(el) {
@@ -1951,16 +2216,15 @@
 
         scanExistingLinks() {
             const done = Utils.debugTime('DOMWatcher.scanExistingLinks');
-            const links = document.querySelectorAll('a[href]');
-            links.forEach(link => this.observeLink(link));
-            // 合集播放列表项
-            const playlistItems = document.querySelectorAll(PLAYLIST_ITEM_SELECTOR);
-            playlistItems.forEach(item => {
-                this.observePlaylistItem(item);
-                this.processPlaylistItem(item);
-            });
+            this.refreshObserverRoots();
+            const links = new Set();
+            const playlistItems = new Set();
+            const roots = Array.from(this.contentObservers.keys());
+            roots.forEach(root => this.collectExistingFromRoot(root, links, playlistItems));
+            this.enqueueLinks(links);
+            this.enqueuePlaylistItems(playlistItems);
             this.refreshHeaderPopoverCards();
-            done(`links=${links.length} playlist=${playlistItems.length} visible=${this.visibleElements.size}`);
+            done(`mode=${this.pageMode} roots=${this.contentObservers.size} links=${links.size} playlist=${playlistItems.size} visible=${this.visibleElements.size}`);
         }
 
         // 强制刷新所有播放列表项标签（绕过 processedLinks 检查）
@@ -1971,10 +2235,10 @@
             items.forEach(item => {
                 // 确保新节点也被纳入观察
                 this.observePlaylistItem(item);
-                // 直接重新处理，不依赖 IntersectionObserver 回调
-                this.processPlaylistItem(item);
+                this.pendingPlaylistItems.add(item);
                 processed++;
             });
+            this.scheduleQueueFlush();
             done(`items=${items.length} processed=${processed}`);
         }
 
@@ -1986,10 +2250,11 @@
             cards.forEach(card => {
                 if (card.href) {
                     this.observeLink(card);
-                    this.processLink(card);
+                    this.pendingLinks.add(card);
                     processed++;
                 }
             });
+            this.scheduleQueueFlush();
             done(`cards=${cards.length} processed=${processed}`);
         }
 
@@ -2151,6 +2416,14 @@
             return UIComponent.createTag(tagText, tagTitle, `bvh-tag ${this.getRecordTagColorClass(record)} bvh-action-list-cover-tag`);
         }
 
+        getRelatedKeysCached(bvBase) {
+            if (!bvBase) return [];
+            if (!this.relatedKeysCache.has(bvBase)) {
+                this.relatedKeysCache.set(bvBase, StorageManager.getRelatedKeys(bvBase, { loadAll: true }));
+            }
+            return this.relatedKeysCache.get(bvBase) || [];
+        }
+
         processPlaylistItem(el) {
             const start = performance.now();
             const item = this.getPlaylistItemInfo(el);
@@ -2229,13 +2502,13 @@
             const shouldFindRelated = isHistoryCard || /\?p=[0-9]+/.test(bv) || el.closest('.action-list-item-wrap, .video-pod, .playlist-container, .list-box');
 
             if (!record) {
-                const relatedKeys = shouldFindRelated ? StorageManager.getRelatedKeys(bvBase, { loadAll: true }) : [];
+                const relatedKeys = shouldFindRelated ? this.getRelatedKeysCached(bvBase) : [];
                 if (relatedKeys.length > 0) {
                     record = StorageManager.getRecord(relatedKeys[0]);
                     multiRecords = relatedKeys;
                 }
             } else {
-                multiRecords = StorageManager.getRelatedKeys(bvBase, { loadAll: true });
+                multiRecords = this.getRelatedKeysCached(bvBase);
             }
 
             if (!record) {
@@ -2636,6 +2909,9 @@
                         const done = Utils.debugTime('AppController.locationchange delayed refresh');
                         this.checkAndInitVideoPage();
                         UIComponent.showQuickEntry();
+                        if (this.domWatcher) {
+                            this.domWatcher.refreshForRoute();
+                        }
                         // 合集/分 P 切换视频时强制刷新播放列表标签
                         if (this.domWatcher && (/\/list\//.test(location.href) || document.querySelector(PLAYLIST_ITEM_SELECTOR))) {
                             this.domWatcher.refreshPlaylistItems();
