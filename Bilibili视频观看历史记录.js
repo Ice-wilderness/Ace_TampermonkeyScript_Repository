@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.2.0
+// @version      3.2.2
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -23,7 +23,8 @@
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @grant        GM_info
-// @run-at       document-idle
+// @grant        unsafeWindow
+// @run-at       document-start
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/574216/Bilibili%E8%A7%86%E9%A2%91%E8%A7%82%E7%9C%8B%E5%8E%86%E5%8F%B2%E8%AE%B0%E5%BD%95.user.js
 // @updateURL https://update.greasyfork.org/scripts/574216/Bilibili%E8%A7%86%E9%A2%91%E8%A7%82%E7%9C%8B%E5%8E%86%E5%8F%B2%E8%AE%B0%E5%BD%95.meta.js
@@ -173,7 +174,11 @@
     };
 
     // --- 样式注入 ---
-    GM_addStyle(`
+    let stylesInjected = false;
+    const injectStyles = () => {
+        if (stylesInjected) return;
+        try {
+            GM_addStyle(`
         .bvh-tag { position: absolute; margin: .5em!important; padding: 0 5px!important; height: 20px; line-height: 20px; border-radius: 4px; color: #fff; font-style: normal; font-size: 12px; background-color: rgba(122, 134, 234, 0.7); z-index: 108; pointer-events: none; }
         .bvh-tag-visited { background-color: rgba(158, 158, 158, 0.9) !important; }
         .bvh-tag-low { background-color: rgba(255, 152, 0, 0.9) !important; }
@@ -236,34 +241,246 @@
         .bvh-stat strong { display: block; font-size: 22px; margin-top: 4px; color: #00aeec; }
         .bvh-resume { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 99998; background: #fff; color: #18191c; border: 1px solid #e3e5e7; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.2); padding: 12px; display: flex; align-items: center; gap: 10px; }
         .bvh-resume span { font-weight: 600; }
-    `);
+            `);
+            stylesInjected = true;
+        } catch (e) { }
+    };
 
     // --- 工具类 ---
     const Utils = {
         _debugCounters: {},
         _debugLogs: [],
         _debugLogLimit: 3000,
+        _debugSessionId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        _issueLogKey: 'bvh_debug_issue_logs',
+        _issueLogLimit: 800,
+        _issueFlushDelay: 500,
+        _issuePending: new Map(),
+        _issueFlushTimer: null,
+        _issuePersistedSnapshot: null,
+        _isCapturingIssue: false,
+        _isFlushingIssueLogs: false,
+        _isConsolePassthrough: false,
+        _issueHooksInstalled: false,
+        _issueLifecycleHooksInstalled: false,
+        _truncate: (value, limit = 2000) => {
+            const text = String(value ?? '');
+            return text.length > limit ? `${text.slice(0, limit)}...<truncated ${text.length - limit} chars>` : text;
+        },
+        _isErrorLike: (value) => {
+            if (!value || typeof value !== 'object') return false;
+            const tag = Object.prototype.toString.call(value);
+            return tag === '[object Error]' || tag === '[object DOMException]' || ('message' in value && 'stack' in value);
+        },
+        _errorInfo: (value) => {
+            const name = Utils._truncate(value?.name || 'Error', 120);
+            const message = Utils._truncate(value?.message || String(value), 1200);
+            const stack = Utils._truncate(value?.stack || '', 5000);
+            return { name, message, stack };
+        },
+        _domNodeSummary: (value) => {
+            if (!value || typeof value !== 'object' || typeof value.nodeType !== 'number') return '';
+            const tag = String(value.tagName || value.nodeName || 'node').toLowerCase();
+            const id = value.id ? `#${Utils._truncate(value.id, 80)}` : '';
+            const cls = typeof value.className === 'string'
+                ? `.${Utils._truncate(value.className.trim().split(/\s+/).slice(0, 3).join('.'), 120)}`
+                : '';
+            const src = value.src ? ` src=${Utils._truncate(value.src, 160)}` : '';
+            const href = value.href ? ` href=${Utils._truncate(value.href, 160)}` : '';
+            return `[DOM ${tag}${id}${cls}${src}${href}]`;
+        },
+        _toSafeDebugValue: (value, depth = 0, seen = new WeakSet()) => {
+            if (value === null || value === undefined) return value;
+            const type = typeof value;
+            if (type === 'string') return Utils._truncate(value, 2000);
+            if (type === 'number' || type === 'boolean') return value;
+            if (type === 'bigint' || type === 'symbol') return String(value);
+            if (type === 'function') return `[Function ${value.name || 'anonymous'}]`;
+            if (Utils._isErrorLike(value)) {
+                const info = Utils._errorInfo(value);
+                return { name: info.name, message: info.message, stack: info.stack };
+            }
+            const domSummary = Utils._domNodeSummary(value);
+            if (domSummary) return domSummary;
+            try {
+                if (value === window || value === Utils._getPageWindow()) return '[Window]';
+            } catch (e) { }
+            if (depth >= 3) return '[MaxDepth]';
+            if (seen.has(value)) return '[Circular]';
+            seen.add(value);
+            if (Array.isArray(value)) {
+                const items = value.slice(0, 30).map(item => Utils._toSafeDebugValue(item, depth + 1, seen));
+                if (value.length > 30) items.push(`...<${value.length - 30} more>`);
+                return items;
+            }
+            const out = {};
+            let keys = [];
+            try {
+                keys = Object.keys(value);
+            } catch (e) {
+                return '[Unreadable Object]';
+            }
+            keys.slice(0, 30).forEach(key => {
+                try {
+                    out[key] = Utils._toSafeDebugValue(value[key], depth + 1, seen);
+                } catch (e) {
+                    out[key] = '[Unreadable]';
+                }
+            });
+            if (keys.length > 30) out.__truncatedKeys = keys.length - 30;
+            return out;
+        },
         _stringifyDebugArg: (arg) => {
-            if (arg instanceof Error) return `${arg.name}: ${arg.message}\n${arg.stack || ''}`;
+            if (Utils._isErrorLike(arg)) {
+                const info = Utils._errorInfo(arg);
+                return `${info.name}: ${info.message}${info.stack ? `\n${info.stack}` : ''}`;
+            }
             if (typeof arg === 'string') return arg;
             try {
-                return JSON.stringify(arg);
+                return Utils._truncate(JSON.stringify(Utils._toSafeDebugValue(arg)), 2000);
             } catch (e) {
-                return String(arg);
+                return Utils._truncate(String(arg), 2000);
             }
         },
-        _pushDebugLog: (level, label, args) => {
+        _normalizeIssueArgs: (args) => {
+            const list = Array.isArray(args) ? args : [args];
+            let stack = '';
+            const parts = list.map(arg => {
+                if (Utils._isErrorLike(arg)) {
+                    const info = Utils._errorInfo(arg);
+                    if (!stack) stack = info.stack;
+                    return `${info.name}: ${info.message}`;
+                }
+                return Utils._stringifyDebugArg(arg);
+            });
+            return {
+                message: Utils._truncate(parts.join(' '), 2000),
+                stack: Utils._truncate(stack, 5000)
+            };
+        },
+        _issueSignature: (record) => Utils._truncate([
+            record.level || '',
+            record.source || '',
+            record.message || '',
+            record.stack || record.url || ''
+        ].join('\n'), 8000),
+        _createIssueRecord: (level, source, payload) => {
+            const at = new Date().toISOString();
+            const info = Array.isArray(payload) ? Utils._normalizeIssueArgs(payload) : payload;
+            const record = {
+                sessionId: Utils._debugSessionId,
+                lastSessionId: Utils._debugSessionId,
+                firstAt: at,
+                lastAt: at,
+                count: 1,
+                level,
+                source,
+                url: location.href,
+                message: Utils._truncate(info?.message || '', 2000),
+                stack: Utils._truncate(info?.stack || '', 5000),
+                line: Utils._truncate(info?.line || '', 4000)
+            };
+            record.signature = Utils._issueSignature(record);
+            return record;
+        },
+        _mergeIssueRecordInto: (map, incoming) => {
+            if (!incoming) return;
+            const signature = incoming.signature || Utils._issueSignature(incoming);
+            const existing = map.get(signature);
+            const next = Object.assign({}, incoming, { signature });
+            next.count = Math.max(1, parseInt(next.count, 10) || 1);
+            if (!existing) {
+                map.set(signature, next);
+                return;
+            }
+            existing.count = (parseInt(existing.count, 10) || 1) + next.count;
+            existing.firstAt = existing.firstAt && existing.firstAt < next.firstAt ? existing.firstAt : next.firstAt;
+            existing.lastAt = existing.lastAt && existing.lastAt > next.lastAt ? existing.lastAt : next.lastAt;
+            existing.lastSessionId = next.lastSessionId || next.sessionId || existing.lastSessionId;
+            existing.url = next.url || existing.url;
+            existing.message = next.message || existing.message;
+            existing.stack = next.stack || existing.stack;
+            existing.line = next.line || existing.line;
+        },
+        _mergeIssueLogs: (base, incoming) => {
+            const map = new Map();
+            (Array.isArray(base) ? base : []).forEach(item => Utils._mergeIssueRecordInto(map, item));
+            (Array.isArray(incoming) ? incoming : []).forEach(item => Utils._mergeIssueRecordInto(map, item));
+            return Array.from(map.values())
+                .sort((a, b) => new Date(a.lastAt || 0).getTime() - new Date(b.lastAt || 0).getTime())
+                .slice(-Utils._issueLogLimit);
+        },
+        _queueIssueRecord: (record) => {
+            if (!CONFIG.debug || !record) return;
+            const signature = record.signature || Utils._issueSignature(record);
+            const existing = Utils._issuePending.get(signature);
+            if (existing) {
+                existing.count += 1;
+                existing.lastAt = record.lastAt;
+                existing.lastSessionId = record.lastSessionId;
+                existing.url = record.url;
+                existing.line = record.line || existing.line;
+            } else {
+                if (Utils._issuePending.size >= Utils._issueLogLimit) {
+                    const oldestKey = Utils._issuePending.keys().next().value;
+                    if (oldestKey) Utils._issuePending.delete(oldestKey);
+                }
+                Utils._issuePending.set(signature, record);
+            }
+            Utils._scheduleIssueFlush();
+        },
+        _scheduleIssueFlush: () => {
+            if (Utils._issueFlushTimer) return;
+            Utils._issueFlushTimer = setTimeout(() => {
+                Utils._issueFlushTimer = null;
+                Utils._flushIssueLogs(false);
+            }, Utils._issueFlushDelay);
+        },
+        _flushIssueLogs: (light = false) => {
+            if (Utils._isFlushingIssueLogs || Utils._issuePending.size === 0) return false;
+            Utils._isFlushingIssueLogs = true;
+            const keys = Array.from(Utils._issuePending.keys());
+            const pending = keys.map(key => Utils._issuePending.get(key)).filter(Boolean);
+            try {
+                let latest = Utils._issuePersistedSnapshot;
+                if (!light) {
+                    latest = GM_getValue(Utils._issueLogKey, []);
+                } else if (!latest) {
+                    return false;
+                }
+                const merged = Utils._mergeIssueLogs(Array.isArray(latest) ? latest : [], pending);
+                GM_setValue(Utils._issueLogKey, merged);
+                Utils._issuePersistedSnapshot = merged;
+                keys.forEach(key => Utils._issuePending.delete(key));
+                return true;
+            } catch (e) {
+                return false;
+            } finally {
+                Utils._isFlushingIssueLogs = false;
+            }
+        },
+        _pushDebugLog: (level, label, args, options = {}) => {
             const line = `${new Date().toISOString()} ${label} ${args.map(Utils._stringifyDebugArg).join(' ')}`;
             Utils._debugLogs.push(line);
             if (Utils._debugLogs.length > Utils._debugLogLimit) {
                 Utils._debugLogs.splice(0, Utils._debugLogs.length - Utils._debugLogLimit);
+            }
+            if (!options.skipIssue && (level === 'warn' || level === 'error')) {
+                const issue = Utils._createIssueRecord(level, 'script', args);
+                issue.line = line;
+                Utils._queueIssueRecord(issue);
             }
         },
         _writeLog: (level, label, args, alwaysConsole = false) => {
             Utils._pushDebugLog(level, label, args);
             if (alwaysConsole || CONFIG.debug) {
                 const writer = console[level] || console.log;
-                writer.apply(console, [label, ...args]);
+                try {
+                    Utils._isConsolePassthrough = true;
+                    writer.apply(console, [label, ...args]);
+                } finally {
+                    Utils._isConsolePassthrough = false;
+                }
             }
         },
         log: (...args) => { if (CONFIG.debug) Utils._writeLog('log', '[BvH]', args); },
@@ -279,11 +496,11 @@
                 Utils._writeLog(level, '[BvH Perf]', [`${name}: ${cost.toFixed(1)}ms${suffix}`]);
             };
         },
-        logSlow: (name, start, extra = '', threshold = 80) => {
+        logSlow: (name, start, extra = '', threshold = 80, level = 'warn') => {
             if (!CONFIG.debug) return;
             const cost = performance.now() - start;
             if (cost >= threshold) {
-                Utils._writeLog('warn', '[BvH Slow]', [`${name}: ${cost.toFixed(1)}ms${extra ? ` ${extra}` : ''}`]);
+                Utils._writeLog(level, '[BvH Slow]', [`${name}: ${cost.toFixed(1)}ms${extra ? ` ${extra}` : ''}`]);
             }
         },
         count: (name, step = 1) => {
@@ -298,18 +515,148 @@
                 Utils._writeLog('log', '[BvH Count]', [`${name}: ${count}`, ...args]);
             }
         },
+        _captureExternalIssue: (level, source, payload) => {
+            if (!CONFIG.debug || Utils._isCapturingIssue || Utils._isFlushingIssueLogs) return;
+            Utils._isCapturingIssue = true;
+            try {
+                const issue = Utils._createIssueRecord(level, source, payload);
+                const line = issue.line || `${issue.lastAt} [BvH ${source}] ${issue.message}${issue.stack ? `\n${issue.stack}` : ''}`;
+                Utils._pushDebugLog(level, `[BvH ${source}]`, [issue.message, issue.stack].filter(Boolean), { skipIssue: true });
+                issue.line = line;
+                Utils._queueIssueRecord(issue);
+            } catch (e) {
+            } finally {
+                Utils._isCapturingIssue = false;
+            }
+        },
+        _getPageWindow: () => {
+            try {
+                return typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+            } catch (e) {
+                return window;
+            }
+        },
+        _hookConsoleMethod: (consoleObj, level) => {
+            try {
+                if (!consoleObj || typeof consoleObj[level] !== 'function' || consoleObj[level].__bvhIssueHooked) return;
+                const original = consoleObj[level];
+                const hooked = function (...args) {
+                    try {
+                        if (!Utils._isConsolePassthrough) {
+                            const info = Utils._normalizeIssueArgs(args);
+                            Utils._captureExternalIssue(level, `console.${level}`, info);
+                        }
+                    } catch (e) { }
+                    return original.apply(this, args);
+                };
+                Object.defineProperty(hooked, '__bvhIssueHooked', { value: true });
+                consoleObj[level] = hooked;
+            } catch (e) { }
+        },
+        _hookConsoleIssues: () => {
+            const targets = [];
+            const pageWindow = Utils._getPageWindow();
+            try {
+                if (pageWindow?.console) targets.push(pageWindow.console);
+            } catch (e) { }
+            try {
+                if (window.console && !targets.includes(window.console)) targets.push(window.console);
+            } catch (e) { }
+            targets.forEach(consoleObj => {
+                Utils._hookConsoleMethod(consoleObj, 'warn');
+                Utils._hookConsoleMethod(consoleObj, 'error');
+            });
+        },
+        _hookWindowIssues: () => {
+            const bind = (targetWindow) => {
+                try {
+                    if (!targetWindow?.addEventListener) return false;
+                    targetWindow.addEventListener('error', (event) => {
+                        try {
+                            const locationText = event.filename ? ` @ ${event.filename}:${event.lineno || 0}:${event.colno || 0}` : '';
+                            const errorInfo = Utils._isErrorLike(event.error) ? Utils._errorInfo(event.error) : null;
+                            Utils._captureExternalIssue('error', 'window.error', {
+                                message: Utils._truncate(`${event.message || errorInfo?.message || 'window error'}${locationText}`, 2000),
+                                stack: errorInfo?.stack || ''
+                            });
+                        } catch (e) { }
+                    }, true);
+                    targetWindow.addEventListener('unhandledrejection', (event) => {
+                        try {
+                            const info = Utils._normalizeIssueArgs([event.reason]);
+                            Utils._captureExternalIssue('error', 'unhandledrejection', info);
+                        } catch (e) { }
+                    }, true);
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            };
+            if (!bind(Utils._getPageWindow())) {
+                bind(window);
+            }
+        },
+        installIssueLifecycleHooks: () => {
+            if (Utils._issueLifecycleHooksInstalled) return;
+            Utils._issueLifecycleHooksInstalled = true;
+            const lightFlush = () => Utils._flushIssueLogs(true);
+            try { window.addEventListener('pagehide', lightFlush, { capture: true }); } catch (e) { }
+            try { window.addEventListener('beforeunload', lightFlush, { capture: true }); } catch (e) { }
+            try {
+                document.addEventListener('visibilitychange', () => {
+                    if (document.visibilityState === 'hidden') lightFlush();
+                }, { capture: true });
+            } catch (e) { }
+        },
+        installIssueHooks: () => {
+            if (Utils._issueHooksInstalled || !CONFIG.debug) return;
+            Utils._issueHooksInstalled = true;
+            Utils.installIssueLifecycleHooks();
+            Utils._hookWindowIssues();
+            Utils._hookConsoleIssues();
+        },
+        _getHistoricalIssueLogs: () => {
+            Utils._flushIssueLogs(false);
+            try {
+                const logs = GM_getValue(Utils._issueLogKey, []);
+                Utils._issuePersistedSnapshot = Array.isArray(logs) ? logs : [];
+                return Utils._issuePersistedSnapshot.filter(item => item?.lastSessionId !== Utils._debugSessionId);
+            } catch (e) {
+                return [];
+            }
+        },
+        _formatIssueLogRecord: (item) => {
+            const count = parseInt(item.count, 10) || 1;
+            const header = `${item.lastAt || item.firstAt || ''} [${String(item.level || '').toUpperCase()}] ${item.source || 'unknown'}${count > 1 ? ` x${count}` : ''} ${item.url || ''}`.trim();
+            const body = [item.message, item.stack].filter(Boolean).join('\n');
+            return `${header}${body ? `\n${body}` : ''}`;
+        },
+        clearDebugLogs: () => {
+            Utils._debugLogs = [];
+            Utils._debugCounters = {};
+            Utils._issuePending.clear();
+            if (Utils._issueFlushTimer) {
+                clearTimeout(Utils._issueFlushTimer);
+                Utils._issueFlushTimer = null;
+            }
+            Utils._issuePersistedSnapshot = [];
+            try { GM_deleteValue(Utils._issueLogKey); } catch (e) { }
+        },
         downloadDebugLog: () => {
+            const historicalIssues = Utils._getHistoricalIssueLogs();
             const version = typeof GM_info !== 'undefined' ? (GM_info.script?.version || 'unknown') : 'unknown';
             const lines = [
                 '# Bilibili视频观看历史记录 调试日志',
                 `导出时间: ${Utils.formatTime()}`,
                 `脚本版本: ${version}`,
+                `日志会话: ${Utils._debugSessionId}`,
                 `页面地址: ${location.href}`,
                 `UserAgent: ${navigator.userAgent}`,
                 `调试开关: ${CONFIG.debug}`,
                 `页面状态: ${document.readyState}`,
                 `可见状态: ${document.visibilityState}`,
-                `日志条数: ${Utils._debugLogs.length}/${Utils._debugLogLimit}`,
+                `当前页面日志条数: ${Utils._debugLogs.length}/${Utils._debugLogLimit}`,
+                `历史异常日志条数: ${historicalIssues.length}/${Utils._issueLogLimit}`,
                 '',
                 '# 当前配置',
                 JSON.stringify(CONFIG, null, 2),
@@ -327,8 +674,11 @@
                         allKeysCacheSize: StorageManager._allKeysCache?.length || 0
                     }, null, 2),
                 '',
-                '# 最近日志',
-                ...Utils._debugLogs
+                '# 当前页面日志',
+                ...Utils._debugLogs,
+                '',
+                '# 历史 warning/error 日志',
+                ...(historicalIssues.length ? historicalIssues.map(Utils._formatIssueLogRecord) : ['(无历史 warning/error 日志)'])
             ];
             const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
             const url = URL.createObjectURL(blob);
@@ -337,7 +687,7 @@
             a.download = `bvh-debug-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`;
             a.click();
             URL.revokeObjectURL(url);
-            Utils.log('Debug log downloaded', `lines=${Utils._debugLogs.length}`);
+            Utils.log('Debug log downloaded', `current=${Utils._debugLogs.length}`, `issues=${historicalIssues.length}`);
         },
         describeElement: (el) => {
             if (!el) return '(none)';
@@ -378,6 +728,9 @@
         }
     };
 
+    Utils.installIssueLifecycleHooks();
+    if (CONFIG.debug) Utils.installIssueHooks();
+
     const DISPLAY_SETTINGS = new Set([
         'showProgressBar',
         'showVisitedTag',
@@ -391,6 +744,7 @@
         save: (patch = {}) => {
             Object.assign(CONFIG, patch);
             GM_setValue('bvh_settings', Object.assign({}, CONFIG));
+            if (patch.debug) Utils.installIssueHooks();
             const needsDomRefresh = Object.keys(patch).some(key => DISPLAY_SETTINGS.has(key));
             if (needsDomRefresh) {
                 StorageManager._notifyChange();
@@ -1356,7 +1710,7 @@
             }
 
             const targetUrl = EpisodeResolver.getSeekUrl(target.key);
-            Utils.warn('UIComponent.resumeToRecord navigate', `current=${currentKey}`, `target=${target.key}`, `url=${targetUrl}`);
+            Utils.log('UIComponent.resumeToRecord navigate', `current=${currentKey}`, `target=${target.key}`, `url=${targetUrl}`);
             sessionStorage.setItem(PENDING_SEEK_KEY, JSON.stringify({
                 key: target.key,
                 currentTime: target.record.currentTime,
@@ -1375,7 +1729,7 @@
                 return;
             }
             if (Date.now() - (pending.savedAt || 0) > 60000) {
-                Utils.warn('UIComponent.applyPendingSeek expired', pending);
+                Utils.log('UIComponent.applyPendingSeek expired', pending);
                 sessionStorage.removeItem(PENDING_SEEK_KEY);
                 return;
             }
@@ -1496,6 +1850,7 @@
                         <button class="bvh-btn primary" data-action="save-settings">保存设置</button>
                         <button class="bvh-btn" data-action="reset-settings">恢复默认设置</button>
                         <button class="bvh-btn" data-action="download-debug-log">下载调试日志</button>
+                        <button class="bvh-btn" data-action="clear-debug-log">清空调试日志</button>
                         <button class="bvh-btn" data-action="reset-panel">恢复左下角面板位置</button>
                         ${currentRecord?.currentTime ? '<button class="bvh-btn primary" data-action="jump-current">跳转当前视频进度</button>' : ''}
                     </div>`;
@@ -1714,6 +2069,10 @@
                     Utils.downloadDebugLog();
                     UIComponent.toast('调试日志已下载', 'success', 2000);
                 }
+                if (target.dataset.action === 'clear-debug-log') {
+                    Utils.clearDebugLogs();
+                    UIComponent.toast('调试日志已清空', 'success', 2000);
+                }
                 if (target.dataset.action === 'reset-panel') {
                     GM_deleteValue('bvh_panel_position');
                     const panel = document.getElementById('bvh-view-panel');
@@ -1834,7 +2193,7 @@
 
             this.bvId = getBvId();
             if (!this.bvId) {
-                Utils.warn('VideoPlayerObserver.init no bvId, start polling __INITIAL_STATE__');
+                Utils.log('VideoPlayerObserver.init no bvId, start polling __INITIAL_STATE__');
                 let retries = 0;
                 this.stateInterval = setInterval(() => {
                     this.bvId = getBvId();
@@ -2659,11 +3018,11 @@
             const isActionListItem = el.matches(ACTION_LIST_ITEM_SELECTOR);
             el.querySelectorAll(isActionListItem ? '.bvh-episode-tag, .bvh-action-list-cover-tag' : '.bvh-episode-tag').forEach(tag => tag.remove());
             if (!record) {
-                Utils.logSlow('DOMWatcher.processPlaylistItem no-record', start, `key=${item.key} el=${Utils.describeElement(el)}`, 30);
+                Utils.logSlow('DOMWatcher.processPlaylistItem no-record', start, `key=${item.key} el=${Utils.describeElement(el)}`, 30, 'log');
                 return;
             }
             if (record.status === RECORD_STATUS.VISITED && !CONFIG.showVisitedTag) {
-                Utils.logSlow('DOMWatcher.processPlaylistItem hidden-visited', start, `key=${item.key}`, 30);
+                Utils.logSlow('DOMWatcher.processPlaylistItem hidden-visited', start, `key=${item.key}`, 30, 'log');
                 return;
             }
 
@@ -2687,7 +3046,7 @@
                 } else {
                     coverTarget.insertBefore(tagEl, coverTarget.firstChild);
                 }
-                Utils.logSlow('DOMWatcher.processPlaylistItem action-list', start, `key=${item.key}`, 30);
+                Utils.logSlow('DOMWatcher.processPlaylistItem action-list', start, `key=${item.key}`, 30, 'log');
                 return;
             }
 
@@ -2702,7 +3061,7 @@
                         : (el.querySelector('.simple-base-item.normal > .title') || el.querySelector('.title') || el))
                     : (el.querySelector('.title-txt, .bpx-player-ctrl-eplist-multi-menu-item-text, .title') || el);
             target.appendChild(tagEl);
-            Utils.logSlow('DOMWatcher.processPlaylistItem', start, `key=${item.key} record=${record.status}${record.percent || ''}`, 30);
+            Utils.logSlow('DOMWatcher.processPlaylistItem', start, `key=${item.key} record=${record.status}${record.percent || ''}`, 30, 'log');
         }
 
         processLink(el) {
@@ -2742,13 +3101,13 @@
                     this.removeExistingMark(el);
                 }
                 el._bvhLastVideoKey = bv;
-                Utils.logSlow('DOMWatcher.processLink no-record', start, `key=${bv} el=${Utils.describeElement(el)}`, 30);
+                Utils.logSlow('DOMWatcher.processLink no-record', start, `key=${bv} el=${Utils.describeElement(el)}`, 30, 'log');
                 return;
             }
             if (record.status === RECORD_STATUS.VISITED && !CONFIG.showVisitedTag) {
                 this.removeExistingMark(el);
                 el._bvhLastVideoKey = bv;
-                Utils.logSlow('DOMWatcher.processLink hidden-visited', start, `key=${bv}`, 30);
+                Utils.logSlow('DOMWatcher.processLink hidden-visited', start, `key=${bv}`, 30, 'log');
                 return;
             }
 
@@ -2773,7 +3132,7 @@
             const existingBars = el.querySelectorAll('.bvh-progress-bar');
             if (existingTags.length > 0 || existingBars.length > 0) {
                 if (existingTags.length === 1 && existingBars.length <= 1 && isSameVideoKey && existingTags[0].innerText === tagText) {
-                    Utils.logSlow('DOMWatcher.processLink unchanged', start, `key=${bv}`, 30);
+                    Utils.logSlow('DOMWatcher.processLink unchanged', start, `key=${bv}`, 30, 'log');
                     return;
                 }
                 this.removeExistingMark(el);
@@ -2812,7 +3171,7 @@
 
             // 确保标签不会注入到头像图片上
             if (img.closest('.bili-avatar, .header-dynamic-avatar')) {
-                Utils.logSlow('DOMWatcher.processLink skip avatar image', start, `key=${bv}`, 30);
+                Utils.logSlow('DOMWatcher.processLink skip avatar image', start, `key=${bv}`, 30, 'log');
                 return;
             }
 
@@ -2853,7 +3212,7 @@
                     markParent.insertBefore(barEl, markBeforeNode);
                 }
             }
-            Utils.logSlow('DOMWatcher.processLink', start, `key=${bv} record=${record.status}${record.percent || ''} multi=${isMulti} el=${Utils.describeElement(el)}`, 30);
+            Utils.logSlow('DOMWatcher.processLink', start, `key=${bv} record=${record.status}${record.percent || ''} multi=${isMulti} el=${Utils.describeElement(el)}`, 30, 'log');
         }
     }
 
@@ -2871,6 +3230,7 @@
             const done = Utils.debugTime('AppController.start');
             const currentVersion = typeof GM_info !== 'undefined' ? (GM_info.script?.version || 'unknown') : 'unknown';
             Utils.log(`Script started v${currentVersion}`, `url=${location.href}`, `readyState=${document.readyState}`, `debug=${CONFIG.debug}`);
+            injectStyles();
 
             // 数据迁移（v1/v2 → v3 分片，仅首次执行）
             StorageManager.migrateIfNeeded();
