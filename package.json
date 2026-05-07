@@ -5,6 +5,8 @@
     "dev:bilibili": "node tools/userscript/print-tampermonkey-loader.cjs",
     "install:playwright-browsers": "PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 playwright install chromium",
     "install:playwright-deps": "PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 playwright install-deps chromium",
+    "setup:bilibili-real-profile": "node tools/userscript/setup-bilibili-real-profile.cjs",
+    "debug:bilibili:real": "node tools/userscript/debug-bilibili-real.cjs",
     "debug:bilibili": "node tools/userscript/debug-bilibili.cjs",
     "setup:bilibili-profile": "node tools/userscript/setup-bilibili-profile.cjs",
     "capture:bilibili": "node tools/userscript/capture-bilibili.cjs",
@@ -17,5 +19,8 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1"
+  },
+  "dependencies": {
+    "chrome": "^0.1.0"
   }
 }

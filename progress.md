@@ -162,6 +162,66 @@
   - `findings.md` (updated)
   - `progress.md` (updated)
 
+### Phase 10: Real Environment First Plan
+
+- **Status:** complete
+- Actions taken:
+  - 用户明确担心继续模拟油猴扩展会浪费时间在测试环境差异上。
+  - 重读 `task_plan.md`、`findings.md`、`progress.md` 和 `planning-with-files` skill。
+  - 将后续方向调整为真实环境优先：真实浏览器、真实脚本管理器、真实本地 loader。
+  - 明确 runner 后续只作为 fixture、快速回归和辅助诊断工具，不再作为最终真相源。
+  - 在 `task_plan.md` 写入后续执行计划。
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 11: Real Userscript Manager Debug Lane
+
+- **Status:** complete
+- Actions taken:
+  - 收到用户“开始执行”指令。
+  - 运行 planning-with-files session catchup，确认上一轮 Phase 10 计划更新仍是未提交工作区改动。
+  - 读取 `task_plan.md`、`findings.md`、`progress.md`、`package.json`、现有 debug/capture/snapshot 工具和自动化文档。
+  - 决定新增独立真实环境入口，不复用自建 runner 的 profile。
+  - 新增 `tools/userscript/debug-bilibili-real.cjs`，启动 `.browser-profiles/bilibili-real/`，不调用 runner 注入逻辑。
+  - 调整 `tools/userscript/snapshot.cjs`，支持真实环境跳过 Playwright GM shim 状态采集。
+  - 新增 package script `debug:bilibili:real`。
+  - 更新 README 和 `docs/userscript-automation.md`，把真实脚本管理器入口列为首选流程，并把旧 runner 入口标为辅助。
+  - 运行 CJS 语法检查、loader 输出检查、package.json JSON 解析检查、真实入口 headless 启动检查、真实入口 snapshot 检查、capture 兼容检查和 fixture 回归。
+- Files created/modified:
+  - `tools/userscript/debug-bilibili-real.cjs` (created)
+  - `tools/userscript/snapshot.cjs` (updated)
+  - `package.json` (updated)
+  - `README.md` (updated)
+  - `docs/userscript-automation.md` (updated)
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 12: Real Extension Install Workflow
+
+- **Status:** complete
+- Actions taken:
+  - 用户反馈 `debug:bilibili:real` 中 Chrome Web Store 安装 Tampermonkey 仍失败，截图显示 `Installation is not enabled`。
+  - 检查 Playwright 本地源码，确认默认 Chromium 启动参数包含 `--disable-extensions`，且自动化浏览器会带 `--enable-automation`。
+  - 决定拆分真实流程：扩展安装用非 Playwright 控制的普通 Chrome setup 命令；真实调试入口继续用 Playwright，但忽略 `--disable-extensions`。
+  - 新增 `setup:bilibili-real-profile`，用系统 Chrome 普通启动 `.browser-profiles/bilibili-real/`，默认打开 Tampermonkey Chrome Web Store 页面。
+  - 修改 `debug:bilibili:real`，通过 `ignoreDefaultArgs: ['--disable-extensions']` 保持真实扩展启用。
+  - 更新 README 和自动化文档，明确安装扩展不要在 Playwright 控制的窗口里做。
+  - 运行新增脚本和全部 userscript 工具的 CJS 语法检查。
+  - 确认 WSL 中存在 `/usr/bin/google-chrome-stable` 和 `/usr/bin/google-chrome`。
+  - 注意到工作区已有 `chrome` npm 依赖和 `package-lock.json` 变化；该依赖不是本轮工具需要的，未擅自移除。
+- Files created/modified:
+  - `tools/userscript/setup-bilibili-real-profile.cjs` (created)
+  - `tools/userscript/debug-bilibili-real.cjs` (updated)
+  - `package.json` (updated scripts; existing unrelated dependency left untouched)
+  - `README.md` (updated)
+  - `docs/userscript-automation.md` (updated)
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
 ## Test Results
 
 | Test | Input | Expected | Actual | Status |
@@ -193,6 +253,21 @@
 | capture after snapshot refactor | HEADLESS=1 CAPTURE_WAIT_MS=1000 npm run capture:bilibili -- https://www.bilibili.com/ | Capture files saved with summary mode capture | Passed | pass |
 | debug snapshot workflow | HEADLESS=1 piped Enter into npm run debug:bilibili -- https://www.bilibili.com/ | Debug session files saved with summary mode debug | Passed | pass |
 | GM same-origin sync fixture | npm run test:fixture:bilibili | Includes cross-page GM revision refresh and tag update | 4 passed | pass |
+| real environment first planning | planning files update | Record next plan without changing runtime code | Plan recorded | pass |
+| real debug script syntax | node --check tools/userscript/debug-bilibili-real.cjs | New real debug script parses | Passed | pass |
+| all userscript tool syntax | node --check tools/userscript/*.cjs | All tool scripts parse | Passed | pass |
+| package json parse | JSON.parse package.json | package.json remains valid JSON | Passed | pass |
+| loader generation after real lane | npm run dev:bilibili | Loader still points to scripts/Bilibili...js | Passed | pass |
+| real debug command smoke | DEBUG_SAVE_SNAPSHOT=0 HEADLESS=1 npm run debug:bilibili:real -- https://www.bilibili.com/ | Opens real profile without runner injection and exits after Enter | Passed | pass |
+| real debug snapshot | HEADLESS=1 npm run debug:bilibili:real -- https://www.bilibili.com/ | Saves real-debug artifact with no GM shim state collection | Saved `artifacts/real-debug-sessions/2026-05-07T16-09-43-743Z/` with `gmStore: null` and `real-environment.json` | pass |
+| capture after snapshot option | HEADLESS=1 CAPTURE_WAIT_MS=1000 npm run capture:bilibili -- https://www.bilibili.com/ | Existing capture flow still saves GM shim state | Saved `artifacts/captures/2026-05-07T16-10-11-078Z/`; page errors empty | pass |
+| fixture after real lane | npm run test:fixture:bilibili | Existing 4 fixture tests pass | 4 passed | pass |
+| final fixture after snapshot option | npm run test:fixture:bilibili | Existing 4 fixture tests pass after final snapshot helper change | 4 passed | pass |
+| real setup script syntax | node --check tools/userscript/setup-bilibili-real-profile.cjs | New setup script parses | Passed | pass |
+| real debug script syntax after extension enable | node --check tools/userscript/debug-bilibili-real.cjs | Real debug script parses after `ignoreDefaultArgs` change | Passed | pass |
+| all userscript tool syntax after setup command | node --check tools/userscript/*.cjs | All tool scripts parse | Passed | pass |
+| package json parse after setup command | JSON.parse package.json | package.json remains valid JSON | Passed | pass |
+| Chrome executable discovery | which google-chrome-stable google-chrome chromium chromium-browser | WSL Chrome executable should exist | Found `/usr/bin/google-chrome-stable` and `/usr/bin/google-chrome` | pass |
 
 ## Error Log
 
@@ -209,8 +284,8 @@
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 9 complete; same-origin GM storage sync parity is fixed and covered by fixture. |
-| Where am I going? | User can retest tag refresh in debug environment; cross-subdomain sync remains a known runner limitation. |
+| Where am I? | Phase 12 complete; real extension installation is split into a normal Chrome setup command, and Playwright debug now keeps extensions enabled. |
+| Where am I going? | User should run `npm run setup:bilibili-real-profile` to install Tampermonkey/loader, close Chrome, then run `PLAYWRIGHT_CHROMIUM_CHANNEL=chrome npm run debug:bilibili:real -- <url>` for real-environment artifacts. |
 | What's the goal? | 为油猴脚本库建立真实网页测试和诊断体系，先覆盖 `scripts/Bilibili视频观看历史记录.js`。 |
 | What have I learned? | See `findings.md`. |
 | What have I done? | Created planning files, added the Playwright/userscript test infrastructure, ran static checks, and documented browser dependency blocker. |

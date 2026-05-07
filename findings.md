@@ -62,6 +62,29 @@
 | 首版 fixture 使用可加载真实脚本的 HTML 页面 | 不拆分生产脚本源码，降低对现有单文件结构的侵入。 |
 | package-lock 正常入库 | 测试工程依赖需要可复现安装，`package-lock.json` 不应被 `.gitignore` 忽略。 |
 | 根目录脚本迁移到 `scripts/` | 保留多脚本独立维护方式，同时让根目录只承载文档、配置、测试和 planning 文件。 |
+| 后续以真实用户脚本管理器为主验证环境 | 用户明确需要完全贴近真实使用；模拟层越厚，越可能产生工具差异导致的无意义修复。 |
+| 自建 runner 只保留为辅助回归工具 | 它适合 fixture 和快速定位，但不再承担“证明真实环境正确”的职责。 |
+
+## Real Environment Pivot
+
+- 当前 `debug:bilibili` / `capture:bilibili` 会通过 Playwright runner 注入脚本和 GM shim，本质上是在模拟油猴扩展。
+- 真实使用环境无法靠 shim 100% 复刻，因为脚本管理器的注入时机、沙盒隔离、跨域 GM 存储、菜单、权限和扩展实现细节都可能与页面 JS 模拟不同。
+- 后续主线应改为：Playwright 只负责打开浏览器、保留 profile、采集截图/HTML/console/trace；用户脚本由真实 Tampermonkey/Violentmonkey 执行。
+- 真实环境入口的判断优先级高于 runner。真实环境能复现的问题才应默认修改 userscript；只在 runner 出现的问题应优先视为测试工具差异。
+- 真实扩展内部 GM 存储通常不能像 shim 那样直接从页面导出，因此真实环境 artifact 应以 DOM、截图、console、page error 和 trace 为主。
+- Phase 11 采用单独 `.browser-profiles/bilibili-real/` profile，避免真实脚本管理器和原模拟 runner 的 profile、存储、登录态互相污染。
+- 真实入口只能辅助安装和运行真正的 Tampermonkey/Violentmonkey；不会自动安装扩展，也不会从扩展内部直接读取 GM 存储。
+- 已新增 `npm run debug:bilibili:real`：它只启动持久化浏览器和保存 artifacts，不调用 `installUserscript()`，不会注入 Playwright GM shim。
+- 真实环境 artifacts 保存到 `artifacts/real-debug-sessions/<timestamp>/`，额外包含 `real-environment.json`，用于让 AI 确认现场来自未注入 shim 的真实入口。
+- `DEBUG_SAVE_SNAPSHOT=0 HEADLESS=1 npm run debug:bilibili:real -- https://www.bilibili.com/` 已验证可打开页面、等待 Enter 并正常关闭。
+- `savePageSnapshot()` 支持真实环境跳过 Playwright GM shim 状态采集，真实入口写入的 `userscript-state.json` 只保留页面 URL、标题和说明。
+- 用户在 `PLAYWRIGHT_CHROMIUM_CHANNEL=chrome npm run debug:bilibili:real` 中打开 Chrome Web Store 安装 Tampermonkey 时，页面提示 `Installation is not enabled`，并把扩展下载成 `.crx` 后删除。
+- 本地 Playwright 代码确认 Chromium 默认参数包含 `--disable-extensions`，这是扩展安装不可用的直接原因之一；截图中的 `Chrome is being controlled by automated test software` 来自 `--enable-automation`。
+- 后续需要区分两件事：安装扩展应使用不受 Playwright 控制的普通 Chrome；自动采集/调试再由 Playwright 打开同一个 profile，但必须忽略默认的 `--disable-extensions`。
+- 已新增 `npm run setup:bilibili-real-profile`：直接启动系统 Chrome，并使用 `.browser-profiles/bilibili-real/`，用于安装真实脚本管理器和本地 loader。
+- `debug:bilibili:real` 已改为 `ignoreDefaultArgs: ['--disable-extensions']`，用于调试时让已安装扩展继续运行。
+- 当前 WSL 已能找到 `/usr/bin/google-chrome-stable` 和 `/usr/bin/google-chrome`。
+- 工作区中已有 `chrome` npm 依赖和对应 lockfile 变化；当前工具不需要这个依赖，未擅自删除。
 
 ## Issues Encountered
 
@@ -73,6 +96,10 @@
 | debug snapshot 默认开启 | 更符合“人工发现问题后交给 AI 读取现场”的目标；如只想关闭浏览器可用 `DEBUG_SAVE_SNAPSHOT=0`。 |
 | debug 支持 `HEADLESS=1` | 便于 CI/Codex 非交互验证 snapshot 保存路径；用户手动测试默认仍打开可见浏览器。 |
 | 同域 GM 同步通过每次读写刷新 localStorage 实现 | 保持 GM API 同步调用形态，避免引入异步 binding 破坏 userscript 行为。 |
+| 追求 100% 模拟油猴扩展不现实 | 后续不要继续扩大 GM shim parity 范围，除非该差异会破坏已有 fixture 的基本可用性。 |
+| 真实入口不负责自动安装扩展 | Chrome/Chromium 扩展安装受浏览器和商店限制影响，文档改为指导用户在专用 profile 中一次性安装真实脚本管理器和本地 loader。 |
+| Playwright 默认禁用扩展 | 即使使用真实 Chrome channel，Playwright 仍会默认传入 `--disable-extensions`；真实调试入口必须显式忽略该默认参数。 |
+| 安装扩展与调试采集分离 | Chrome Web Store 安装扩展应使用普通 Chrome setup 命令；Playwright 只在扩展安装完成后进入同一 profile 采集现场。 |
 
 ## Resources
 

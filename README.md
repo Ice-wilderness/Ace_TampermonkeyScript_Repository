@@ -25,11 +25,14 @@
 
 ## 开发测试命令
 
-- `npm run setup:bilibili-profile`：打开专用浏览器配置，用于首次登录 Bilibili；登录后回终端按 Enter 保存并关闭。
-- `npm run debug:bilibili -- "https://www.bilibili.com/video/..."`：打开可手动操作的调试浏览器，自动注入当前仓库脚本；按 Enter 后会保存现场并关闭。
+- `npm run dev:bilibili`：输出 Tampermonkey/Violentmonkey 本地 loader，用于真实脚本管理器读取仓库中的最新脚本文件。
+- `npm run setup:bilibili-real-profile`：用普通 Chrome 打开真实环境 profile，用于安装 Tampermonkey/Violentmonkey 和本地 loader。
+- `npm run debug:bilibili:real -- "https://www.bilibili.com/video/..."`：打开真实脚本管理器专用调试浏览器；不注入模拟 GM shim，按 Enter 后保存真实环境现场并关闭。
+- `npm run setup:bilibili-profile`：打开模拟 runner 使用的专用浏览器配置，用于首次登录 Bilibili；登录后回终端按 Enter 保存并关闭。
+- `npm run debug:bilibili -- "https://www.bilibili.com/video/..."`：打开可手动操作的模拟调试浏览器，自动注入当前仓库脚本；按 Enter 后会保存现场并关闭。
 - `npm run test:fixture:bilibili`：运行离线 fixture 回归测试。
-- `npm run test:e2e:bilibili`：运行短时真实页面 smoke 测试，完成后会自动关闭浏览器。
-- `npm run capture:bilibili -- "https://www.bilibili.com/..."`：采集真实页面截图、HTML、console、页面错误、GM 状态和 trace。
+- `npm run test:e2e:bilibili`：运行短时真站 smoke 测试，完成后会自动关闭浏览器。
+- `npm run capture:bilibili -- "https://www.bilibili.com/..."`：使用模拟 runner 采集页面截图、HTML、console、页面错误、GM 状态和 trace。
 
 更完整的人工复现、自动采集和 AI 排障流程见 [用户脚本自动化调试指南](./docs/userscript-automation.md)。
 

@@ -32,12 +32,15 @@ async function savePageSnapshot(page, options) {
   const artifactDir = ensureDir(options.artifactDir);
   const consoleMessages = options.consoleMessages || [];
   const pageErrors = options.pageErrors || [];
+  const userscriptState = options.userscriptState === false
+    ? await collectPageState(page, options.userscriptStateNote || '')
+    : await collectUserscriptState(page);
 
   await page.screenshot({ path: path.join(artifactDir, 'screenshot.png'), fullPage: true });
   writeText(path.join(artifactDir, 'page.html'), await page.content());
   writeJson(path.join(artifactDir, 'console.json'), consoleMessages);
   writeJson(path.join(artifactDir, 'page-errors.json'), pageErrors);
-  writeJson(path.join(artifactDir, 'userscript-state.json'), await collectUserscriptState(page));
+  writeJson(path.join(artifactDir, 'userscript-state.json'), userscriptState);
   writeJson(path.join(artifactDir, 'summary.json'), {
     url: page.url(),
     title: await page.title().catch(() => ''),
@@ -50,6 +53,16 @@ async function savePageSnapshot(page, options) {
   return artifactDir;
 }
 
+async function collectPageState(page, note) {
+  return page.evaluate((stateNote) => ({
+    url: location.href,
+    title: document.title,
+    gmStore: null,
+    menuCommands: [],
+    note: stateNote
+  }), note);
+}
+
 function makeArtifactDir(repoRoot, kind, date = new Date()) {
   return path.join(repoRoot, 'artifacts', kind, timestampForPath(date));
 }
@@ -59,4 +72,3 @@ module.exports = {
   makeArtifactDir,
   savePageSnapshot
 };
-

@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 9
+Phase 12 complete: real extension install workflow split from Playwright debug.
 
 ## Phases
 
@@ -83,6 +83,41 @@ Phase 9
 - [x] 记录跨子域同步限制
 - **Status:** complete
 
+### Phase 10: Real Environment First Plan
+
+- [x] 明确当前 Playwright runner 是模拟用户脚本管理器，不应作为最终真相源
+- [x] 决定将“真实浏览器 + 真实 Tampermonkey/Violentmonkey + 本地 loader”作为主验证通道
+- [x] 决定 runner 只保留为快速 fixture、离线回归和非关键诊断辅助
+- [x] 制定后续落地顺序，避免继续把时间消耗在模拟环境 parity 上
+- **Status:** complete
+
+### Phase 11: Real Userscript Manager Debug Lane
+
+- [x] 新增 `debug:bilibili:real` 命令，启动真实脚本管理器专用 profile
+- [x] 确保真实入口不注入 GM shim、不调用自建 userscript runner
+- [x] 保存真实环境复现现场 artifacts
+- [x] 更新用户和 AI 文档，将真实入口作为首选流程
+- [x] 运行语法检查和可行的自动验证
+- **Status:** complete
+
+### Phase 12: Real Extension Install Workflow
+
+- [x] 分析 Chrome Web Store 提示 `Installation is not enabled` 的原因
+- [x] 让 `debug:bilibili:real` 启动时启用扩展
+- [x] 新增非 Playwright 控制的真实 profile 准备命令
+- [x] 更新文档中的 Tampermonkey/Violentmonkey 安装步骤
+- [x] 运行语法检查和可行的 smoke 验证
+- **Status:** complete
+
+## Operating Rules After Phase 11
+
+1. 真实环境优先：用户手动复现问题时，首选 `npm run debug:bilibili:real -- <url>`。
+2. 模拟 runner 降级为辅助：`debug:bilibili`、`capture:bilibili` 和 fixture 仍可用于快速定位、离线回归和 GM shim 状态检查。
+3. 不再追求 100% 复刻 Tampermonkey/Violentmonkey：只修明显影响现有 fixture 的 runner bug。
+4. 排障判断以真实现场为准：如果 bug 只在 runner 出现，优先按测试工具差异处理；如果 bug 在真实环境出现，才默认修改 userscript 源码。
+5. 真实环境 artifacts 以 DOM、截图、console、page errors 和 trace 为主；真实扩展内部 GM 存储通常不能直接导出。
+6. 安装真实扩展时使用非 Playwright 控制的 setup 命令；调试时再使用 Playwright 打开同一个 profile 并启用扩展。
+
 ## Key Questions
 
 1. Playwright 自动化应直接加载真实油猴扩展，还是先用自建 userscript runner 注入脚本？
@@ -105,6 +140,9 @@ Phase 9
 | 用户脚本源码统一放入 `scripts/` | 根目录保留项目文档、配置、测试入口和 planning 文件，脚本源码按类型集中管理，改动范围小。 |
 | debug 人工复现后默认保存现场 | 用户描述问题时，AI 需要真实 DOM、截图、console、GM 状态和 trace，而不仅是口述。 |
 | GM shim 每次读写前刷新持久 store | 更接近 Tampermonkey 多标签页共享 GM 存储行为，支持同域标签页切回后读取最新 revision。 |
+| 真实脚本管理器作为后续主验证通道 | 用户需要的是完全贴近真实使用环境；继续扩大模拟层会增加无意义 parity bug 风险。 |
+| 自建 runner 降级为辅助工具 | runner 仍适合离线 fixture 和快速采集，但不能替代真实 Tampermonkey/Violentmonkey 判断脚本是否正常。 |
+| `debug:bilibili:real` 使用独立 profile | 避免真实扩展、真实 GM 存储和模拟 runner 的 localStorage/登录态互相污染。 |
 
 ## Errors Encountered
 
