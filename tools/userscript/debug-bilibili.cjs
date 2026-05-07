@@ -4,6 +4,7 @@ const { ensureDir } = require('./artifacts.cjs');
 const { chromiumLaunchOptions } = require('./browser-options.cjs');
 const { collectUserscriptState, installUserscript } = require('./runner.cjs');
 const { attachPageDiagnostics, makeArtifactDir, savePageSnapshot } = require('./snapshot.cjs');
+const { waitForEnter } = require('./terminal.cjs');
 
 const repoRoot = path.resolve(__dirname, '..', '..');
 const scriptPath = path.join(repoRoot, 'scripts', 'Bilibili视频观看历史记录.js');
@@ -48,10 +49,7 @@ const saveSnapshot = process.env.DEBUG_SAVE_SNAPSHOT !== '0';
     ? '复现问题后回到终端按 Enter，会先保存现场再关闭浏览器。'
     : '结束后回到终端按 Enter 关闭浏览器。');
 
-  await new Promise((resolve) => {
-    process.stdin.resume();
-    process.stdin.once('data', resolve);
-  });
+  await waitForEnter();
 
   let artifactDir = null;
   if (saveSnapshot) {
