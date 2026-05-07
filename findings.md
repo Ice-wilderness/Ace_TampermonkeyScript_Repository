@@ -40,6 +40,10 @@
 - `npm run test:e2e:bilibili` 已通过：真实 B 站首页 smoke 能打开页面并注册脚本菜单。
 - `HEADLESS=1 CAPTURE_WAIT_MS=2000 npm run capture:bilibili -- https://www.bilibili.com/` 已通过，产物包含 `screenshot.png`、`page.html`、`console.json`、`page-errors.json`、`userscript-state.json`、`trace.zip` 和 `summary.json`。
 - capture 中 `page-errors.json` 为空，console 只有 log/info；`userscript-state.json` 显示 GM 存储初始化成功并注册 4 个菜单命令。
+- `debug:bilibili` 需要和 `capture:bilibili` 产出一致格式，方便 AI 使用同一排障流程读取 artifacts。
+- 人工复现场景默认保存到 `artifacts/debug-sessions/<timestamp>/`，自动指定 URL 采集仍保存到 `artifacts/captures/<timestamp>/`。
+- `debug:bilibili` 已验证可在按 Enter 后保存 `screenshot.png`、`page.html`、`console.json`、`page-errors.json`、`userscript-state.json`、`trace.zip` 和 `summary.json`。
+- debug snapshot 验证中 `page-errors.json` 为空，GM store 初始化成功并注册 4 个菜单命令。
 
 ## Technical Decisions
 
@@ -62,6 +66,8 @@
 | 当前还没有 planning 文件 | 已创建本次任务专用 `task_plan.md`、`findings.md`、`progress.md`。 |
 | Playwright 浏览器依赖无法在当前会话完整安装 | 已下载 fallback Chromium，但系统库安装需要 sudo；用户可在终端执行 `npm run install:playwright-deps` 或通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定已有浏览器。 |
 | 默认命令沙箱无法启动 Chromium | 对 Playwright 浏览器启动命令使用提升权限；用户本机 WSL 终端直接运行不应受该沙箱限制。 |
+| debug snapshot 默认开启 | 更符合“人工发现问题后交给 AI 读取现场”的目标；如只想关闭浏览器可用 `DEBUG_SAVE_SNAPSHOT=0`。 |
+| debug 支持 `HEADLESS=1` | 便于 CI/Codex 非交互验证 snapshot 保存路径；用户手动测试默认仍打开可见浏览器。 |
 
 ## Resources
 

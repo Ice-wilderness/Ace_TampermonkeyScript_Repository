@@ -1,8 +1,9 @@
 const path = require('path');
 const { chromium } = require('@playwright/test');
-const { collectUserscriptState, installUserscript } = require('./runner.cjs');
-const { ensureDir, timestampForPath, writeJson, writeText } = require('./artifacts.cjs');
+const { installUserscript } = require('./runner.cjs');
+const { ensureDir } = require('./artifacts.cjs');
 const { chromiumLaunchOptions } = require('./browser-options.cjs');
+const { attachPageDiagnostics, makeArtifactDir, savePageSnapshot } = require('./snapshot.cjs');
 
 const url = process.argv[2];
 
@@ -14,13 +15,11 @@ if (!url) {
 const repoRoot = path.resolve(__dirname, '..', '..');
 const scriptPath = path.join(repoRoot, 'scripts', 'Bilibili视频观看历史记录.js');
 const profileDir = ensureDir(path.join(repoRoot, '.browser-profiles', 'bilibili'));
-const artifactDir = ensureDir(path.join(repoRoot, 'artifacts', 'captures', timestampForPath()));
+const artifactDir = ensureDir(makeArtifactDir(repoRoot, 'captures'));
 const waitMs = Number(process.env.CAPTURE_WAIT_MS || 5000);
 const headless = process.env.HEADLESS === '1';
 
 (async () => {
-  const consoleMessages = [];
-  const pageErrors = [];
   let tracingStarted = false;
 
   const context = await chromium.launchPersistentContext(profileDir, chromiumLaunchOptions({
@@ -40,35 +39,17 @@ const headless = process.env.HEADLESS === '1';
     tracingStarted = true;
 
     const page = context.pages()[0] || await context.newPage();
-    page.on('console', (message) => {
-      consoleMessages.push({
-        type: message.type(),
-        text: message.text(),
-        location: message.location()
-      });
-    });
-    page.on('pageerror', (error) => {
-      pageErrors.push({
-        name: error.name,
-        message: error.message,
-        stack: error.stack
-      });
-    });
+    const diagnostics = attachPageDiagnostics(page);
 
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60_000 });
     await page.waitForTimeout(waitMs);
 
-    await page.screenshot({ path: path.join(artifactDir, 'screenshot.png'), fullPage: true });
-    writeText(path.join(artifactDir, 'page.html'), await page.content());
-    writeJson(path.join(artifactDir, 'console.json'), consoleMessages);
-    writeJson(path.join(artifactDir, 'page-errors.json'), pageErrors);
-    writeJson(path.join(artifactDir, 'userscript-state.json'), await collectUserscriptState(page));
-    writeJson(path.join(artifactDir, 'summary.json'), {
-      url,
-      capturedAt: new Date().toISOString(),
-      waitMs,
-      headless,
-      artifactDir
+    await savePageSnapshot(page, {
+      artifactDir,
+      mode: 'capture',
+      notes: `waitMs=${waitMs}; headless=${headless}`,
+      consoleMessages: diagnostics.consoleMessages,
+      pageErrors: diagnostics.pageErrors
     });
 
     await context.tracing.stop({ path: path.join(artifactDir, 'trace.zip') });

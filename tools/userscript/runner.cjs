@@ -5,7 +5,7 @@ function toJsonForInit(value) {
   return JSON.stringify(value).replace(/</g, '\\u003c');
 }
 
-function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObserver = false }) {
+function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObserver = false, storageKey = '' }) {
   const scriptInfo = {
     name: metadata.name,
     namespace: metadata.namespace,
@@ -20,18 +20,39 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
 
   return `
 (() => {
+  const storageKey = ${toJsonForInit(storageKey)};
   const clone = (value) => {
     if (value === undefined) return undefined;
     if (typeof structuredClone === 'function') return structuredClone(value);
     return JSON.parse(JSON.stringify(value));
   };
 
+  const readPersistedStore = () => {
+    if (!storageKey) return {};
+    try {
+      return JSON.parse(localStorage.getItem(storageKey) || '{}') || {};
+    } catch (error) {
+      console.warn('[userscript-runner] failed to read GM store', error);
+      return {};
+    }
+  };
+
+  const writePersistedStore = (value) => {
+    if (!storageKey) return;
+    try {
+      localStorage.setItem(storageKey, JSON.stringify(value));
+    } catch (error) {
+      console.warn('[userscript-runner] failed to persist GM store', error);
+    }
+  };
+
   const initialStore = ${toJsonForInit(initialStore)};
-  const store = window.__userscriptGMStore || Object.create(null);
+  const store = window.__userscriptGMStore || Object.assign(Object.create(null), readPersistedStore());
   Object.keys(initialStore).forEach((key) => {
     if (!(key in store)) store[key] = clone(initialStore[key]);
   });
   window.__userscriptGMStore = store;
+  writePersistedStore(store);
 
   const menuCommands = [];
   const menuHandlers = new Map();
@@ -61,6 +82,7 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
     configurable: true,
     value(key, value) {
       store[key] = clone(value);
+      writePersistedStore(store);
     }
   });
 
@@ -68,6 +90,7 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
     configurable: true,
     value(key) {
       delete store[key];
+      writePersistedStore(store);
     }
   });
 
@@ -196,7 +219,8 @@ async function installUserscript(context, options) {
     content: buildGmShimSource({
       metadata,
       initialStore: options.initialStore || {},
-      eagerIntersectionObserver: !!options.eagerIntersectionObserver
+      eagerIntersectionObserver: !!options.eagerIntersectionObserver,
+      storageKey: options.storageKey || ''
     })
   });
 
@@ -220,4 +244,3 @@ module.exports = {
   installUserscript,
   collectUserscriptState
 };
-

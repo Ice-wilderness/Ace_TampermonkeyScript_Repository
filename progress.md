@@ -118,6 +118,31 @@
   - `findings.md` (updated)
   - `progress.md` (updated)
 
+### Phase 8: Manual Reproduction Snapshot Workflow
+
+- **Status:** complete
+- Actions taken:
+  - 用户确认采用“人工复现后保存现场”的方案，并要求新增用户/AI 使用文档。
+  - 读取当前 debug/capture/artifacts 工具和 package scripts。
+  - 新增 `tools/userscript/snapshot.cjs`，统一保存 screenshot、HTML、console、page-errors、userscript-state、summary。
+  - 改造 `capture:bilibili` 使用统一 snapshot helper。
+  - 改造 `debug:bilibili`：浏览器保持打开，用户按 Enter 后保存 debug session 现场再关闭。
+  - 新增 `docs/userscript-automation.md`，说明用户命令和 AI 排障流程。
+  - 增加 `HEADLESS=1` 支持，用于非交互验证 debug snapshot。
+  - 运行 CJS 语法检查，通过。
+  - 运行 `npm run test:fixture:bilibili`，3 个测试通过。
+  - 运行 `capture:bilibili`，确认统一 snapshot helper 产物完整。
+  - 运行 `HEADLESS=1 printf Enter | npm run debug:bilibili`，确认 debug session 能保存现场。
+- Files created/modified:
+  - `tools/userscript/snapshot.cjs` (created)
+  - `tools/userscript/capture-bilibili.cjs` (updated)
+  - `tools/userscript/debug-bilibili.cjs` (updated)
+  - `docs/userscript-automation.md` (created)
+  - `README.md` (updated)
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
 ## Test Results
 
 | Test | Input | Expected | Actual | Status |
@@ -144,6 +169,10 @@
 | real-page smoke | npm run test:e2e:bilibili | Open Bilibili homepage and register userscript menu | 1 passed | pass |
 | capture workflow | HEADLESS=1 CAPTURE_WAIT_MS=2000 npm run capture:bilibili -- https://www.bilibili.com/ | Save screenshot, HTML, logs, state, trace, summary | Capture saved successfully | pass |
 | capture artifact sanity | inspect generated JSON/files | page-errors empty, GM state and menu commands present | Passed | pass |
+| CJS syntax check after snapshot workflow | node --check on Playwright config, tools, tests | All CJS files parse | Passed | pass |
+| fixture after snapshot workflow | npm run test:fixture:bilibili | 3 offline tests pass | 3 passed | pass |
+| capture after snapshot refactor | HEADLESS=1 CAPTURE_WAIT_MS=1000 npm run capture:bilibili -- https://www.bilibili.com/ | Capture files saved with summary mode capture | Passed | pass |
+| debug snapshot workflow | HEADLESS=1 piped Enter into npm run debug:bilibili -- https://www.bilibili.com/ | Debug session files saved with summary mode debug | Passed | pass |
 
 ## Error Log
 
@@ -160,8 +189,8 @@
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 7 complete; feasibility validation passed with elevated browser execution. |
-| Where am I going? | User can run fixture/e2e/capture commands directly in WSL; Codex should use elevated execution for Playwright browser launches in this sandbox. |
+| Where am I? | Phase 8 complete; manual reproduction snapshot workflow is implemented and verified. |
+| Where am I going? | User can use debug sessions to hand AI real page state after manual reproduction. |
 | What's the goal? | 为油猴脚本库建立真实网页测试和诊断体系，先覆盖 `scripts/Bilibili视频观看历史记录.js`。 |
 | What have I learned? | See `findings.md`. |
 | What have I done? | Created planning files, added the Playwright/userscript test infrastructure, ran static checks, and documented browser dependency blocker. |

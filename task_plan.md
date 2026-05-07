@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 7
+Phase 8
 
 ## Phases
 
@@ -67,6 +67,14 @@ Phase 7
 - [x] 记录验证结论和后续限制
 - **Status:** complete
 
+### Phase 8: Manual Reproduction Snapshot Workflow
+
+- [x] 增强 `debug:bilibili`，人工复现后保存现场
+- [x] 复用 capture/debug 的 snapshot 产物格式
+- [x] 新增用户和 AI 使用文档
+- [x] 验证语法和基础 fixture
+- **Status:** complete
+
 ## Key Questions
 
 1. Playwright 自动化应直接加载真实油猴扩展，还是先用自建 userscript runner 注入脚本？
@@ -87,6 +95,7 @@ Phase 7
 | fixture 首版使用最小 HTML，capture 保存完整 HTML | 最小 fixture 易维护，真实问题由 capture 命令保存完整页面以供诊断。 |
 | 提供 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` / `PLAYWRIGHT_CHROMIUM_CHANNEL` 逃生口 | 当前环境缺少系统浏览器且 Playwright 自带浏览器依赖无法 sudo 安装，允许用户显式指定已安装浏览器。 |
 | 用户脚本源码统一放入 `scripts/` | 根目录保留项目文档、配置、测试入口和 planning 文件，脚本源码按类型集中管理，改动范围小。 |
+| debug 人工复现后默认保存现场 | 用户描述问题时，AI 需要真实 DOM、截图、console、GM 状态和 trace，而不仅是口述。 |
 
 ## Errors Encountered
 
