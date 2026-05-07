@@ -47,10 +47,25 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
   };
 
   const initialStore = ${toJsonForInit(initialStore)};
-  const store = window.__userscriptGMStore || Object.assign(Object.create(null), readPersistedStore());
-  Object.keys(initialStore).forEach((key) => {
-    if (!(key in store)) store[key] = clone(initialStore[key]);
-  });
+  const store = window.__userscriptGMStore || Object.create(null);
+  const syncFromPersistedStore = () => {
+    if (!storageKey) return;
+    const persistedStore = readPersistedStore();
+    Object.keys(store).forEach((key) => {
+      if (!Object.prototype.hasOwnProperty.call(persistedStore, key)) delete store[key];
+    });
+    Object.keys(persistedStore).forEach((key) => {
+      store[key] = clone(persistedStore[key]);
+    });
+  };
+
+  syncFromPersistedStore();
+  const shouldApplyInitialStore = !storageKey || Object.keys(store).length === 0;
+  if (shouldApplyInitialStore) {
+    Object.keys(initialStore).forEach((key) => {
+      if (!(key in store)) store[key] = clone(initialStore[key]);
+    });
+  }
   window.__userscriptGMStore = store;
   writePersistedStore(store);
 
@@ -74,6 +89,7 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
   Object.defineProperty(window, 'GM_getValue', {
     configurable: true,
     value(key, defaultValue) {
+      syncFromPersistedStore();
       return Object.prototype.hasOwnProperty.call(store, key) ? clone(store[key]) : defaultValue;
     }
   });
@@ -81,6 +97,7 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
   Object.defineProperty(window, 'GM_setValue', {
     configurable: true,
     value(key, value) {
+      syncFromPersistedStore();
       store[key] = clone(value);
       writePersistedStore(store);
     }
@@ -89,6 +106,7 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
   Object.defineProperty(window, 'GM_deleteValue', {
     configurable: true,
     value(key) {
+      syncFromPersistedStore();
       delete store[key];
       writePersistedStore(store);
     }
@@ -97,6 +115,7 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
   Object.defineProperty(window, 'GM_listValues', {
     configurable: true,
     value() {
+      syncFromPersistedStore();
       return Object.keys(store);
     }
   });
@@ -125,6 +144,7 @@ function buildGmShimSource({ metadata, initialStore = {}, eagerIntersectionObser
   Object.defineProperty(window, '__userscriptGetGMStore', {
     configurable: true,
     value() {
+      syncFromPersistedStore();
       return clone(store);
     }
   });

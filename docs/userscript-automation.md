@@ -65,6 +65,8 @@ npm run test:e2e:bilibili
 
 `test:e2e:bilibili` 是短时真实页面 smoke，只验证脚本能在真站注入并注册菜单，跑完会自动关闭浏览器。它不是手动调试入口。
 
+离线 fixture 也覆盖同域多标签页 GM 存储同步：一个 `www.bilibili.com` 页面更新观看记录后，另一个 `www.bilibili.com` 页面在切回可见时应能读取最新 revision 并刷新标签。注意：Playwright runner 的 GM 存储是对真实油猴环境的近似模拟；跨子域（例如 `www.bilibili.com` 与 `search.bilibili.com`）的同步不完全等价于 Tampermonkey 的扩展级存储。
+
 ### 自动采集指定页面
 
 ```bash
@@ -88,9 +90,10 @@ artifacts/captures/<timestamp>/
 3. 读取 `userscript-state.json`，确认 GM 存储、脚本版本和菜单注册情况。
 4. 读取 `page.html`，用 `rg` 搜索相关 DOM、视频 BV、`.bvh-*` 标签、目标卡片选择器。
 5. 必要时查看 `screenshot.png`，确认用户可见状态。
-6. 修改 `scripts/Bilibili视频观看历史记录.js`，保持小改动。
-7. 先跑 `npm run test:fixture:bilibili`，再按需要跑 `npm run test:e2e:bilibili` 或 `capture:bilibili`。
-8. 普通开发修复不更新 `@version`、`README.md`、`CHANGELOG.md`，除非用户明确要求收尾、提交或发布。
+6. 如果问题涉及多标签页同步，优先确认是否同域；同域问题应能用 fixture 回归，跨子域问题需要记录 runner 与 Tampermonkey 的差异。
+7. 修改 `scripts/Bilibili视频观看历史记录.js`，保持小改动。
+8. 先跑 `npm run test:fixture:bilibili`，再按需要跑 `npm run test:e2e:bilibili` 或 `capture:bilibili`。
+9. 普通开发修复不更新 `@version`、`README.md`、`CHANGELOG.md`，除非用户明确要求收尾、提交或发布。
 
 在 Codex 的命令沙箱中启动 Chromium 可能需要提升权限；用户自己的 WSL 终端通常不需要。
 

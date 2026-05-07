@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 8
+Phase 9
 
 ## Phases
 
@@ -75,6 +75,14 @@ Phase 8
 - [x] 验证语法和基础 fixture
 - **Status:** complete
 
+### Phase 9: GM Storage Sync Parity
+
+- [x] 分析真实 Tampermonkey 与 Playwright runner 的多标签页 GM 存储差异
+- [x] 修复同域页面读取陈旧 GM store 的问题
+- [x] 增加同域多标签页同步 fixture 回归
+- [x] 记录跨子域同步限制
+- **Status:** complete
+
 ## Key Questions
 
 1. Playwright 自动化应直接加载真实油猴扩展，还是先用自建 userscript runner 注入脚本？
@@ -96,6 +104,7 @@ Phase 8
 | 提供 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` / `PLAYWRIGHT_CHROMIUM_CHANNEL` 逃生口 | 当前环境缺少系统浏览器且 Playwright 自带浏览器依赖无法 sudo 安装，允许用户显式指定已安装浏览器。 |
 | 用户脚本源码统一放入 `scripts/` | 根目录保留项目文档、配置、测试入口和 planning 文件，脚本源码按类型集中管理，改动范围小。 |
 | debug 人工复现后默认保存现场 | 用户描述问题时，AI 需要真实 DOM、截图、console、GM 状态和 trace，而不仅是口述。 |
+| GM shim 每次读写前刷新持久 store | 更接近 Tampermonkey 多标签页共享 GM 存储行为，支持同域标签页切回后读取最新 revision。 |
 
 ## Errors Encountered
 

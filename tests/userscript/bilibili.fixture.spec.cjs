@@ -18,14 +18,15 @@ const watchedRecord = {
   title: 'Fixture watched video'
 };
 
-async function installBilibiliScript(context, initialStore = {}) {
+async function installBilibiliScript(context, initialStore = {}, options = {}) {
   await installUserscript(context, {
     scriptPath,
     initialStore: {
       bvh_settings: { debug: true },
       ...initialStore
     },
-    eagerIntersectionObserver: true
+    eagerIntersectionObserver: true,
+    ...options
   });
 }
 
@@ -80,4 +81,42 @@ test('records video progress on fixture video page', async ({ context, page }) =
       .filter((value) => value && typeof value === 'object')
       .some((value) => value.BV1xx411c7mD && value.BV1xx411c7mD.s === 1 && value.BV1xx411c7mD.p === 42);
   }).toBe(true);
+});
+
+test('shares GM storage updates across same-origin pages', async ({ context, page }) => {
+  await installBilibiliScript(context, {
+    BV1xx411c7mD: watchedRecord
+  }, {
+    storageKey: 'bvh_fixture_shared_store'
+  });
+  await context.route(listUrl, (route) => route.fulfill({ path: listFixturePath, contentType: 'text/html' }));
+
+  await page.goto(listUrl);
+  await expect(page.locator('.bvh-tag')).toContainText('已观看67%');
+
+  const secondPage = await context.newPage();
+  await secondPage.goto(listUrl);
+  await secondPage.evaluate(() => {
+    GM_setValue('bvh_shard_32', {
+      BV1xx411c7mD: {
+        s: 1,
+        t: '08:00',
+        p: 88,
+        a: Math.floor(Date.now() / 1000),
+        n: 'Updated from second page'
+      }
+    });
+    GM_setValue('bvh_storage_revision', 99);
+  });
+
+  await page.bringToFront();
+  await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'visible'
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+
+  await expect(page.locator('.bvh-tag')).toContainText('已观看88%');
 });

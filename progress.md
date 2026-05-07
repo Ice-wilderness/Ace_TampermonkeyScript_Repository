@@ -143,6 +143,25 @@
   - `findings.md` (updated)
   - `progress.md` (updated)
 
+### Phase 9: GM Storage Sync Parity
+
+- **Status:** complete
+- Actions taken:
+  - 用户反馈真实 Tampermonkey 环境切换标签页会刷新最新状态标签，但 Playwright runner 环境不会。
+  - 分析脚本同步逻辑：`visibilitychange` 时读取 `bvh_storage_revision`，变大则清缓存并通知 DOMWatcher 重扫。
+  - 定位 runner 差异：GM shim 初始化后使用页面内存 store，其他标签页更新后当前页 `GM_getValue` 仍读旧内存。
+  - 修改 GM shim，使 `GM_getValue`、`GM_setValue`、`GM_deleteValue`、`GM_listValues` 和 `__userscriptGetGMStore` 在读写前同步持久 store。
+  - 调整持久 store 初始数据逻辑，避免新页面重复把 fixture 初始数据补种回持久 store。
+  - 新增同域双页面 fixture，验证第二页更新记录后第一页切回可刷新标签状态。
+  - 记录跨子域同步限制：runner 仍不是 Tampermonkey 扩展级跨 origin GM 存储。
+- Files created/modified:
+  - `tools/userscript/runner.cjs` (updated)
+  - `tests/userscript/bilibili.fixture.spec.cjs` (updated)
+  - `docs/userscript-automation.md` (updated)
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
 ## Test Results
 
 | Test | Input | Expected | Actual | Status |
@@ -173,6 +192,7 @@
 | fixture after snapshot workflow | npm run test:fixture:bilibili | 3 offline tests pass | 3 passed | pass |
 | capture after snapshot refactor | HEADLESS=1 CAPTURE_WAIT_MS=1000 npm run capture:bilibili -- https://www.bilibili.com/ | Capture files saved with summary mode capture | Passed | pass |
 | debug snapshot workflow | HEADLESS=1 piped Enter into npm run debug:bilibili -- https://www.bilibili.com/ | Debug session files saved with summary mode debug | Passed | pass |
+| GM same-origin sync fixture | npm run test:fixture:bilibili | Includes cross-page GM revision refresh and tag update | 4 passed | pass |
 
 ## Error Log
 
@@ -189,8 +209,8 @@
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 8 complete; manual reproduction snapshot workflow is implemented and verified. |
-| Where am I going? | User can use debug sessions to hand AI real page state after manual reproduction. |
+| Where am I? | Phase 9 complete; same-origin GM storage sync parity is fixed and covered by fixture. |
+| Where am I going? | User can retest tag refresh in debug environment; cross-subdomain sync remains a known runner limitation. |
 | What's the goal? | 为油猴脚本库建立真实网页测试和诊断体系，先覆盖 `scripts/Bilibili视频观看历史记录.js`。 |
 | What have I learned? | See `findings.md`. |
 | What have I done? | Created planning files, added the Playwright/userscript test infrastructure, ran static checks, and documented browser dependency blocker. |

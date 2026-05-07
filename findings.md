@@ -44,6 +44,10 @@
 - 人工复现场景默认保存到 `artifacts/debug-sessions/<timestamp>/`，自动指定 URL 采集仍保存到 `artifacts/captures/<timestamp>/`。
 - `debug:bilibili` 已验证可在按 Enter 后保存 `screenshot.png`、`page.html`、`console.json`、`page-errors.json`、`userscript-state.json`、`trace.zip` 和 `summary.json`。
 - debug snapshot 验证中 `page-errors.json` 为空，GM store 初始化成功并注册 4 个菜单命令。
+- 用户反馈真实浏览器切换标签页可自动刷新状态标签，但 Playwright runner 环境不能刷新；原因是 GM shim 曾把持久 store 读入页面内存后不再主动刷新。
+- 已将 `GM_getValue`、`GM_setValue`、`GM_deleteValue`、`GM_listValues` 和 `__userscriptGetGMStore` 改为读写前同步持久 store。
+- 新增 fixture 覆盖同域多页面同步：第二个页面写入 `bvh_shard_32` 和 `bvh_storage_revision=99` 后，第一个页面触发 `visibilitychange` 能刷新标签到 `已观看88%`。
+- 该修复覆盖同源/同域页面；跨子域的 GM 存储同步仍不能完全模拟 Tampermonkey 扩展级共享存储。
 
 ## Technical Decisions
 
@@ -68,6 +72,7 @@
 | 默认命令沙箱无法启动 Chromium | 对 Playwright 浏览器启动命令使用提升权限；用户本机 WSL 终端直接运行不应受该沙箱限制。 |
 | debug snapshot 默认开启 | 更符合“人工发现问题后交给 AI 读取现场”的目标；如只想关闭浏览器可用 `DEBUG_SAVE_SNAPSHOT=0`。 |
 | debug 支持 `HEADLESS=1` | 便于 CI/Codex 非交互验证 snapshot 保存路径；用户手动测试默认仍打开可见浏览器。 |
+| 同域 GM 同步通过每次读写刷新 localStorage 实现 | 保持 GM API 同步调用形态，避免引入异步 binding 破坏 userscript 行为。 |
 
 ## Resources
 
