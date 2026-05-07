@@ -35,6 +35,11 @@
 - 用户脚本源码已统一移动到 `scripts/`；根目录不再直接放置 `.js` userscript。
 - README 和 CHANGELOG 的脚本文件链接已同步到 `./scripts/...`。
 - Bilibili Playwright 工具和测试已改为读取 `scripts/Bilibili视频观看历史记录.js`。
+- 在默认命令沙箱中直接启动 Chromium 会触发 `sandbox_host_linux.cc ... Operation not permitted`；用提升权限运行 Playwright 命令后可正常启动。
+- `npm run test:fixture:bilibili` 已通过：3 个离线 fixture 测试覆盖列表标记、菜单面板和视频进度保存。
+- `npm run test:e2e:bilibili` 已通过：真实 B 站首页 smoke 能打开页面并注册脚本菜单。
+- `HEADLESS=1 CAPTURE_WAIT_MS=2000 npm run capture:bilibili -- https://www.bilibili.com/` 已通过，产物包含 `screenshot.png`、`page.html`、`console.json`、`page-errors.json`、`userscript-state.json`、`trace.zip` 和 `summary.json`。
+- capture 中 `page-errors.json` 为空，console 只有 log/info；`userscript-state.json` 显示 GM 存储初始化成功并注册 4 个菜单命令。
 
 ## Technical Decisions
 
@@ -56,6 +61,7 @@
 |-------|------------|
 | 当前还没有 planning 文件 | 已创建本次任务专用 `task_plan.md`、`findings.md`、`progress.md`。 |
 | Playwright 浏览器依赖无法在当前会话完整安装 | 已下载 fallback Chromium，但系统库安装需要 sudo；用户可在终端执行 `npm run install:playwright-deps` 或通过 `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` 指定已有浏览器。 |
+| 默认命令沙箱无法启动 Chromium | 对 Playwright 浏览器启动命令使用提升权限；用户本机 WSL 终端直接运行不应受该沙箱限制。 |
 
 ## Resources
 

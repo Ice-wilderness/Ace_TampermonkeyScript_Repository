@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 6
+Phase 7
 
 ## Phases
 
@@ -57,6 +57,14 @@ Phase 6
 - [x] 更新测试工具和 fixture 中的脚本路径
 - [x] 验证静态检查和 loader 输出
 - [x] 说明 WSL 中浏览器依赖安装方式
+- **Status:** complete
+
+### Phase 7: Feasibility Verification
+
+- [x] 运行离线 fixture 测试
+- [x] 根据失败结果修正测试基础设施或 fixture
+- [x] 尝试真站 smoke 或 capture
+- [x] 记录验证结论和后续限制
 - **Status:** complete
 
 ## Key Questions

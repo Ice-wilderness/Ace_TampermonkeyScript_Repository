@@ -101,6 +101,23 @@
   - `tests/userscript/bilibili.e2e.spec.cjs` (updated)
   - `scripts/*.js` (moved from repository root)
 
+### Phase 7: Feasibility Verification
+
+- **Status:** complete
+- Actions taken:
+  - 已创建提交 `5b77efe Add userscript test workflow and project layout`。
+  - 开始可行性验证，先运行离线 fixture 测试。
+  - 默认沙箱中首次运行 fixture 失败，Chromium 报 `sandbox_host_linux.cc ... Operation not permitted`。
+  - 使用提升权限重跑 `npm run test:fixture:bilibili`，3 个离线 fixture 测试全部通过。
+  - 使用提升权限运行 `npm run test:e2e:bilibili`，真实 B 站首页 smoke 通过。
+  - 使用 headless capture 验证 `npm run capture:bilibili -- https://www.bilibili.com/`，成功保存诊断产物。
+  - 检查 capture 产物，确认包含截图、HTML、console、page errors、userscript state、trace 和 summary。
+  - 检查 `page-errors.json` 为空，console 仅包含 log/info，GM 存储和菜单命令初始化成功。
+- Files created/modified:
+  - `task_plan.md` (updated)
+  - `findings.md` (updated)
+  - `progress.md` (updated)
+
 ## Test Results
 
 | Test | Input | Expected | Actual | Status |
@@ -122,6 +139,11 @@
 | old root path residual scan | rg for old root links/path joins | No old root script links or joins remain | No output | pass |
 | moved script content hash | git hash-object vs git rev-parse HEAD:path | Moved files keep identical content | All 4 hashes match | pass |
 | planning completion | check-complete.sh | All phases complete | 6/6 complete | pass |
+| fixture feasibility default sandbox | npm run test:fixture:bilibili | Run fixture tests | Blocked by Chromium sandbox host permission | blocked |
+| fixture feasibility elevated | npm run test:fixture:bilibili | Run 3 offline tests | 3 passed | pass |
+| real-page smoke | npm run test:e2e:bilibili | Open Bilibili homepage and register userscript menu | 1 passed | pass |
+| capture workflow | HEADLESS=1 CAPTURE_WAIT_MS=2000 npm run capture:bilibili -- https://www.bilibili.com/ | Save screenshot, HTML, logs, state, trace, summary | Capture saved successfully | pass |
+| capture artifact sanity | inspect generated JSON/files | page-errors empty, GM state and menu commands present | Passed | pass |
 
 ## Error Log
 
@@ -132,13 +154,14 @@
 | 2026-05-07 23:08 CST | Chromium missing `libnspr4.so`; install-deps needs sudo TTY | 3 | Added install scripts and explicit browser path/channel support; full browser tests require user-side system dependency setup. |
 | 2026-05-07 23:08 CST | Metadata matcher rejected no-path `@match` and mishandled `*` glob | 1 | Updated parser to support no-path matches and correctly convert `*` to `.*`. |
 | 2026-05-07 23:09 CST | Residual path scan command used unescaped backticks | 1 | Re-run the scan with single-quoted pattern and no shell-interpreted backticks. |
+| 2026-05-07 23:33 CST | Chromium launch blocked by command sandbox | 1 | Re-ran Playwright tests with elevated execution; fixture tests passed. |
 
 ## 5-Question Reboot Check
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 6 complete; userscript source layout has been restructured. |
-| Where am I going? | User can install browser deps in WSL, then rerun fixture/e2e/capture commands. |
+| Where am I? | Phase 7 complete; feasibility validation passed with elevated browser execution. |
+| Where am I going? | User can run fixture/e2e/capture commands directly in WSL; Codex should use elevated execution for Playwright browser launches in this sandbox. |
 | What's the goal? | 为油猴脚本库建立真实网页测试和诊断体系，先覆盖 `scripts/Bilibili视频观看历史记录.js`。 |
 | What have I learned? | See `findings.md`. |
 | What have I done? | Created planning files, added the Playwright/userscript test infrastructure, ran static checks, and documented browser dependency blocker. |
