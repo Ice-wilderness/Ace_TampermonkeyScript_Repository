@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Fixture Video Title</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    #biliMainHeader { height: 56px; background: #fff; border-bottom: 1px solid #eee; }
+    #bilibili-player { margin: 32px; width: 640px; height: 360px; background: #18191c; }
+    bwp-video { display: block; width: 640px; height: 360px; }
+  </style>
+  <script>
+    window.__INITIAL_STATE__ = {
+      bvid: 'BV1xx411c7mD',
+      videoData: { title: 'Fixture Video Title' }
+    };
+  </script>
+</head>
+<body>
+  <header id="biliMainHeader"></header>
+  <main>
+    <section id="bilibili-player">
+      <bwp-video id="fixture-video"></bwp-video>
+    </section>
+  </main>
+</body>
+</html>
+

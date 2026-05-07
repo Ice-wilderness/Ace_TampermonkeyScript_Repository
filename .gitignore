@@ -1,0 +1,6 @@
+node_modules/
+
+.browser-profiles/
+artifacts/
+test-results/
+playwright-report/

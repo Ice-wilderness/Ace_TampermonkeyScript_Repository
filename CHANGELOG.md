@@ -15,7 +15,7 @@
 <details>
 <summary><strong>Bilibili 视频观看历史记录</strong></summary>
 
-文件：[Bilibili视频观看历史记录.js](./Bilibili视频观看历史记录.js)
+文件：[Bilibili视频观看历史记录.js](./scripts/Bilibili视频观看历史记录.js)
 
 ### 3.2.2
 
@@ -123,7 +123,7 @@
 <details>
 <summary><strong>bilibili 查看关注时间</strong></summary>
 
-文件：[bilibili查看关注时间.js](./bilibili查看关注时间.js)
+文件：[bilibili查看关注时间.js](./scripts/bilibili查看关注时间.js)
 
 ### 1.1.2
 
@@ -141,7 +141,7 @@
 <details>
 <summary><strong>Discuz 论坛帖子已读标记与图片预览</strong></summary>
 
-文件：[Discuz 论坛帖子已读标记与图片预览.js](./Discuz%20论坛帖子已读标记与图片预览.js)
+文件：[Discuz 论坛帖子已读标记与图片预览.js](./scripts/Discuz%20论坛帖子已读标记与图片预览.js)
 
 ### 4.6.3
 
@@ -226,7 +226,7 @@
 <details>
 <summary><strong>自用论坛辅助签到</strong></summary>
 
-文件：[【自写】自用论坛辅助签到自写.js](./【自写】自用论坛辅助签到自写.js)
+文件：[自用论坛辅助签到自写.js](./scripts/自用论坛辅助签到自写.js)
 
 ### 2.2.1
 

@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Bilibili Fixture List</title>
+  <style>
+    body { margin: 0; font-family: sans-serif; }
+    #biliMainHeader { height: 56px; background: #fff; border-bottom: 1px solid #eee; }
+    .bili-feed4-layout { display: grid; grid-template-columns: repeat(2, 240px); gap: 24px; padding: 32px; }
+    .bili-video-card { width: 240px; }
+    .bili-video-card__image--wrap { display: block; position: relative; width: 240px; height: 135px; overflow: hidden; background: #e3e5e7; }
+    .bili-video-card__image--wrap img { display: block; width: 240px; height: 135px; object-fit: cover; }
+    .bili-video-card__stats { position: absolute; left: 0; right: 0; bottom: 0; min-height: 18px; background: rgba(0,0,0,.25); }
+    .title { margin-top: 8px; font-size: 14px; color: #18191c; }
+  </style>
+</head>
+<body>
+  <header id="biliMainHeader"></header>
+  <main class="bili-feed4-layout">
+    <article class="bili-video-card">
+      <a class="bili-video-card__image--wrap" href="https://www.bilibili.com/video/BV1xx411c7mD/">
+        <img alt="watched video cover" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='135'%3E%3Crect width='240' height='135' fill='%2389c2ff'/%3E%3C/svg%3E">
+        <span class="bili-video-card__stats"></span>
+      </a>
+      <div class="title">Fixture watched video</div>
+    </article>
+    <article class="bili-video-card">
+      <a class="bili-video-card__image--wrap" href="https://www.bilibili.com/video/BV1yy411c7mE/">
+        <img alt="fresh video cover" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='135'%3E%3Crect width='240' height='135' fill='%23f2c572'/%3E%3C/svg%3E">
+        <span class="bili-video-card__stats"></span>
+      </a>
+      <div class="title">Fixture fresh video</div>
+    </article>
+  </main>
+</body>
+</html>
+

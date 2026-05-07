@@ -1,0 +1,20 @@
+{
+  "name": "userscript-tools",
+  "private": true,
+  "scripts": {
+    "dev:bilibili": "node tools/userscript/print-tampermonkey-loader.cjs",
+    "install:playwright-browsers": "PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 playwright install chromium",
+    "install:playwright-deps": "PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64 playwright install-deps chromium",
+    "setup:bilibili-profile": "node tools/userscript/setup-bilibili-profile.cjs",
+    "capture:bilibili": "node tools/userscript/capture-bilibili.cjs",
+    "test:fixture:bilibili": "playwright test tests/userscript/bilibili.fixture.spec.cjs --project=fixture",
+    "test:e2e:bilibili": "playwright test tests/userscript/bilibili.e2e.spec.cjs --project=bilibili",
+    "test:bilibili": "npm run test:fixture:bilibili && npm run test:e2e:bilibili"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.1"
+  }
+}
