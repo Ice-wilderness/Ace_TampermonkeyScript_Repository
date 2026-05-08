@@ -2,7 +2,7 @@
 
 本项目的自动化工具用于减少“复制脚本到油猴、手动保存 HTML、再让 AI 猜问题”的流程。当前工具以 `scripts/Bilibili视频观看历史记录.js` 为样板。
 
-现在推荐优先使用真实环境入口：真实浏览器 profile + 真实 Tampermonkey/Violentmonkey + 本地 loader。Playwright 只负责打开浏览器和保存现场，不再模拟油猴扩展。
+现在推荐优先使用真实环境入口：真实浏览器 profile + 真实 Tampermonkey/Violentmonkey + 本地 loader。人工复现阶段使用普通 Chrome；工具只在你按 Enter 后通过 CDP 临时接入保存现场，不再模拟油猴扩展。
 
 ## 给用户的使用方式
 
@@ -44,12 +44,16 @@ google-chrome-stable --version
 ### 首选：真实脚本管理器环境
 
 ```bash
-PLAYWRIGHT_CHROMIUM_CHANNEL=chrome npm run debug:bilibili:real -- "https://www.bilibili.com/video/..."
+npm run debug:bilibili:real -- "https://www.bilibili.com/video/..."
 ```
 
 这个命令使用 `.browser-profiles/bilibili-real/`，不会注入 Playwright GM shim，也不会自动加载仓库脚本。脚本必须由真实 Tampermonkey/Violentmonkey 执行。
 
-`debug:bilibili:real` 会忽略 Playwright 默认的 `--disable-extensions`，让已经安装在 profile 中的真实扩展继续运行。但它仍是 Playwright 控制的浏览器，不建议在这个窗口里安装 Chrome Web Store 扩展；安装扩展请使用 `setup:bilibili-real-profile`。
+`debug:bilibili:real` 会先启动普通 Chrome 进程，人工复现阶段 Playwright 不会连接或控制页面。复现完成并按 Enter 后，工具才会通过 CDP 临时接入当前 Chrome，保存截图、HTML 和页面信息。
+
+运行前请先关闭其他使用 `.browser-profiles/bilibili-real/` 的 Chrome 窗口。Chrome 同一个 profile 只能有一个主进程；如果旧窗口占着 profile，新窗口可能不会开启新的 CDP endpoint。
+
+如果你要安装 Chrome Web Store 扩展，请仍然使用 `setup:bilibili-real-profile`。调试入口会带远程调试端口，主要用于复现和采集，不作为扩展安装入口。
 
 复现问题后回终端按 Enter。工具会自动保存真实环境现场到：
 
@@ -65,10 +69,12 @@ artifacts/real-debug-sessions/<timestamp>/
 - `page-errors.json`
 - `userscript-state.json`
 - `real-environment.json`
-- `trace.zip`
+- `trace.zip`，如果当前 CDP 连接支持 trace
 - `summary.json`
 
-真实脚本管理器的 GM 存储通常不能直接从页面导出，所以 `userscript-state.json` 在真实环境里只记录页面信息和说明，`gmStore` 会是 `null`。AI 排障时应优先看 DOM、截图、console、page errors 和 trace。
+`console.json`、`page-errors.json` 和 `trace.zip` 都从末尾 CDP 接入后开始采集，不记录你完整人工操作过程；真实复现依据以截图、HTML、用户描述和最终页面状态为主。
+
+真实脚本管理器的 GM 存储通常不能直接从页面导出，所以 `userscript-state.json` 在真实环境里只记录页面信息和说明，`gmStore` 会是 `null`。AI 排障时应优先看 DOM、截图、用户描述和最终页面状态；`console.json`、`page-errors.json`、`trace.zip` 作为末尾接入后的辅助资料。
 
 如果只想打开真实调试浏览器但不保存现场：
 
@@ -148,7 +154,7 @@ artifacts/captures/<timestamp>/
 当用户说“我人工复现了问题，现场在 artifacts/real-debug-sessions/... 或 artifacts/debug-sessions/...”时：
 
 1. 读取 `summary.json`，确认 URL、标题和保存时间。
-2. 读取 `page-errors.json` 和 `console.json`，优先查页面错误、脚本错误、warning。
+2. 读取 `page-errors.json` 和 `console.json`。真实环境里它们只覆盖 CDP 接入后的短时间窗口；模拟 runner 里则覆盖工具打开页面后的过程。
 3. 如果是 `artifacts/real-debug-sessions/...`，读取 `real-environment.json`，确认这是未注入 shim 的真实环境；如果是 `artifacts/debug-sessions/...`，把它当作模拟 runner 现场。
 4. 读取 `userscript-state.json`。真实环境里 GM 存储可能不可见；模拟 runner 里可用它确认 GM 存储、脚本版本和菜单注册情况。
 5. 读取 `page.html`，用 `rg` 搜索相关 DOM、视频 BV、`.bvh-*` 标签、目标卡片选择器。

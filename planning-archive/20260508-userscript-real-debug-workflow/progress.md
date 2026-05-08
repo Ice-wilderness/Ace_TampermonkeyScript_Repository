@@ -222,6 +222,50 @@
   - `findings.md` (updated)
   - `progress.md` (updated)
 
+### Phase 13: Ordinary Chrome Reproduction + CDP Snapshot
+
+- **Status:** complete
+- Actions taken:
+  - 用户确认采用“普通 Chrome 人工复现，Playwright 只在最后通过 CDP 接入采集”的方案。
+  - 读取当前 planning 文件、`debug-bilibili-real.cjs` 和 `setup-bilibili-real-profile.cjs`。
+  - 决定保留 `debug:bilibili:real` 命令名，但改造其内部实现，避免人工复现阶段由 Playwright 启动和控制浏览器。
+  - 新增 `real-browser.cjs`，集中普通 Chrome 查找、启动参数和空闲 CDP 端口选择。
+  - 改造 `debug-bilibili-real.cjs`：启动普通 Chrome，等待用户复现并按 Enter 后再 `connectOverCDP()` 保存现场。
+  - 改造 `setup-bilibili-real-profile.cjs` 复用普通 Chrome helper。
+  - 更新 README 和自动化文档，说明人工复现阶段不再由 Playwright 控制，trace 只覆盖末尾接入。
+  - 运行 `node --check` 验证新增和修改后的 userscript 工具脚本。
+  - 运行 helper smoke，确认普通 Chrome 查找结果和 CDP 启动参数。
+  - 运行 `package.json` JSON 解析检查。
+- Files created/modified:
+  - `tools/userscript/real-browser.cjs` (created)
+  - `tools/userscript/debug-bilibili-real.cjs` (updated)
+  - `tools/userscript/setup-bilibili-real-profile.cjs` (updated)
+  - `README.md` (updated)
+  - `docs/userscript-automation.md` (updated)
+  - `findings.md` (updated)
+  - `task_plan.md` (updated)
+  - `progress.md` (updated)
+
+### Phase 14: Robust CDP Endpoint Discovery
+
+- **Status:** complete
+- Actions taken:
+  - 用户按 Enter 后遇到 `connectOverCDP: Unexpected status 400 ... This does not look like a DevTools server`。
+  - 检查 `debug-bilibili-real.cjs`，当前实现是先找空闲端口再假设 Chrome 会在该端口提供 DevTools HTTP。
+  - 判断该方式不够稳：Chrome 可能未绑定该端口、profile 已被既有 Chrome 进程占用，或端口被其他服务抢占。
+  - 决定改为让 Chrome 使用 `--remote-debugging-port=0` 自动分配端口，并从 profile 的 `DevToolsActivePort` 文件读取真实 CDP endpoint。
+  - 更新 `real-browser.cjs`，新增 `DevToolsActivePort` 清理、等待和 endpoint 读取逻辑。
+  - 更新 `debug-bilibili-real.cjs`，连接 Chrome 写入的真实 CDP endpoint，而不是预先猜测端口。
+  - 更新文档，提示运行前关闭其他使用 `.browser-profiles/bilibili-real/` 的 Chrome 窗口。
+  - 运行 CJS 语法检查和 helper smoke，确认参数包含 `--remote-debugging-port=0`、`--remote-debugging-address=127.0.0.1` 和 `--remote-allow-origins=*`。
+- Files created/modified:
+  - `tools/userscript/real-browser.cjs` (updated)
+  - `tools/userscript/debug-bilibili-real.cjs` (updated)
+  - `docs/userscript-automation.md` (updated)
+  - `findings.md` (updated)
+  - `task_plan.md` (updated)
+  - `progress.md` (updated)
+
 ## Test Results
 
 | Test | Input | Expected | Actual | Status |
@@ -268,6 +312,16 @@
 | all userscript tool syntax after setup command | node --check tools/userscript/*.cjs | All tool scripts parse | Passed | pass |
 | package json parse after setup command | JSON.parse package.json | package.json remains valid JSON | Passed | pass |
 | Chrome executable discovery | which google-chrome-stable google-chrome chromium chromium-browser | WSL Chrome executable should exist | Found `/usr/bin/google-chrome-stable` and `/usr/bin/google-chrome` | pass |
+| real browser helper syntax | node --check tools/userscript/real-browser.cjs | New helper parses | Passed | pass |
+| CDP real debug syntax | node --check tools/userscript/debug-bilibili-real.cjs | CDP-based real debug script parses | Passed | pass |
+| setup real profile syntax after helper | node --check tools/userscript/setup-bilibili-real-profile.cjs | Setup script parses after helper refactor | Passed | pass |
+| all userscript tools after CDP refactor | node --check tools/userscript/*.cjs | All tool scripts parse | Passed | pass |
+| real browser helper smoke | node -e require real-browser helper | Finds Chrome and builds remote-debugging args | Found `/usr/bin/google-chrome-stable`; args include `--remote-debugging-port=9222` | pass |
+| package json parse after CDP refactor | JSON.parse package.json | package.json remains valid JSON | Passed | pass |
+| real browser helper syntax after DevToolsActivePort | node --check tools/userscript/real-browser.cjs | Helper parses after endpoint discovery change | Passed | pass |
+| real debug syntax after DevToolsActivePort | node --check tools/userscript/debug-bilibili-real.cjs | Real debug script parses after endpoint discovery change | Passed | pass |
+| all userscript tools after DevToolsActivePort | node --check tools/userscript/*.cjs | All tool scripts parse | Passed | pass |
+| DevToolsActivePort helper smoke | node -e build Chrome args and endpoint file path | Args should request Chrome-assigned CDP port and localhost endpoint | Args include `--remote-debugging-port=0`, `--remote-debugging-address=127.0.0.1`, `--remote-allow-origins=*`; file path is `/tmp/profile/DevToolsActivePort` | pass |
 
 ## Error Log
 
@@ -284,8 +338,8 @@
 
 | Question | Answer |
 |----------|--------|
-| Where am I? | Phase 12 complete; real extension installation is split into a normal Chrome setup command, and Playwright debug now keeps extensions enabled. |
-| Where am I going? | User should run `npm run setup:bilibili-real-profile` to install Tampermonkey/loader, close Chrome, then run `PLAYWRIGHT_CHROMIUM_CHANNEL=chrome npm run debug:bilibili:real -- <url>` for real-environment artifacts. |
+| Where am I? | Phase 14 complete; `debug:bilibili:real` now reads Chrome's actual CDP endpoint from `DevToolsActivePort` instead of guessing a port. |
+| Where am I going? | User should close any existing `.browser-profiles/bilibili-real/` Chrome window, rerun `debug:bilibili:real -- <url>`, reproduce, then press Enter. |
 | What's the goal? | 为油猴脚本库建立真实网页测试和诊断体系，先覆盖 `scripts/Bilibili视频观看历史记录.js`。 |
 | What have I learned? | See `findings.md`. |
 | What have I done? | Created planning files, added the Playwright/userscript test infrastructure, ran static checks, and documented browser dependency blocker. |

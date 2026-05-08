@@ -85,6 +85,11 @@
 - `debug:bilibili:real` 已改为 `ignoreDefaultArgs: ['--disable-extensions']`，用于调试时让已安装扩展继续运行。
 - 当前 WSL 已能找到 `/usr/bin/google-chrome-stable` 和 `/usr/bin/google-chrome`。
 - 工作区中已有 `chrome` npm 依赖和对应 lockfile 变化；当前工具不需要这个依赖，未擅自删除。
+- Phase 13 将 `debug:bilibili:real` 改为普通 Chrome 进程复现，只有用户按 Enter 后才通过 CDP 接入保存现场，避免人工复现阶段被 Playwright 生命周期参数影响。
+- CDP 模式下 `console.json`、`page-errors.json` 和 `trace.zip` 只覆盖末尾接入后的短窗口，不能作为完整人工操作录像；真实复现判断应以 DOM、截图、最终页面状态和用户描述为主。
+- 用户遇到 `connectOverCDP: Unexpected status 400 ... This does not look like a DevTools server`，说明工具尝试连接的端口不是 Chrome DevTools endpoint。
+- 已将 CDP endpoint 发现改为 Chrome 原生 `DevToolsActivePort` 文件：Chrome 使用 `--remote-debugging-port=0` 自行分配端口，工具读取真实 endpoint 后连接，避免空闲端口假设失效。
+- 如果 `.browser-profiles/bilibili-real/` 已被其他 Chrome 主进程占用，Chrome 可能不会生成新的 `DevToolsActivePort`；此时应关闭旧窗口后重试。
 
 ## Issues Encountered
 
@@ -100,6 +105,7 @@
 | 真实入口不负责自动安装扩展 | Chrome/Chromium 扩展安装受浏览器和商店限制影响，文档改为指导用户在专用 profile 中一次性安装真实脚本管理器和本地 loader。 |
 | Playwright 默认禁用扩展 | 即使使用真实 Chrome channel，Playwright 仍会默认传入 `--disable-extensions`；真实调试入口必须显式忽略该默认参数。 |
 | 安装扩展与调试采集分离 | Chrome Web Store 安装扩展应使用普通 Chrome setup 命令；Playwright 只在扩展安装完成后进入同一 profile 采集现场。 |
+| 人工复现阶段不使用 Playwright 启动浏览器 | 普通 Chrome 更接近日常浏览器生命周期，能减少 `visibilitychange`、前后台切换和扩展运行策略差异。 |
 
 ## Resources
 

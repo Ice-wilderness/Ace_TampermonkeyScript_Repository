@@ -6,7 +6,7 @@
 
 ## Current Phase
 
-Phase 12 complete: real extension install workflow split from Playwright debug.
+Phase 14 complete: CDP endpoint discovery now uses Chrome DevToolsActivePort.
 
 ## Phases
 
@@ -109,6 +109,24 @@ Phase 12 complete: real extension install workflow split from Playwright debug.
 - [x] 运行语法检查和可行的 smoke 验证
 - **Status:** complete
 
+### Phase 13: Ordinary Chrome Reproduction + CDP Snapshot
+
+- [x] 将 `debug:bilibili:real` 的人工复现阶段改为普通 Chrome 进程
+- [x] 仅在用户按 Enter 后通过 CDP 连接并保存 snapshot
+- [x] 复用真实 profile、真实扩展和本地 loader
+- [x] 更新文档，说明普通 Chrome 负责生命周期，Playwright 只负责末尾采集
+- [x] 运行语法检查和可行验证
+- **Status:** complete
+
+### Phase 14: Robust CDP Endpoint Discovery
+
+- [x] 分析 `connectOverCDP` 连接到非 DevTools 服务导致 400 的原因
+- [x] 改为使用 Chrome 写入的 `DevToolsActivePort` 发现真实 CDP endpoint
+- [x] 在 endpoint 不可用时给出明确的 profile 占用/启动失败提示
+- [x] 更新文档说明不要复用已打开的同 profile Chrome
+- [x] 运行语法检查和可行验证
+- **Status:** complete
+
 ## Operating Rules After Phase 11
 
 1. 真实环境优先：用户手动复现问题时，首选 `npm run debug:bilibili:real -- <url>`。
@@ -116,7 +134,8 @@ Phase 12 complete: real extension install workflow split from Playwright debug.
 3. 不再追求 100% 复刻 Tampermonkey/Violentmonkey：只修明显影响现有 fixture 的 runner bug。
 4. 排障判断以真实现场为准：如果 bug 只在 runner 出现，优先按测试工具差异处理；如果 bug 在真实环境出现，才默认修改 userscript 源码。
 5. 真实环境 artifacts 以 DOM、截图、console、page errors 和 trace 为主；真实扩展内部 GM 存储通常不能直接导出。
-6. 安装真实扩展时使用非 Playwright 控制的 setup 命令；调试时再使用 Playwright 打开同一个 profile 并启用扩展。
+6. 安装真实扩展时使用非 Playwright 控制的 setup 命令。
+7. 真实调试复现阶段使用普通 Chrome；Playwright 只在用户按 Enter 后通过 CDP 接入保存现场。
 
 ## Key Questions
 
