@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"exit: $?\")",
+      "Bash(npm install *)",
+      "Bash(timeout 5 node __TRACKED_VAR__/.claude/plugins/cache/thedotmack/claude-mem/12.7.2/scripts/mcp-server.cjs)",
+      "Bash(echo \"Exit code: $?\")",
+      "mcp__plugin_claude-mem_mcp-search__smart_outline"
+    ]
+  }
+}
