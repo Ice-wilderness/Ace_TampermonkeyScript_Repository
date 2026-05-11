@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.2.2
-// @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持进度记忆、分级高亮、设置面板、历史管理、统计及导入导出。
+// @version      3.2.3
+// @description  记录并提示Bilibili已观看或已访问但未观看视频记录。优化设置页默认入口、历史搜索体验，并增强统计图表。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -225,6 +225,11 @@
         .bvh-opacity-control input[type="range"] { min-width: 120px; }
         .bvh-opacity-control input[type="number"] { min-width: 0; width: 72px; }
         .bvh-actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 14px 0; align-items: center; }
+        .bvh-actions-search { margin-bottom: 6px; }
+        .bvh-actions-search .bvh-search { flex: 1; min-width: 0; }
+        .bvh-actions-bar { margin-top: 0; }
+        .bvh-actions-spacer { flex: 1; }
+        .bvh-history-loading { text-align: center; color: #9499a0; font-size: 14px; padding: 40px 0; }
         .bvh-btn { border: 1px solid #d0d7de; background: #fff; color: #18191c; border-radius: 7px; padding: 8px 13px; cursor: pointer; font-weight: 700; }
         .bvh-btn.primary { background: #00aeec; border-color: #00aeec; color: #fff; }
         .bvh-btn.danger { background: #f85a54; border-color: #f85a54; color: #fff; }
@@ -241,6 +246,25 @@
         .bvh-stat strong { display: block; font-size: 22px; margin-top: 4px; color: #00aeec; }
         .bvh-resume { position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%); z-index: 99998; background: #fff; color: #18191c; border: 1px solid #e3e5e7; border-radius: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.2); padding: 12px; display: flex; align-items: center; gap: 10px; }
         .bvh-resume span { font-weight: 600; }
+        .bvh-chart-toolbar { display: flex; justify-content: flex-end; margin: 14px 0; }
+        .bvh-chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 14px; }
+        .bvh-chart-card { border: 1px solid #e3e5e7; border-radius: 8px; background: #fff; padding: 14px; }
+        .bvh-chart-card-wide { grid-column: 1 / -1; }
+        .bvh-chart-title { margin: 0 0 12px; font-size: 14px; font-weight: 800; color: #18191c; }
+        .bvh-chart-row { display: grid; grid-template-columns: 72px 1fr 44px; gap: 8px; align-items: center; margin: 8px 0; }
+        .bvh-chart-label { font-size: 13px; color: #18191c; font-weight: 600; }
+        .bvh-chart-value { font-size: 13px; color: #18191c; text-align: right; }
+        .bvh-chart-bar-track { height: 10px; background: #edf0f2; border-radius: 999px; overflow: hidden; }
+        .bvh-chart-bar-fill { height: 100%; border-radius: 999px; transition: width 0.4s ease; }
+        .bvh-chart-empty { color: #9499a0; font-size: 13px; padding: 18px 0; text-align: center; }
+        .bvh-completion-ring { display: flex; align-items: center; justify-content: center; gap: 16px; padding: 8px 0; }
+        .bvh-ring-svg { width: 90px; height: 90px; flex-shrink: 0; }
+        .bvh-ring-text { display: flex; flex-direction: column; align-items: center; }
+        .bvh-ring-text strong { font-size: 28px; color: #00aeec; }
+        .bvh-ring-text span { font-size: 12px; color: #9499a0; }
+        .bvh-svg-chart { width: 100%; height: auto; }
+        .bvh-chart-scroll { overflow-x: auto; }
+        .bvh-chart-scroll .bvh-svg-chart { min-width: 560px; height: 180px; }
             `);
             stylesInjected = true;
         } catch (e) { }
@@ -1268,36 +1292,69 @@
             return data;
         },
 
-        getStats: () => {
+        getStatsBundle: (days = 30) => {
             const start = performance.now();
             const now = Date.now();
             const weekAgo = now - 7 * 24 * 60 * 60 * 1000;
-            const stats = {
-                total: 0,
-                watched: 0,
-                visited: 0,
-                low: 0,
-                mid: 0,
-                high: 0,
-                recent7Days: 0,
-                unfinished: 0
+            const cutoff = now - days * 24 * 60 * 60 * 1000;
+            const formatLocalMD = (ts) => {
+                const d = new Date(ts);
+                return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
             };
+
+            const cards = { total: 0, watched: 0, visited: 0, low: 0, mid: 0, high: 0, recent7Days: 0, unfinished: 0 };
+            const chartStatus = { watched: 0, visited: 0 };
+            const chartProgress = { low: 0, mid: 0, high: 0 };
+            const dailyMap = new Map();
+
             StorageManager.getAllRecords().forEach(({ record }) => {
-                stats.total++;
-                if (record.status === RECORD_STATUS.WATCHED) stats.watched++;
-                if (record.status === RECORD_STATUS.VISITED) stats.visited++;
+                cards.total++;
+                if (record.status === RECORD_STATUS.WATCHED) { cards.watched++; chartStatus.watched++; }
+                if (record.status === RECORD_STATUS.VISITED) { cards.visited++; chartStatus.visited++; }
                 const percent = parseInt(record.percent);
                 if (!isNaN(percent)) {
-                    if (percent < CONFIG.lowThreshold) stats.low++;
-                    else if (percent <= CONFIG.highThreshold) stats.mid++;
-                    else stats.high++;
-                    if (percent < CONFIG.highThreshold) stats.unfinished++;
+                    if (percent < CONFIG.lowThreshold) { cards.low++; chartProgress.low++; }
+                    else if (percent <= CONFIG.highThreshold) { cards.mid++; chartProgress.mid++; }
+                    else { cards.high++; chartProgress.high++; }
+                    if (percent < CONFIG.highThreshold) cards.unfinished++;
                 }
                 const savedTime = record.savedAt ? new Date(record.savedAt).getTime() : 0;
-                if (savedTime >= weekAgo) stats.recent7Days++;
+                if (savedTime >= weekAgo) cards.recent7Days++;
+                if (savedTime >= cutoff) {
+                    const dateKey = formatLocalMD(savedTime);
+                    dailyMap.set(dateKey, (dailyMap.get(dateKey) || 0) + 1);
+                }
             });
-            Utils.logSlow('StorageManager.getStats', start, `total=${stats.total}`, 80);
-            return stats;
+
+            const recentDays = [];
+            for (let d = days - 1; d >= 0; d--) {
+                const key = formatLocalMD(now - d * 24 * 60 * 60 * 1000);
+                recentDays.push({ date: key, value: dailyMap.get(key) || 0 });
+            }
+
+            const progressTotal = chartProgress.low + chartProgress.mid + chartProgress.high;
+
+            Utils.logSlow('StorageManager.getStatsBundle', start, `days=${days} total=${cards.total}`, 80);
+            return {
+                cards,
+                charts: {
+                    status: [
+                        { label: '已观看', value: chartStatus.watched },
+                        { label: '已访问', value: chartStatus.visited }
+                    ],
+                    progress: [
+                        { label: '低进度', value: chartProgress.low },
+                        { label: '中进度', value: chartProgress.mid },
+                        { label: '高进度', value: chartProgress.high }
+                    ],
+                    recentDays,
+                    completion: {
+                        total: cards.total,
+                        unfinished: cards.total - chartProgress.high,
+                        finished: chartProgress.high
+                    }
+                }
+            };
         },
 
         // --- localStorage 备份恢复 ---
@@ -1678,7 +1735,7 @@
                 el.type = 'button';
                 el.innerText = '脚本设置';
                 el.title = '打开 Bilibili 观看历史记录设置与历史管理';
-                el.addEventListener('click', () => UIComponent.showManagerPanel({ activeTab: 'history' }));
+                el.addEventListener('click', () => UIComponent.showManagerPanel({ activeTab: 'settings' }));
                 document.body.appendChild(el);
             }
         },
@@ -1777,7 +1834,7 @@
             const old = document.getElementById('bvh-modal-mask');
             if (old) old.remove();
 
-            const activeTab = options.activeTab || 'history';
+            const activeTab = options.activeTab || 'settings';
             const mask = document.createElement('div');
             mask.id = 'bvh-modal-mask';
             mask.className = 'bvh-modal-mask';
@@ -1806,8 +1863,10 @@
                 status: 'all',
                 sort: 'savedAt-desc',
                 page: 1,
-                pageSize: 50,
+                pageSize: 20,
                 selected: new Set(),
+                statsRange: 30,
+                _dataReady: false,
                 _cachedRows: null
             };
 
@@ -1878,8 +1937,49 @@
                 return rows;
             };
 
-            const renderHistory = () => {
+            const renderHistoryShell = () => {
                 const pane = mask.querySelector('[data-pane="history"]');
+                const existingToolbar = pane.querySelector('.bvh-history-toolbar');
+                if (!existingToolbar) {
+                    pane.innerHTML = `
+                        <div class="bvh-history-toolbar">
+                            <div class="bvh-actions bvh-actions-search">
+                                <input class="bvh-search" data-action="search" placeholder="搜索标题 / BV / av" value="${Utils.escapeHTML(state.query)}">
+                                <button class="bvh-btn" data-action="clear-search" title="清空搜索">✕</button>
+                            </div>
+                            <div class="bvh-actions bvh-actions-bar">
+                                <select data-action="status-filter">
+                                    <option value="all" ${state.status === 'all' ? 'selected' : ''}>全部状态</option>
+                                    <option value="${RECORD_STATUS.WATCHED}" ${state.status === RECORD_STATUS.WATCHED ? 'selected' : ''}>已观看</option>
+                                    <option value="${RECORD_STATUS.VISITED}" ${state.status === RECORD_STATUS.VISITED ? 'selected' : ''}>已访问</option>
+                                </select>
+                                <select data-action="sort">
+                                    <option value="savedAt-desc" ${state.sort === 'savedAt-desc' ? 'selected' : ''}>最近优先</option>
+                                    <option value="savedAt-asc" ${state.sort === 'savedAt-asc' ? 'selected' : ''}>最早优先</option>
+                                    <option value="percent-desc" ${state.sort === 'percent-desc' ? 'selected' : ''}>进度高优先</option>
+                                    <option value="percent-asc" ${state.sort === 'percent-asc' ? 'selected' : ''}>进度低优先</option>
+                                    <option value="title-asc" ${state.sort === 'title-asc' ? 'selected' : ''}>标题排序</option>
+                                </select>
+                                <span class="bvh-actions-spacer"></span>
+                                <button class="bvh-btn" data-action="export">导出</button>
+                                <button class="bvh-btn" data-action="import">导入</button>
+                                <button class="bvh-btn danger" data-action="delete-selected">删除选中</button>
+                            </div>
+                        </div>
+                        <div class="bvh-history-results"></div>`;
+                } else {
+                    existingToolbar.querySelector('[data-action="status-filter"]').value = state.status;
+                    existingToolbar.querySelector('[data-action="sort"]').value = state.sort;
+                    const searchInput = existingToolbar.querySelector('[data-action="search"]');
+                    if (searchInput && searchInput !== document.activeElement) {
+                        searchInput.value = state.query;
+                    }
+                }
+            };
+
+            const renderHistoryResults = () => {
+                const resultsContainer = mask.querySelector('.bvh-history-results');
+                if (!resultsContainer) return;
                 const rows = getFilteredRows();
                 const pageCount = Math.max(1, Math.ceil(rows.length / state.pageSize));
                 if (state.page > pageCount) state.page = pageCount;
@@ -1888,28 +1988,14 @@
                 const visibleRows = rows.slice(start, start + state.pageSize);
                 const displayStart = rows.length ? start + 1 : 0;
                 const displayEnd = start + visibleRows.length;
-                pane.innerHTML = `
-                    <div class="bvh-actions">
-                        <input class="bvh-search" data-action="search" placeholder="搜索标题 / BV / av" value="${Utils.escapeHTML(state.query)}">
-                        <select data-action="status-filter">
-                            <option value="all" ${state.status === 'all' ? 'selected' : ''}>全部状态</option>
-                            <option value="${RECORD_STATUS.WATCHED}" ${state.status === RECORD_STATUS.WATCHED ? 'selected' : ''}>已观看</option>
-                            <option value="${RECORD_STATUS.VISITED}" ${state.status === RECORD_STATUS.VISITED ? 'selected' : ''}>已访问</option>
-                        </select>
-                        <select data-action="sort">
-                            <option value="savedAt-desc" ${state.sort === 'savedAt-desc' ? 'selected' : ''}>最近优先</option>
-                            <option value="savedAt-asc" ${state.sort === 'savedAt-asc' ? 'selected' : ''}>最早优先</option>
-                            <option value="percent-desc" ${state.sort === 'percent-desc' ? 'selected' : ''}>进度高优先</option>
-                            <option value="percent-asc" ${state.sort === 'percent-asc' ? 'selected' : ''}>进度低优先</option>
-                            <option value="title-asc" ${state.sort === 'title-asc' ? 'selected' : ''}>标题排序</option>
-                        </select>
-                        <button class="bvh-btn" data-action="export">导出</button>
-                        <button class="bvh-btn" data-action="import">导入</button>
-                        <button class="bvh-btn danger" data-action="delete-selected">删除选中</button>
-                    </div>
+                const pageKeys = visibleRows.map(({ key }) => key);
+                const selectedOnPage = pageKeys.filter(key => state.selected.has(key)).length;
+                const allSelected = pageKeys.length > 0 && selectedOnPage === pageKeys.length;
+                const partialSelected = selectedOnPage > 0 && !allSelected;
+                resultsContainer.innerHTML = `
                     <p class="bvh-history-summary">共 ${rows.length} 条，当前显示 ${displayStart}-${displayEnd} 条</p>
                     <table class="bvh-table">
-                        <thead><tr><th><input type="checkbox" data-action="select-all"></th><th>标题</th><th>Key</th><th>状态</th><th>进度</th><th>时间</th><th>操作</th></tr></thead>
+                        <thead><tr><th><input type="checkbox" data-action="select-all" ${allSelected ? 'checked' : ''}></th><th>标题</th><th>Key</th><th>状态</th><th>进度</th><th>时间</th><th>操作</th></tr></thead>
                         <tbody>${visibleRows.map(({ key, record }) => `
                             <tr>
                                 <td><input type="checkbox" data-key="${Utils.escapeHTML(key)}" ${state.selected.has(key) ? 'checked' : ''}></td>
@@ -1921,6 +2007,7 @@
                                 <td><button class="bvh-btn danger" data-action="delete-one" data-key="${Utils.escapeHTML(key)}">删除</button></td>
                             </tr>`).join('')}</tbody>
                     </table>
+                    ${rows.length === 0 && state.query ? '<p class="bvh-chart-empty">没有找到匹配的历史记录</p>' : ''}
                     <div class="bvh-pagination">
                         <button class="bvh-btn" data-action="page-first" ${state.page <= 1 ? 'disabled' : ''}>首页</button>
                         <button class="bvh-btn" data-action="page-prev" ${state.page <= 1 ? 'disabled' : ''}>上一页</button>
@@ -1929,16 +2016,94 @@
                         <button class="bvh-btn" data-action="page-last" ${state.page >= pageCount ? 'disabled' : ''}>末页</button>
                         <span>每页</span>
                         <select data-action="page-size">
+                            <option value="20" ${state.pageSize === 20 ? 'selected' : ''}>20</option>
                             <option value="30" ${state.pageSize === 30 ? 'selected' : ''}>30</option>
                             <option value="50" ${state.pageSize === 50 ? 'selected' : ''}>50</option>
                             <option value="100" ${state.pageSize === 100 ? 'selected' : ''}>100</option>
                         </select>
                     </div>`;
+                if (partialSelected) {
+                    const selectAllCb = resultsContainer.querySelector('[data-action="select-all"]');
+                    if (selectAllCb) selectAllCb.indeterminate = true;
+                }
+            };
+
+            const renderHistory = () => {
+                renderHistoryShell();
+                if (!state._dataReady) {
+                    const resultsContainer = mask.querySelector('.bvh-history-results');
+                    if (resultsContainer) {
+                        resultsContainer.innerHTML = '<p class="bvh-history-loading">加载中...</p>';
+                    }
+                }
+                setTimeout(() => {
+                    state._cachedRows = null;
+                    state._dataReady = true;
+                    renderHistoryResults();
+                }, 0);
+            };
+
+            const renderMiniBarChart = (items) => {
+                const max = Math.max(1, ...items.map(item => item.value));
+                if (!items.some(item => item.value > 0)) {
+                    return '<div class="bvh-chart-empty">暂无数据</div>';
+                }
+                return items.map(item => {
+                    const percent = Math.round((item.value / max) * 100);
+                    const fillColor = item.color || '#00aeec';
+                    return `
+                        <div class="bvh-chart-row">
+                            <span class="bvh-chart-label">${Utils.escapeHTML(item.label)}</span>
+                            <div class="bvh-chart-bar-track">
+                                <div class="bvh-chart-bar-fill" style="width:${percent}%;background:${fillColor}"></div>
+                            </div>
+                            <strong class="bvh-chart-value">${item.value}</strong>
+                        </div>`;
+                }).join('');
+            };
+
+            const renderDailySvgChart = (items) => {
+                if (!items.length || !items.some(item => item.value > 0)) {
+                    return '<div class="bvh-chart-empty">暂无数据</div>';
+                }
+                const max = Math.max(1, ...items.map(item => item.value));
+                const chartHeight = 120;
+                const paddingX = 10;
+                const paddingTop = 16;
+                const paddingBottom = 30;
+                const barAreaWidth = items.length * 24;
+                const totalWidth = barAreaWidth + paddingX * 2;
+                const totalHeight = chartHeight + paddingTop + paddingBottom;
+                const barBottom = chartHeight + paddingTop;
+                const gap = barAreaWidth / items.length;
+                const barWidth = Math.max(4, Math.min(20, gap - 4));
+                const labelStep = Math.max(1, Math.ceil(items.length / 7));
+                return `
+                    <svg viewBox="0 0 ${totalWidth} ${totalHeight}" class="bvh-svg-chart" aria-label="近期记录趋势图">
+                        ${items.map((item, i) => {
+                            const h = Math.max(0.5, max > 0 ? (item.value / max) * chartHeight : 0);
+                            const x = paddingX + i * gap + (gap - barWidth) / 2;
+                            const barY = barBottom - h;
+                            return [
+                                `<rect x="${x.toFixed(1)}" y="${barY.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${h.toFixed(1)}" fill="#00aeec" rx="2"><title>${item.date}: ${item.value} 条</title></rect>`,
+                                item.value > 0 ? `<text x="${(x + barWidth / 2).toFixed(1)}" y="${(barY - 3).toFixed(1)}" text-anchor="middle" font-size="9" fill="#61666d" font-weight="600">${item.value}</text>` : ''
+                            ].join('');
+                        }).join('')}
+                        ${items.map((item, i) => {
+                            if (i % labelStep !== 0 && i !== items.length - 1) return '';
+                            const x = paddingX + i * gap + gap / 2;
+                            return `<text x="${x.toFixed(1)}" y="${barBottom + 18}" text-anchor="middle" font-size="10" fill="#9499a0">${item.date}</text>`;
+                        }).join('')}
+                    </svg>`;
             };
 
             const renderStats = () => {
-                const stats = StorageManager.getStats();
+                const bundle = StorageManager.getStatsBundle(state.statsRange);
+                const stats = bundle.cards;
+                const chartData = bundle.charts;
                 const pane = mask.querySelector('[data-pane="stats"]');
+                const completionPercent = chartData.completion.total > 0 ? Math.round((chartData.completion.finished / chartData.completion.total) * 100) : 0;
+
                 pane.innerHTML = `
                     <div class="bvh-stats">
                         <div class="bvh-stat">总记录<strong>${stats.total}</strong></div>
@@ -1950,7 +2115,50 @@
                         <div class="bvh-stat">高进度<strong>${stats.high}</strong></div>
                         <div class="bvh-stat">未看完<strong>${stats.unfinished}</strong></div>
                     </div>
-                    <div class="bvh-actions"><button class="bvh-btn primary" data-action="show-unfinished">查看未看完</button></div>`;
+                    <div class="bvh-chart-toolbar">
+                        <select data-action="stats-range">
+                            <option value="7" ${state.statsRange === 7 ? 'selected' : ''}>近 7 天</option>
+                            <option value="30" ${state.statsRange === 30 ? 'selected' : ''}>近 30 天</option>
+                            <option value="90" ${state.statsRange === 90 ? 'selected' : ''}>近 90 天</option>
+                        </select>
+                    </div>
+                    <div class="bvh-chart-grid">
+                        <div class="bvh-chart-card">
+                            <p class="bvh-chart-title">观看完成度</p>
+                            <div class="bvh-completion-ring">
+                                <svg viewBox="0 0 120 120" class="bvh-ring-svg">
+                                    <circle cx="60" cy="60" r="50" fill="none" stroke="#edf0f2" stroke-width="10"/>
+                                    <circle cx="60" cy="60" r="50" fill="none" stroke="#00aeec" stroke-width="10"
+                                        stroke-dasharray="${completionPercent * 3.14} 314" stroke-linecap="round"
+                                        transform="rotate(-90 60 60)"/>
+                                </svg>
+                                <div class="bvh-ring-text">
+                                    <strong>${completionPercent}%</strong>
+                                    <span>高进度 / 总数量</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="bvh-chart-card">
+                            <p class="bvh-chart-title">观看状态分布</p>
+                            ${renderMiniBarChart([
+                                { label: '已观看', value: chartData.status[0].value, color: '#4CAF50' },
+                                { label: '已访问', value: chartData.status[1].value, color: '#9E9E9E' }
+                            ])}
+                        </div>
+                        <div class="bvh-chart-card">
+                            <p class="bvh-chart-title">观看进度分布</p>
+                            ${renderMiniBarChart([
+                                { label: '低进度', value: chartData.progress[0].value, color: '#FF9800' },
+                                { label: '中进度', value: chartData.progress[1].value, color: '#4285F4' },
+                                { label: '高进度', value: chartData.progress[2].value, color: '#4CAF50' }
+                            ])}
+                        </div>
+                        <div class="bvh-chart-card bvh-chart-card-wide">
+                            <p class="bvh-chart-title">近期记录趋势 (${state.statsRange} 天)</p>
+                            <div class="bvh-chart-scroll">${renderDailySvgChart(chartData.recentDays)}</div>
+                        </div>
+                    </div>
+`;
             };
 
             const render = () => {
@@ -2027,19 +2235,19 @@
                 }
                 if (target.dataset.action === 'page-first') {
                     state.page = 1;
-                    render();
+                    renderHistoryResults();
                 }
                 if (target.dataset.action === 'page-prev') {
                     state.page = Math.max(1, state.page - 1);
-                    render();
+                    renderHistoryResults();
                 }
                 if (target.dataset.action === 'page-next') {
                     state.page++;
-                    render();
+                    renderHistoryResults();
                 }
                 if (target.dataset.action === 'page-last') {
                     state.page = Math.max(1, Math.ceil(getFilteredRows().length / state.pageSize));
-                    render();
+                    renderHistoryResults();
                 }
                 if (target.dataset.action === 'save-settings') {
                     const patch = {};
@@ -2095,14 +2303,15 @@
                     const rows = getFilteredRows().slice(start, start + state.pageSize);
                     if (target.checked) rows.forEach(({ key }) => state.selected.add(key));
                     else rows.forEach(({ key }) => state.selected.delete(key));
-                    render();
+                    renderHistoryResults();
                 }
-                if (target.dataset.action === 'show-unfinished') {
-                    state.tab = 'history';
-                    state.status = RECORD_STATUS.WATCHED;
-                    state.sort = 'percent-asc';
+                if (target.dataset.action === 'clear-search') {
+                    state.query = '';
                     state.page = 1;
-                    render();
+                    state._cachedRows = null;
+                    const searchInput = mask.querySelector('[data-action="search"]');
+                    if (searchInput) searchInput.value = '';
+                    renderHistoryResults();
                 }
             });
 
@@ -2111,17 +2320,23 @@
                 if (target.dataset.action === 'status-filter') {
                     state.status = target.value;
                     state.page = 1;
-                    render();
+                    state._cachedRows = null;
+                    renderHistoryResults();
                 }
                 if (target.dataset.action === 'sort') {
                     state.sort = target.value;
                     state.page = 1;
-                    render();
+                    state._cachedRows = null;
+                    renderHistoryResults();
                 }
                 if (target.dataset.action === 'page-size') {
                     state.pageSize = parseInt(target.value, 10) || 50;
                     state.page = 1;
-                    render();
+                    renderHistoryResults();
+                }
+                if (target.dataset.action === 'stats-range') {
+                    state.statsRange = parseInt(target.value, 10) || 30;
+                    renderStats();
                 }
                 if (target.dataset.key) {
                     if (target.checked) state.selected.add(target.dataset.key);
@@ -2129,21 +2344,23 @@
                 }
             });
 
+            const updateSearchResults = Utils.debounce((value) => {
+                state.query = value;
+                state.page = 1;
+                state._cachedRows = null;
+                renderHistoryResults();
+            }, 300);
+
             mask.addEventListener('input', (e) => {
                 const target = e.target;
                 if (target.dataset.setting === 'tagOpacity') {
                     syncOpacityControls(target.value);
+                    return;
+                }
+                if (target.dataset.action === 'search') {
+                    updateSearchResults(target.value);
                 }
             });
-
-            mask.addEventListener('input', Utils.debounce((e) => {
-                const target = e.target;
-                if (target.dataset.action === 'search') {
-                    state.query = target.value;
-                    state.page = 1;
-                    render();
-                }
-            }, 200));
 
             render();
         }
@@ -3374,7 +3591,7 @@
             Utils.log('AppController.initMenuCommands');
 
             GM_registerMenuCommand('打开设置与历史管理', () => {
-                UIComponent.showManagerPanel({ activeTab: 'history' });
+                UIComponent.showManagerPanel({ activeTab: 'settings' });
             });
 
             GM_registerMenuCommand('导出历史记录', () => {
