@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.2.3
+// @version      3.2.4
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。优化设置页默认入口、历史搜索体验，并增强统计图表。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -179,7 +179,7 @@
         if (stylesInjected) return;
         try {
             GM_addStyle(`
-        .bvh-tag { position: absolute; margin: .5em!important; padding: 0 5px!important; height: 20px; line-height: 20px; border-radius: 4px; color: #fff; font-style: normal; font-size: 12px; background-color: rgba(122, 134, 234, 0.7); z-index: 108; pointer-events: none; }
+        .bvh-tag { position: absolute; margin: .5em!important; padding: 0 5px!important; height: 20px; line-height: 20px; border-radius: 4px; color: #fff; font-style: normal; font-size: 12px; white-space: nowrap; background-color: rgba(122, 134, 234, 0.7); z-index: 108; pointer-events: none; }
         .bvh-tag-visited { background-color: rgba(158, 158, 158, 0.9) !important; }
         .bvh-tag-low { background-color: rgba(255, 152, 0, 0.9) !important; }
         .bvh-tag-mid { background-color: rgba(66, 133, 244, 0.9) !important; }
@@ -3356,7 +3356,7 @@
             }
 
             let img = headerPopoverCover
-                ? (headerPopoverCover.querySelector('picture') || headerPopoverCover.querySelector('img'))
+                ? (headerPopoverCover.querySelector('img') || headerPopoverCover.querySelector('picture'))
                 : (el.querySelector('img') || el.querySelector('picture'));
             let isSmall = false;
 
