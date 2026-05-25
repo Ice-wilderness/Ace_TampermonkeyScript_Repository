@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.2.4
-// @description  记录并提示Bilibili已观看或已访问但未观看视频记录。优化设置页默认入口、历史搜索体验，并增强统计图表。
+// @version      3.3.0
+// @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、保留周期清理和批量删除进度提示。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -196,11 +196,15 @@
         .bpx-player-ctrl-eplist-multi-menu-item .bpx-player-ctrl-eplist-multi-menu-item-text { display: block; padding-right: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .bpx-player-ctrl-eplist-multi-menu-item .bvh-episode-tag { position: absolute; right: 10px; top: 50%; margin-left: 0; transform: translateY(-50%); }
         .bvh-progress-bar { background: linear-gradient(90deg, rgba(122, 134, 234, 0.9), rgba(156, 166, 255, 0.7)); z-index: 108; position: absolute; height: 4px; bottom: 0px; border-bottom-left-radius: inherit; border-bottom-right-radius: inherit; pointer-events: none; }
-        .bvh-toast-container { position: fixed; bottom: 20px; left: 20px; z-index: 99999; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
-        .bvh-toast { background-color: #333; color: #fff; padding: 10px 20px; border-radius: 4px; font-size: 14px; opacity: 0; transition: opacity 0.3s; box-shadow: 0 2px 8px rgba(0,0,0,0.2); pointer-events: auto; }
+        .bvh-toast-container { position: fixed; top: 24px; left: 50%; transform: translateX(-50%); z-index: 100010; display: flex; flex-direction: column; align-items: center; gap: 10px; width: min(420px, calc(100vw - 32px)); pointer-events: none; }
+        .bvh-toast { max-width: 100%; min-width: 220px; background-color: #333; color: #fff; padding: 10px 20px; border-radius: 4px; font-size: 14px; text-align: center; opacity: 0; transition: opacity 0.3s; box-shadow: 0 2px 8px rgba(0,0,0,0.2); pointer-events: auto; }
         .bvh-toast.show { opacity: 1; }
         .bvh-toast.success { border-left: 4px solid #4CAF50; }
         .bvh-toast.error { border-left: 4px solid #F44336; }
+        .bvh-progress-toast { width: min(360px, calc(100vw - 48px)); text-align: left; }
+        .bvh-toast-progress-text { margin-bottom: 8px; font-weight: 700; }
+        .bvh-toast-progress-track { height: 8px; border-radius: 999px; background: rgba(255,255,255,.28); overflow: hidden; }
+        .bvh-toast-progress-fill { width: 0; height: 100%; border-radius: 999px; background: #00aeec; transition: width .18s ease; }
         .bvh-view-panel { position: fixed; text-align: center; border-left: 6px solid #2196F3; background-color: #aeffff; font-family: 'Segoe UI', sans-serif; font-weight: 600; padding: 5px; z-index: 9999; cursor: move; color: #000; box-shadow: 0 2px 8px rgba(0,0,0,0.2); border-radius: 0 4px 4px 0; user-select: none; }
         .bvh-quick-entry { position: fixed; left: 15px; bottom: 15px; z-index: 9998; border: 1px solid #00aeec; background: #fff; color: #00aeec; border-radius: 6px; padding: 7px 10px; cursor: pointer; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,.16); }
         .bvh-modal-mask { position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,.42); display: flex; align-items: center; justify-content: center; }
@@ -229,6 +233,10 @@
         .bvh-actions-search .bvh-search { flex: 1; min-width: 0; }
         .bvh-actions-bar { margin-top: 0; }
         .bvh-actions-spacer { flex: 1; }
+        .bvh-retention-cleanup { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+        .bvh-retention-cleanup input, .bvh-retention-cleanup select { border: 1px solid #d0d7de; border-radius: 7px; padding: 8px 10px; background: #fff; color: #18191c; font-size: 14px; }
+        .bvh-retention-cleanup input { width: 72px; min-width: 72px; }
+        .bvh-retention-label { color: #61666d; font-size: 13px; font-weight: 700; }
         .bvh-history-loading { text-align: center; color: #9499a0; font-size: 14px; padding: 40px 0; }
         .bvh-btn { border: 1px solid #d0d7de; background: #fff; color: #18191c; border-radius: 7px; padding: 8px 13px; cursor: pointer; font-weight: 700; }
         .bvh-btn.primary { background: #00aeec; border-color: #00aeec; color: #fff; }
@@ -1196,6 +1204,177 @@
             Utils.logSlow('StorageManager.deleteRecord', start, `key=${id} shard=${shardId} notify=${notify}`, 30);
         },
 
+        saveRecords: (records, notify = true) => {
+            const start = performance.now();
+            const touchedShards = new Set();
+            let count = 0;
+
+            (Array.isArray(records) ? records : []).forEach(({ key, record }) => {
+                if (!key || !record) return;
+                const id = VideoKey.normalize(key) || key;
+                if (!id) return;
+                const shardId = StorageManager._getShardId(id);
+                const shard = StorageManager._loadShard(shardId);
+                shard.data[id] = StorageManager._compact(record);
+                shard.dirty = true;
+                StorageManager._indexKey(id, shardId);
+                touchedShards.add(shardId);
+                count++;
+            });
+
+            if (count === 0) return 0;
+
+            for (const shardId of touchedShards) {
+                StorageManager._flushShard(shardId);
+            }
+            StorageManager._allKeysCache = null;
+            StorageManager._incrementRevision();
+            StorageManager._persistBaseIndex();
+            if (notify) StorageManager._notifyChange();
+            Utils.logSlow('StorageManager.saveRecords', start, `records=${count} shards=${touchedShards.size} notify=${notify}`, 80);
+            return count;
+        },
+
+        deleteRecords: (ids, notify = true) => {
+            const start = performance.now();
+            const normalizedIds = Array.from(new Set((Array.isArray(ids) ? ids : [])
+                .map(id => VideoKey.normalize(id) || id)
+                .filter(Boolean)));
+            const touched = new Map();
+            let count = 0;
+
+            normalizedIds.forEach(id => {
+                const shardId = StorageManager._getShardId(id);
+                const shard = StorageManager._loadShard(shardId);
+                if (!Object.prototype.hasOwnProperty.call(shard.data, id)) return;
+                const base = VideoKey.base(id);
+                delete shard.data[id];
+                shard.dirty = true;
+                StorageManager._removeFromIndex(id);
+                if (!touched.has(shardId)) touched.set(shardId, new Set());
+                if (base) touched.get(shardId).add(base);
+                count++;
+            });
+
+            if (count === 0) return 0;
+
+            touched.forEach((bases, shardId) => {
+                const shard = StorageManager._loadShard(shardId);
+                StorageManager._flushShard(shardId);
+                if (bases.size === 0) return;
+                const remainingBases = new Set();
+                Object.keys(shard.data).forEach(key => {
+                    const base = VideoKey.base(key);
+                    if (base) remainingBases.add(base);
+                });
+                bases.forEach(base => {
+                    if (remainingBases.has(base)) return;
+                    const shardSet = StorageManager._shardForBase.get(base);
+                    if (!shardSet) return;
+                    shardSet.delete(shardId);
+                    if (shardSet.size === 0) {
+                        StorageManager._shardForBase.delete(base);
+                    }
+                });
+            });
+
+            StorageManager._allKeysCache = null;
+            StorageManager._incrementRevision();
+            StorageManager._persistBaseIndex();
+            if (notify) StorageManager._notifyChange();
+            Utils.logSlow('StorageManager.deleteRecords', start, `records=${count} shards=${touched.size} notify=${notify}`, 80);
+            return count;
+        },
+
+        deleteRecordsWithProgress: (ids, onProgress, notify = true) => {
+            const start = performance.now();
+            const normalizedIds = Array.from(new Set((Array.isArray(ids) ? ids : [])
+                .map(id => VideoKey.normalize(id) || id)
+                .filter(Boolean)));
+            const byShard = new Map();
+            normalizedIds.forEach(id => {
+                const shardId = StorageManager._getShardId(id);
+                if (!byShard.has(shardId)) byShard.set(shardId, []);
+                byShard.get(shardId).push(id);
+            });
+            const shards = Array.from(byShard.entries());
+            const total = normalizedIds.length;
+            let processed = 0;
+            let count = 0;
+
+            const report = (doneShards) => {
+                if (typeof onProgress === 'function') {
+                    onProgress({
+                        processed,
+                        total,
+                        deleted: count,
+                        shardsDone: doneShards,
+                        shardsTotal: shards.length
+                    });
+                }
+            };
+
+            return new Promise(resolve => {
+                const finish = () => {
+                    if (count > 0) {
+                        StorageManager._allKeysCache = null;
+                        StorageManager._incrementRevision();
+                        StorageManager._persistBaseIndex();
+                        if (notify) StorageManager._notifyChange();
+                    }
+                    report(shards.length);
+                    Utils.logSlow('StorageManager.deleteRecordsWithProgress', start, `records=${count} shards=${shards.length} notify=${notify}`, 80);
+                    resolve(count);
+                };
+
+                const step = (index) => {
+                    if (index >= shards.length) {
+                        finish();
+                        return;
+                    }
+
+                    const [shardId, shardIds] = shards[index];
+                    const shard = StorageManager._loadShard(shardId);
+                    const bases = new Set();
+
+                    shardIds.forEach(id => {
+                        if (!Object.prototype.hasOwnProperty.call(shard.data, id)) return;
+                        const base = VideoKey.base(id);
+                        delete shard.data[id];
+                        shard.dirty = true;
+                        StorageManager._removeFromIndex(id);
+                        if (base) bases.add(base);
+                        count++;
+                    });
+
+                    if (bases.size > 0) {
+                        StorageManager._flushShard(shardId);
+                        const remainingBases = new Set();
+                        Object.keys(shard.data).forEach(key => {
+                            const base = VideoKey.base(key);
+                            if (base) remainingBases.add(base);
+                        });
+                        bases.forEach(base => {
+                            if (remainingBases.has(base)) return;
+                            const shardSet = StorageManager._shardForBase.get(base);
+                            if (!shardSet) return;
+                            shardSet.delete(shardId);
+                            if (shardSet.size === 0) {
+                                StorageManager._shardForBase.delete(base);
+                            }
+                        });
+                    }
+
+                    processed += shardIds.length;
+                    report(index + 1);
+                    setTimeout(() => step(index + 1), 0);
+                };
+
+                report(0);
+                step(0);
+            });
+        },
+
         // 批量导入：defer flush / revision / index persist，最后一次性提交
         importRecords: (data) => {
             const start = performance.now();
@@ -1597,6 +1776,46 @@
                 setTimeout(() => el.remove(), 300);
             });
         },
+        progressToast: (msg) => {
+            UIComponent.initToastContainer();
+            const el = document.createElement('div');
+            el.className = 'bvh-toast success bvh-progress-toast';
+
+            const text = document.createElement('div');
+            text.className = 'bvh-toast-progress-text';
+            text.innerText = msg;
+
+            const track = document.createElement('div');
+            track.className = 'bvh-toast-progress-track';
+            const fill = document.createElement('div');
+            fill.className = 'bvh-toast-progress-fill';
+            track.appendChild(fill);
+
+            el.appendChild(text);
+            el.appendChild(track);
+            UIComponent.toastContainer.appendChild(el);
+            setTimeout(() => el.classList.add('show'), 10);
+
+            const close = (message, type = 'success', duration = 2500) => {
+                text.innerText = message;
+                fill.style.width = '100%';
+                el.classList.toggle('error', type === 'error');
+                el.classList.toggle('success', type !== 'error');
+                setTimeout(() => {
+                    el.classList.remove('show');
+                    setTimeout(() => el.remove(), 300);
+                }, duration);
+            };
+
+            return {
+                update: (percent, message) => {
+                    const safePercent = Math.max(0, Math.min(100, Math.round(percent) || 0));
+                    fill.style.width = `${safePercent}%`;
+                    if (message) text.innerText = message;
+                },
+                close
+            };
+        },
         createTag: (text, title, className = 'bvh-tag') => {
             const el = document.createElement('div');
             el.className = className;
@@ -1961,6 +2180,16 @@
                                     <option value="title-asc" ${state.sort === 'title-asc' ? 'selected' : ''}>标题排序</option>
                                 </select>
                                 <span class="bvh-actions-spacer"></span>
+                                <div class="bvh-retention-cleanup">
+                                    <span class="bvh-retention-label">保留</span>
+                                    <input type="text" inputmode="numeric" pattern="[0-9]*" data-action="retention-value" placeholder="N" aria-label="保留数量">
+                                    <select data-action="retention-unit" aria-label="保留单位">
+                                        <option value="days">天</option>
+                                        <option value="months">月</option>
+                                        <option value="years">年</option>
+                                    </select>
+                                    <button class="bvh-btn danger" data-action="cleanup-retention">清理久远记录</button>
+                                </div>
                                 <button class="bvh-btn" data-action="export">导出</button>
                                 <button class="bvh-btn" data-action="import">导入</button>
                                 <button class="bvh-btn danger" data-action="delete-selected">删除选中</button>
@@ -2209,21 +2438,113 @@
                 input.click();
             };
 
+            const formatDateTime = (date) => {
+                const pad = n => String(n).padStart(2, '0');
+                return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+            };
+
+            const getRetentionCutoff = (amount, unit) => {
+                const cutoff = new Date();
+                if (unit === 'months') cutoff.setMonth(cutoff.getMonth() - amount);
+                else if (unit === 'years') cutoff.setFullYear(cutoff.getFullYear() - amount);
+                else cutoff.setDate(cutoff.getDate() - amount);
+                return cutoff;
+            };
+
+            const getRetentionCleanupRequest = () => {
+                const amountInput = mask.querySelector('[data-action="retention-value"]');
+                const unitInput = mask.querySelector('[data-action="retention-unit"]');
+                const rawAmount = (amountInput?.value || '').trim();
+                if (!/^[0-9]+$/.test(rawAmount) || parseInt(rawAmount, 10) < 1) {
+                    UIComponent.toast('保留数量必须为正整数数字', 'error', 2500);
+                    if (amountInput) amountInput.focus();
+                    return null;
+                }
+                const unit = unitInput?.value || 'days';
+                return { amount: parseInt(rawAmount, 10), unit };
+            };
+
+            const getRetentionCandidates = (cutoff) => {
+                const cutoffTime = cutoff.getTime();
+                return StorageManager.getAllRecords()
+                    .filter(({ record }) => {
+                        const savedTime = record?.savedAt ? new Date(record.savedAt).getTime() : NaN;
+                        return Number.isFinite(savedTime) && savedTime < cutoffTime;
+                    })
+                    .map(({ key }) => key);
+            };
+
             const deleteRecords = (keys) => {
                 const backups = keys.map(key => ({ key, record: StorageManager.getRecord(key) })).filter(item => item.record);
                 if (backups.length === 0) {
                     UIComponent.toast('没有可删除的记录', 'error', 2000);
                     return;
                 }
-                backups.forEach(({ key }) => StorageManager.deleteRecord(key, false));
-                StorageManager._notifyChange();
-                UIComponent.toastUndo(`已删除 ${backups.length} 条记录，点击撤销`, 5000, () => {
-                    backups.forEach(({ key, record }) => StorageManager.saveRecord(key, record, false));
+
+                const runDelete = async () => {
+                    const keysToDelete = backups.map(({ key }) => key);
+                    const progress = backups.length > 1
+                        ? UIComponent.progressToast(`准备删除 ${backups.length} 条记录...`)
+                        : null;
+                    const deletedCount = progress
+                        ? await StorageManager.deleteRecordsWithProgress(keysToDelete, ({ processed, total, deleted, shardsDone, shardsTotal }) => {
+                            const percent = total > 0 ? (processed / total) * 100 : 100;
+                            progress.update(percent, `正在删除 ${processed}/${total} 条记录（${shardsDone}/${shardsTotal} 分片，已删 ${deleted} 条）`);
+                        }, false)
+                        : StorageManager.deleteRecords(keysToDelete, false);
+                    if (deletedCount === 0) {
+                        if (progress) progress.close('没有可删除的记录', 'error', 2000);
+                        else UIComponent.toast('没有可删除的记录', 'error', 2000);
+                        return;
+                    }
                     StorageManager._notifyChange();
+                    if (progress) progress.close(`删除完成：${deletedCount} 条记录`, 'success', 1200);
+                    UIComponent.toastUndo(`已删除 ${deletedCount} 条记录，点击撤销`, 5000, () => {
+                        StorageManager.saveRecords(backups, false);
+                        StorageManager._notifyChange();
+                        render();
+                    });
+                    state.selected.clear();
                     render();
-                });
-                state.selected.clear();
-                render();
+                };
+
+                if (backups.length > 1) {
+                    setTimeout(runDelete, 30);
+                } else {
+                    runDelete();
+                }
+            };
+
+            const cleanupByRetention = () => {
+                const request = getRetentionCleanupRequest();
+                if (!request) return;
+
+                const unitLabels = { days: '天', months: '个月', years: '年' };
+                const cutoff = getRetentionCutoff(request.amount, request.unit);
+                const cutoffTime = cutoff.getTime();
+                if (!Number.isFinite(cutoffTime)) {
+                    UIComponent.toast('保留范围过大，无法计算清理时间', 'error', 2500);
+                    return;
+                }
+
+                const keys = getRetentionCandidates(cutoff);
+                const cutoffText = formatDateTime(cutoff);
+                if (keys.length === 0) {
+                    UIComponent.toast(`没有早于 ${cutoffText} 的历史记录需要删除`, 'success', 3000);
+                    return;
+                }
+
+                const periodText = `${request.amount}${unitLabels[request.unit] || '天'}`;
+                const confirmed = window.confirm([
+                    `将保留最近 ${periodText} 的历史记录。`,
+                    `删除范围：保存时间早于 ${cutoffText} 的记录。`,
+                    `预计删除：${keys.length} 条。`,
+                    '',
+                    '确认删除这些久远历史记录？'
+                ].join('\n'));
+                if (!confirmed) return;
+
+                deleteRecords(keys);
             };
 
             mask.addEventListener('click', (e) => {
@@ -2296,6 +2617,7 @@
                 }
                 if (target.dataset.action === 'export') exportHistory();
                 if (target.dataset.action === 'import') importHistory();
+                if (target.dataset.action === 'cleanup-retention') cleanupByRetention();
                 if (target.dataset.action === 'delete-one') deleteRecords([target.dataset.key]);
                 if (target.dataset.action === 'delete-selected') deleteRecords(Array.from(state.selected));
                 if (target.dataset.action === 'select-all') {
