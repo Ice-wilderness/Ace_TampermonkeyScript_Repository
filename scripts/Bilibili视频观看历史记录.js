@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.3.0
-// @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、保留周期清理和批量删除进度提示。
+// @version      3.4.0
+// @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -207,6 +207,9 @@
         .bvh-toast-progress-fill { width: 0; height: 100%; border-radius: 999px; background: #00aeec; transition: width .18s ease; }
         .bvh-view-panel { position: fixed; text-align: center; border-left: 6px solid #2196F3; background-color: #aeffff; font-family: 'Segoe UI', sans-serif; font-weight: 600; padding: 5px; z-index: 9999; cursor: move; color: #000; box-shadow: 0 2px 8px rgba(0,0,0,0.2); border-radius: 0 4px 4px 0; user-select: none; }
         .bvh-quick-entry { position: fixed; left: 15px; bottom: 15px; z-index: 9998; border: 1px solid #00aeec; background: #fff; color: #00aeec; border-radius: 6px; padding: 7px 10px; cursor: pointer; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,.16); }
+        .bvh-history-sync-float { position: fixed; right: 22px; bottom: 86px; z-index: 9998; border: 1px solid #00aeec; background: #00aeec; color: #fff; border-radius: 6px; padding: 9px 13px; cursor: pointer; font-weight: 800; font-size: 13px; line-height: 1.2; box-shadow: 0 4px 16px rgba(0,174,236,.28); transition: opacity .18s ease, transform .18s ease, background .18s ease; }
+        .bvh-history-sync-float:hover { background: #0097d8; transform: translateY(-1px); }
+        .bvh-history-sync-float.loading, .bvh-history-sync-float:disabled { opacity: .72; cursor: wait; transform: none; }
         .bvh-modal-mask { position: fixed; inset: 0; z-index: 100000; background: rgba(0,0,0,.42); display: flex; align-items: center; justify-content: center; }
         .bvh-modal { width: min(980px, calc(100vw - 28px)); max-height: min(760px, calc(100vh - 28px)); background: #fff; color: #18191c; border-radius: 10px; box-shadow: 0 18px 60px rgba(0,0,0,.28); display: flex; flex-direction: column; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
         .bvh-modal-header { display: flex; align-items: center; justify-content: space-between; padding: 18px 24px; border-bottom: 1px solid #edf0f2; background: #fff; }
@@ -2684,7 +2687,414 @@
                 }
             });
 
+            StorageManager.onDataChange(() => {
+                if (!document.contains(mask)) return;
+                state._cachedRows = null;
+                if (state.tab === 'history' && state._dataReady) renderHistoryResults();
+                if (state.tab === 'stats') renderStats();
+            });
+
             render();
+        }
+    };
+
+    const HistoryPageSync = {
+        _button: null,
+        _hasSynced: false,
+        _syncing: false,
+        _lastCardCount: 0,
+
+        isHistoryPage: () => {
+            if (location.hostname !== 'www.bilibili.com') return false;
+            return /^\/(?:history|account\/history)(?:\/|$)/.test(location.pathname);
+        },
+
+        refreshControl: () => {
+            if (!document.body) return;
+            if (!HistoryPageSync.isHistoryPage()) {
+                HistoryPageSync.removeButton();
+                HistoryPageSync._hasSynced = false;
+                HistoryPageSync._lastCardCount = 0;
+                return;
+            }
+            HistoryPageSync.ensureButton();
+        },
+
+        ensureButton: () => {
+            let button = document.getElementById('bvh-history-sync-float');
+            if (!button) {
+                button = document.createElement('button');
+                button.id = 'bvh-history-sync-float';
+                button.className = 'bvh-history-sync-float';
+                button.type = 'button';
+                button.addEventListener('click', () => HistoryPageSync.handleClick());
+                document.body.appendChild(button);
+            }
+            HistoryPageSync._button = button;
+            HistoryPageSync.updateButton();
+        },
+
+        removeButton: () => {
+            const button = document.getElementById('bvh-history-sync-float');
+            if (button) button.remove();
+            HistoryPageSync._button = null;
+            HistoryPageSync._syncing = false;
+        },
+
+        updateButton: (label, loading = false) => {
+            const button = HistoryPageSync._button || document.getElementById('bvh-history-sync-float');
+            if (!button) return;
+            button.innerText = label || (HistoryPageSync._hasSynced ? '继续同步历史' : '同步当前历史');
+            button.title = HistoryPageSync._hasSynced
+                ? '滚动到底部，等待加载更多 Bilibili 历史卡片后继续同步'
+                : '同步当前已加载的 Bilibili 历史卡片';
+            button.disabled = !!loading;
+            button.classList.toggle('loading', !!loading);
+        },
+
+        handleClick: async () => {
+            if (HistoryPageSync._syncing) return;
+            if (!HistoryPageSync.isHistoryPage()) {
+                UIComponent.toast('请先打开 Bilibili 历史记录页面再同步', 'error', 2500);
+                HistoryPageSync.refreshControl();
+                return;
+            }
+            await HistoryPageSync.runSync(HistoryPageSync._hasSynced);
+        },
+
+        runSync: async (continueMode = false) => {
+            HistoryPageSync._syncing = true;
+            const progress = UIComponent.progressToast(continueMode ? '准备继续同步历史...' : '正在同步当前历史...');
+            const beforeCount = HistoryPageSync.countCards();
+            try {
+                if (continueMode) {
+                    HistoryPageSync.updateButton('加载更多...', true);
+                    progress.update(10, `正在滚动到底部，当前已加载 ${beforeCount} 条...`);
+                    await HistoryPageSync.scrollAndWaitForMore(beforeCount, progress);
+                }
+
+                HistoryPageSync.updateButton('同步中...', true);
+                progress.update(continueMode ? 55 : 25, `正在解析 ${HistoryPageSync.countCards()} 条历史卡片...`);
+                const result = HistoryPageSync.syncLoadedCards();
+                result.beforeCardCount = beforeCount;
+                result.afterCardCount = HistoryPageSync.countCards();
+                result.newLoaded = Math.max(0, result.afterCardCount - beforeCount);
+
+                HistoryPageSync._hasSynced = true;
+                HistoryPageSync._lastCardCount = result.afterCardCount;
+                const message = HistoryPageSync.formatSummary(result, continueMode);
+                progress.close(message, 'success', 3200);
+            } catch (e) {
+                Utils.error('HistoryPageSync.runSync failed', e);
+                progress.close('同步失败，请稍后重试或查看调试日志', 'error', 3200);
+            } finally {
+                HistoryPageSync._syncing = false;
+                HistoryPageSync.updateButton();
+            }
+        },
+
+        countCards: () => document.querySelectorAll('.history-card').length,
+
+        scrollAndWaitForMore: (beforeCount, progress) => new Promise(resolve => {
+            const startedAt = Date.now();
+            let lastCount = beforeCount;
+            let lastHeight = HistoryPageSync.getPageHeight();
+            let stableSince = Date.now();
+
+            const tick = () => {
+                window.scrollTo({ top: HistoryPageSync.getPageHeight(), behavior: 'smooth' });
+                const count = HistoryPageSync.countCards();
+                const height = HistoryPageSync.getPageHeight();
+                if (count !== lastCount || height !== lastHeight) {
+                    lastCount = count;
+                    lastHeight = height;
+                    stableSince = Date.now();
+                }
+
+                const elapsed = Date.now() - startedAt;
+                const stableFor = Date.now() - stableSince;
+                const percent = Math.min(50, 12 + elapsed / 120);
+                progress.update(percent, `等待加载更多历史... 当前 ${count} 条`);
+
+                if ((elapsed >= 1200 && stableFor >= 900) || elapsed >= 6500) {
+                    resolve(count);
+                    return;
+                }
+                setTimeout(tick, 300);
+            };
+
+            setTimeout(tick, 120);
+        }),
+
+        getPageHeight: () => Math.max(
+            document.documentElement?.scrollHeight || 0,
+            document.body?.scrollHeight || 0
+        ),
+
+        syncLoadedCards: () => {
+            const result = {
+                scanned: 0,
+                candidates: 0,
+                created: 0,
+                updated: 0,
+                skipped: 0,
+                failed: 0,
+                saved: 0
+            };
+            const candidates = new Map();
+            const cards = Array.from(document.querySelectorAll('.history-card'));
+            result.scanned = cards.length;
+
+            cards.forEach(card => {
+                try {
+                    const parsed = HistoryPageSync.parseCard(card);
+                    if (!parsed) {
+                        result.skipped++;
+                        return;
+                    }
+                    const existing = candidates.get(parsed.key);
+                    if (existing && existing.percentNumber >= parsed.percentNumber) {
+                        result.skipped++;
+                        return;
+                    }
+                    if (existing) result.skipped++;
+                    candidates.set(parsed.key, parsed);
+                } catch (e) {
+                    result.failed++;
+                    Utils.warn('HistoryPageSync.parseCard failed', e);
+                }
+            });
+
+            result.candidates = candidates.size;
+            const writes = [];
+            candidates.forEach(candidate => {
+                const merge = HistoryPageSync.mergeCandidate(candidate);
+                if (merge.action === 'create') result.created++;
+                else if (merge.action === 'update') result.updated++;
+                else result.skipped++;
+                if (merge.record) writes.push({ key: candidate.key, record: merge.record });
+            });
+
+            if (writes.length > 0) {
+                result.saved = StorageManager.saveRecords(writes, false);
+                if (result.saved > 0) StorageManager._notifyChange();
+            }
+            return result;
+        },
+
+        mergeCandidate: (candidate) => {
+            const existing = StorageManager.getRecord(candidate.key);
+            const nextPercent = Math.max(0, Math.min(100, Math.round(candidate.percentNumber)));
+            if (!existing) {
+                return {
+                    action: 'create',
+                    record: {
+                        v: 3,
+                        status: RECORD_STATUS.WATCHED,
+                        currentTime: candidate.currentTime || '',
+                        percent: `${nextPercent}%`,
+                        savedAt: candidate.savedAt,
+                        title: candidate.title || ''
+                    }
+                };
+            }
+
+            const localPercent = parseInt(existing.percent, 10) || 0;
+            const diff = nextPercent - localPercent;
+            if (Math.abs(diff) <= 5 || diff <= 0) {
+                return { action: 'skip', record: null };
+            }
+
+            return {
+                action: 'update',
+                record: {
+                    v: 3,
+                    status: RECORD_STATUS.WATCHED,
+                    currentTime: candidate.currentTime || existing.currentTime || '',
+                    percent: `${nextPercent}%`,
+                    savedAt: candidate.savedAt,
+                    title: candidate.title || existing.title || ''
+                }
+            };
+        },
+
+        parseCard: (card) => {
+            if (!card) return null;
+            const key = HistoryPageSync.extractKey(card);
+            if (!key) return null;
+            const progress = HistoryPageSync.extractProgress(card);
+            if (!progress || !Number.isFinite(progress.percentNumber)) return null;
+            const rawWatchTime = HistoryPageSync.extractWatchTimeText(card);
+            const savedAt = HistoryPageSync.parseWatchTime(rawWatchTime);
+            if (!savedAt) return null;
+            return {
+                key,
+                title: HistoryPageSync.extractTitle(card),
+                percentNumber: Math.max(0, Math.min(100, Math.round(progress.percentNumber))),
+                currentTime: progress.currentTime || '',
+                savedAt,
+                rawWatchTime
+            };
+        },
+
+        extractKey: (card) => {
+            const link = card.querySelector('.bili-cover-card[href*="/video/"], a[href*="/video/"], a[href*="/v/"], a[href*="bvid="]');
+            const href = link?.href || link?.getAttribute?.('href') || '';
+            const hrefKey = VideoKey.fromUrl(href);
+            const attrKey = VideoKey.fromText(card.getAttribute('data-bsb-bvid') || '');
+            const base = VideoKey.base(hrefKey || attrKey);
+            if (!base) return '';
+
+            try {
+                const url = new URL(href, location.href);
+                const page = parseInt(url.searchParams.get('p'), 10);
+                if (page > 1) return VideoKey.withPage(base, page);
+            } catch (e) { }
+            return hrefKey || attrKey || base;
+        },
+
+        extractTitle: (card) => {
+            return (
+                card.querySelector('.bili-video-card__title a')?.textContent ||
+                card.querySelector('.bili-video-card__title')?.getAttribute('title') ||
+                card.querySelector('.bili-cover-card img')?.getAttribute('alt') ||
+                ''
+            ).trim();
+        },
+
+        extractWatchTimeText: (card) => {
+            return (card.querySelector('.bili-video-card__corner span')?.textContent || '').trim();
+        },
+
+        extractProgress: (card) => {
+            const statText = HistoryPageSync.collectTexts(card, '.bili-cover-card__stats span, .bili-cover-card__stat span').join(' ');
+            const timePair = statText.match(/(\d{1,2}:\d{2}(?::\d{2})?)\s*\/\s*(\d{1,2}:\d{2}(?::\d{2})?)/);
+            if (timePair) {
+                const currentSeconds = Utils.timeToSeconds(timePair[1]);
+                const totalSeconds = Utils.timeToSeconds(timePair[2]);
+                if (totalSeconds > 0 && currentSeconds >= 0) {
+                    return {
+                        percentNumber: (currentSeconds / totalSeconds) * 100,
+                        currentTime: HistoryPageSync.normalizeTimeText(timePair[1])
+                    };
+                }
+            }
+
+            if (/已看完/.test(statText)) {
+                return { percentNumber: 100, currentTime: '' };
+            }
+
+            const cssPercent = HistoryPageSync.extractProgressCssPercent(card);
+            if (Number.isFinite(cssPercent)) {
+                return { percentNumber: cssPercent, currentTime: '' };
+            }
+
+            const progressText = HistoryPageSync.collectTexts(card, '.bili-cover-card__tag span, .bili-cover-card__stats span, .bili-cover-card__stat span').join(' ');
+            const percentMatch = progressText.match(/(?:已观看|观看)?\s*(\d+(?:\.\d+)?)\s*%/);
+            if (percentMatch) {
+                return { percentNumber: parseFloat(percentMatch[1]), currentTime: '' };
+            }
+
+            return null;
+        },
+
+        collectTexts: (root, selector) => Array.from(root.querySelectorAll(selector))
+            .filter(el => !el.closest('.bvh-tag, .bvh-episode-tag'))
+            .map(el => (el.textContent || '').trim())
+            .filter(Boolean),
+
+        extractProgressCssPercent: (card) => {
+            const el = card.querySelector('.bili-cover-card__progress');
+            if (!el) return NaN;
+            const value = el.style.getPropertyValue('--bili-cover-card-progress-value')
+                || (el.getAttribute('style') || '').match(/--bili-cover-card-progress-value:\s*([^;]+)/)?.[1]
+                || '';
+            const percent = parseFloat(value);
+            return Number.isFinite(percent) ? percent : NaN;
+        },
+
+        normalizeTimeText: (value) => {
+            const parts = String(value || '').trim().split(':').map(part => parseInt(part, 10));
+            if (parts.some(part => Number.isNaN(part))) return '';
+            const pad = v => String(v).padStart(2, '0');
+            if (parts.length === 2) return `${pad(parts[0])}:${pad(parts[1])}`;
+            if (parts.length === 3) return `${pad(parts[0])}:${pad(parts[1])}:${pad(parts[2])}`;
+            return '';
+        },
+
+        parseWatchTime: (value) => {
+            const raw = String(value || '').trim();
+            if (!raw) return '';
+            const now = new Date();
+            const makeDate = (year, month, day, hour, minute, second = 0, adjustFuture = false) => {
+                const date = new Date(year, month - 1, day, hour, minute, second);
+                if (
+                    date.getFullYear() !== year ||
+                    date.getMonth() !== month - 1 ||
+                    date.getDate() !== day ||
+                    date.getHours() !== hour ||
+                    date.getMinutes() !== minute
+                ) {
+                    return '';
+                }
+                if (adjustFuture && date.getTime() - now.getTime() > 24 * 60 * 60 * 1000) {
+                    date.setFullYear(date.getFullYear() - 1);
+                }
+                return HistoryPageSync.formatDateTime(date);
+            };
+
+            let match = raw.match(/^今天\s*(\d{1,2}):(\d{2})$/);
+            if (match) {
+                return makeDate(now.getFullYear(), now.getMonth() + 1, now.getDate(), parseInt(match[1], 10), parseInt(match[2], 10));
+            }
+
+            match = raw.match(/^昨天\s*(\d{1,2}):(\d{2})$/);
+            if (match) {
+                const date = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, parseInt(match[1], 10), parseInt(match[2], 10), 0);
+                return HistoryPageSync.formatDateTime(date);
+            }
+
+            match = raw.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+            if (match) {
+                return makeDate(
+                    parseInt(match[1], 10),
+                    parseInt(match[2], 10),
+                    parseInt(match[3], 10),
+                    parseInt(match[4], 10),
+                    parseInt(match[5], 10),
+                    parseInt(match[6] || '0', 10)
+                );
+            }
+
+            match = raw.match(/^(\d{1,2})[-/](\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+            if (match) {
+                return makeDate(
+                    now.getFullYear(),
+                    parseInt(match[1], 10),
+                    parseInt(match[2], 10),
+                    parseInt(match[3], 10),
+                    parseInt(match[4], 10),
+                    parseInt(match[5] || '0', 10),
+                    true
+                );
+            }
+
+            return '';
+        },
+
+        formatDateTime: (date) => {
+            const pad = n => String(n).padStart(2, '0');
+            return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+        },
+
+        formatSummary: (result, continueMode) => {
+            const loadedText = continueMode
+                ? `，加载前 ${result.beforeCardCount} 条，当前 ${result.afterCardCount} 条${result.newLoaded > 0 ? `，新增加载 ${result.newLoaded} 条` : '，未发现新增卡片'}`
+                : `，当前 ${result.afterCardCount} 条`;
+            const writeText = result.created + result.updated > 0
+                ? `同步完成：新增 ${result.created}，更新 ${result.updated}，跳过 ${result.skipped}，失败 ${result.failed}`
+                : `没有需要同步的记录：跳过 ${result.skipped}，失败 ${result.failed}`;
+            return `${writeText}${loadedText}`;
         }
     };
 
@@ -3880,6 +4290,7 @@
 
             this.checkAndInitVideoPage();
             UIComponent.showQuickEntry();
+            HistoryPageSync.refreshControl();
             this.hijackRouter();
             done('initialized watchers/player/router');
 
@@ -4023,6 +4434,7 @@
                         const done = Utils.debugTime('AppController.locationchange delayed refresh');
                         this.checkAndInitVideoPage();
                         UIComponent.showQuickEntry();
+                        HistoryPageSync.refreshControl();
                         if (this.domWatcher) {
                             this.domWatcher.refreshForRoute();
                         }
