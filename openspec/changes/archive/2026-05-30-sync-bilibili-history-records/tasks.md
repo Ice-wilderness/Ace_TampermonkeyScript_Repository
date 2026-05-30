@@ -34,14 +34,14 @@
 
 ## 5. Verification
 
-- [ ] 5.1 Verify syncing a new loaded Bilibili history card creates a local `已观看` record with the watch time from `.bili-video-card__corner span`.
-- [ ] 5.2 Verify a card URL with `p=6` is stored as the corresponding per-page key instead of the base BV key.
-- [ ] 5.3 Verify a `current/total` card stores the current-time portion and calculates the expected progress percentage.
-- [ ] 5.4 Verify a percentage-only or `已看完` card does not fabricate `currentTime`.
-- [ ] 5.5 Verify an existing local record is updated only when the Bilibili progress is more than 5 percentage points longer.
-- [ ] 5.6 Verify an existing local record is unchanged, including `savedAt`, when progress difference is 5 percentage points or less.
-- [ ] 5.7 Verify an existing local record is unchanged when local progress is longer than Bilibili progress by more than 5 percentage points.
-- [ ] 5.8 Verify invalid or unsupported history cards are skipped without throwing errors.
-- [ ] 5.9 Verify continuing sync scrolls to the bottom, waits for more cards, and can be repeated.
-- [ ] 5.10 Verify existing history management actions still work after adding the floating sync control.
+- [x] 5.1 Verify syncing a new loaded Bilibili history card creates a local `已观看` record with the watch time from `.bili-video-card__corner span`.
+- [x] 5.2 Verify a card URL with `p=6` is stored as the corresponding per-page key instead of the base BV key.
+- [x] 5.3 Verify a `current/total` card stores the current-time portion and calculates the expected progress percentage.
+- [x] 5.4 Verify a percentage-only or `已看完` card does not fabricate `currentTime`.
+- [x] 5.5 Verify an existing local record is updated only when the Bilibili progress is more than 5 percentage points longer.
+- [x] 5.6 Verify an existing local record is unchanged, including `savedAt`, when progress difference is 5 percentage points or less.
+- [x] 5.7 Verify an existing local record is unchanged when local progress is longer than Bilibili progress by more than 5 percentage points.
+- [x] 5.8 Verify invalid or unsupported history cards are skipped without throwing errors.
+- [x] 5.9 Verify continuing sync scrolls to the bottom, waits for more cards, and can be repeated.
+- [x] 5.10 Verify existing history management actions still work after adding the floating sync control.
 - [x] 5.11 Check userscript metadata and confirm no new `@match`, `@grant`, `@require`, or `@connect` entry is needed for the implementation.
