@@ -1,1 +1,4 @@
 planning-archive/
+node_modules/
+tools/signin-api-discovery/.profile/
+tools/signin-api-discovery/reports/
