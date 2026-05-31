@@ -29,6 +29,6 @@
 ## 5. Verification And Finish
 
 - [x] 5.1 Run a syntax check or the narrowest available script validation for `scripts/自用论坛辅助签到自写.js`.
-- [ ] 5.2 Manually inspect the limestart dashboard UI at desktop and narrow viewport sizes for readability, spacing, and action availability.
-- [ ] 5.3 Manually verify one-click opening behavior with at least one background-safe built-in target, one opened-pending custom target, and SSTM foreground handling.
+- [x] 5.2 Manually inspect the limestart dashboard UI at desktop and narrow viewport sizes for readability, spacing, and action availability.
+- [x] 5.3 Manually verify one-click opening behavior with at least one background-safe built-in target, one opened-pending custom target, and SSTM foreground handling.
 - [x] 5.4 Review userscript metadata, `@grant` usage, README needs, CHANGELOG needs, and `@version` according to the repository's收尾 rules before final release or commit.
