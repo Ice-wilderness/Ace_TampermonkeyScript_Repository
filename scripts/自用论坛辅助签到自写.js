@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.3.0
-// @description  论坛辅助签到工具 - 支持 limestart 签到控制台、可配置打开清单与多站点自动签到
+// @version      2.4.0
+// @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
 // @match        https://limestart.cn/*
@@ -14,6 +14,7 @@
 // @match        http*://www.sl-asmr.com/*
 // @match        http*://bbs.kfpromax.com/*
 // @match        http*://sjs47.com/*
+// @match        http*://*.vr6erw5d.com/*
 // @match        http*://www.vikacg.com/*
 // @match        http*://feixueacg.org/*
 // @match        http*://www.galgamex.org/*
@@ -22,6 +23,11 @@
 // @match        http*://zodgame.xyz/*
 // @match        http*://www.fufugal.com/*
 // @match        *://sstm.moe/*
+// @connect      feixueacg.org
+// @connect      www.south-plus.net
+// @connect      www.sl-asmr.com
+// @connect      www.galgamex.top
+// @connect      www.acgndog.com
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -54,6 +60,7 @@
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
+        running: { label: '执行中', tone: 'pending', message: '正在执行签到请求' },
         opened: { label: '已打开', tone: 'pending', message: '已打开，等待确认' },
         success: { label: '成功', tone: 'success', message: '今日已完成' },
         failed: { label: '失败', tone: 'danger', message: '本次未确认成功' },
@@ -280,6 +287,226 @@
 
     // 延时函数
     const delay = (ms) => new Promise(res => setTimeout(res, ms));
+
+    function gmRequest(details) {
+        return new Promise((resolve, reject) => {
+            if (typeof GM_xmlhttpRequest !== 'function') {
+                reject(new Error('当前脚本管理器不支持 GM_xmlhttpRequest'));
+                return;
+            }
+            GM_xmlhttpRequest({
+                method: details.method || 'GET',
+                url: details.url,
+                headers: details.headers || {},
+                data: details.data,
+                responseType: details.responseType || 'text',
+                anonymous: false,
+                withCredentials: true,
+                onload: resolve,
+                onerror: reject,
+                ontimeout: reject
+            });
+        });
+    }
+
+    function extractCdata(text) {
+        const match = String(text || '').match(/<!\[CDATA\[([\s\S]*?)\]\]>/);
+        return match ? match[1] : String(text || '');
+    }
+
+    function readFormFieldsFromHtml(html, selector) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        const form = doc.querySelector(selector);
+        if (!form) return null;
+
+        const params = new URLSearchParams();
+        form.querySelectorAll('input, textarea, select').forEach(el => {
+            const name = el.getAttribute('name');
+            if (!name) return;
+            let value = el.getAttribute('value') || '';
+            if (el.tagName === 'TEXTAREA') {
+                value = el.value || el.textContent || value;
+            } else if (el.tagName === 'SELECT') {
+                const selected = el.querySelector('option[selected]') || el.querySelector('option');
+                value = selected?.getAttribute('value') || value;
+            }
+            params.set(name, value);
+        });
+        return params;
+    }
+
+    async function runFeixueApiSign() {
+        const modalRes = await gmRequest({
+            url: 'https://feixueacg.org/plugin.php?id=dc_signin:sign&infloat=yes&handlekey=sign&inajax=1&ajaxtarget=fwin_content_sign'
+        });
+        const modalHtml = extractCdata(modalRes.responseText);
+
+        if (/尚未登录|请先登录|member\.php\?mod=logging&action=login/.test(modalHtml)) {
+            recordTargetStatus('fxacg', 'needs-login', {
+                stage: 'login',
+                message: '飞雪论坛需要先登录账号',
+                url: 'https://feixueacg.org/plugin.php?id=dc_signin'
+            });
+            return false;
+        }
+        if (/已签到|已经签到|今日已/.test(modalHtml)) {
+            return completeSign('fxacg', '接口返回今日已签到');
+        }
+
+        const params = readFormFieldsFromHtml(modalHtml, '#signform');
+        if (!params) {
+            console.log('[飞雪论坛] 未找到签到表单');
+            return false;
+        }
+
+        params.set('signsubmit', params.get('signsubmit') || 'yes');
+        params.set('handlekey', params.get('handlekey') || 'signin');
+        params.set('emotid', params.get('emotid') || '3');
+        params.set('referer', params.get('referer') || 'https://feixueacg.org/');
+        params.set('content', params.get('content') || '为了维护宇宙和平，打起精神来！~~');
+
+        const submitRes = await gmRequest({
+            method: 'POST',
+            url: 'https://feixueacg.org/plugin.php?id=dc_signin:sign&inajax=1',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            data: params.toString()
+        });
+        const submitText = submitRes.responseText || '';
+
+        if (/签到成功|随机奖励|succeedhandle_signin/.test(submitText)) {
+            return completeSign('fxacg', '接口返回签到成功');
+        }
+        if (/已签到|已经签到|今日已/.test(submitText)) {
+            return completeSign('fxacg', '接口返回今日已签到');
+        }
+        if (/尚未登录|请先登录|member\.php\?mod=logging&action=login/.test(submitText)) {
+            recordTargetStatus('fxacg', 'needs-login', {
+                stage: 'login',
+                message: '飞雪论坛需要先登录账号',
+                url: 'https://feixueacg.org/plugin.php?id=dc_signin'
+            });
+            return false;
+        }
+
+        console.log('[飞雪论坛] 签到接口未返回成功标记', submitText);
+        return false;
+    }
+
+    async function runSouthPlusApiSign() {
+        const fetchTask = async (id) => {
+            let res = await gmRequest({
+                url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job&cid=${id}`
+            });
+            let text = res.responseText || '';
+            if (text.includes('还没超过')) {
+                console.log(`[南+] 任务${id} 刷新时间未到`);
+                return true;
+            }
+            if (text.includes('已经申请')) {
+                res = await gmRequest({
+                    url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job2&cid=${id}`
+                });
+                text = res.responseText || '';
+                if (text.includes('已经完成')) {
+                    console.log(`[南+] 成功完成任务${id}`);
+                    return true;
+                }
+            }
+            console.log(`[南+] 任务${id}提交异常`, text);
+            return false;
+        };
+
+        const w14 = await fetchTask('14');
+        const w15 = await fetchTask('15');
+        if (w14 && w15) {
+            return completeSign('southplus', '接口返回任务已完成');
+        }
+        return false;
+    }
+
+    async function runSlAsmrApiSign() {
+        const res = await gmRequest({
+            method: 'POST',
+            url: 'https://www.sl-asmr.com/api/mission/fast'
+        });
+        const text = res.responseText || '';
+        if (text.includes('签到成功') || text.includes('您已签到')) {
+            return completeSign('sl-asmr', '接口返回签到成功或已签到');
+        }
+        console.log('[夜世界] 签到接口异常', text);
+        return false;
+    }
+
+    async function runAcgndogApiSign() {
+        const checkAction = 'd2e5b56b75e2f3d4ab412a6d9561faee';
+        const signAction = '5ced0113734a2bc46ecf3f30b0685b7b';
+        const checkRes = await gmRequest({
+            url: `https://www.acgndog.com/wp-admin/admin-ajax.php?action=${checkAction}&${signAction}%5Btype%5D=checkSigned`
+        });
+        let checkJson = null;
+        try {
+            checkJson = JSON.parse(checkRes.responseText || '{}');
+        } catch (err) {
+            console.log('[次元狗] 签到状态接口返回非 JSON', checkRes.responseText);
+            return false;
+        }
+
+        if (!checkJson.user || checkJson.user.isLoggedIn === false) {
+            recordTargetStatus('acgndog', 'needs-login', {
+                stage: 'login',
+                message: '次元狗需要先登录账号',
+                url: 'https://www.acgndog.com/'
+            });
+            return false;
+        }
+        if (checkJson.customPointSignDaily?.signed === true) {
+            return completeSign('acgndog', '接口返回今日已签到');
+        }
+        if (!checkJson._nonce) {
+            console.log('[次元狗] 未获取到签到 nonce', checkJson);
+            return false;
+        }
+
+        const signRes = await gmRequest({
+            url: `https://www.acgndog.com/wp-admin/admin-ajax.php?_nonce=${encodeURIComponent(checkJson._nonce)}&action=${signAction}&type=goSign`
+        });
+        let signJson = null;
+        try {
+            signJson = JSON.parse(signRes.responseText || '{}');
+        } catch (err) {
+            console.log('[次元狗] 签到接口返回非 JSON', signRes.responseText);
+            return false;
+        }
+
+        if (signJson.code === 0 && /签到成功|获得/.test(signJson.msg || '')) {
+            return completeSign('acgndog', signJson.msg || '接口返回签到成功');
+        }
+        if (/已签到|已经签到|今日已/.test(signJson.msg || '')) {
+            return completeSign('acgndog', signJson.msg || '接口返回今日已签到');
+        }
+
+        console.log('[次元狗] API 返回异常:', signJson);
+        return false;
+    }
+
+    async function runGalgameXNewApiSign() {
+        const res = await gmRequest({
+            method: 'POST',
+            url: 'https://www.galgamex.top/api/user/checkin'
+        });
+        const text = res.responseText || '';
+        if (text.includes('randomMoemoepoints')) {
+            const json = JSON.parse(text);
+            return completeSign('galGameXNew', `签到成功，获得 ${json.randomMoemoepoints} 萌点`);
+        }
+        if (text.includes('您今天已经签到过了')) {
+            return completeSign('galGameXNew', '接口返回今日已经签到过了');
+        }
+        console.log('[GalgameX 新站] API 返回异常:', text);
+        return false;
+    }
 
     // ================== 各站点签到策略配置 ==================
 
@@ -550,30 +777,15 @@
             dashboard: {
                 url: "https://feixueacg.org/plugin.php?id=dc_signin",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runFeixueApiSign,
             async run() {
-                if (!location.href.includes('dc_signin') && !location.href.includes('login')) {
-                    window.location.href = "plugin.php?id=dc_signin";
-                    return false;
-                }
-                if (location.href.includes('dc_signin')) {
-                    const statusLink = await waitForElement('#dcsignin > div.sd > div.bm.bw0 > div > a', 3000);
-                    if (statusLink && statusLink.innerText.includes('已签到')) {
-                        console.log('已签到');
-                        return completeSign('fxacg', '页面显示今日已签到');
-                    } else if (statusLink) {
-                        statusLink.click();
-                        const btnSign2 = await waitForElement('#signform > div > ul > li:nth-child(1)', 5000);
-                        const btnSign = await waitForElement('#signform > p > button', 5000);
-                        if (btnSign2 && btnSign) {
-                            btnSign2.click();
-                            await delay(200);
-                            btnSign.click();
-                            console.log('签到成功');
-                            return completeSign('fxacg', '已提交签到表单');
-                        }
-                    }
+                try {
+                    return await runFeixueApiSign();
+                } catch (err) {
+                    console.log('[飞雪论坛] API 签到异常', err);
                 }
                 return false;
             }
@@ -585,32 +797,12 @@
             dashboard: {
                 url: "https://www.south-plus.net/",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runSouthPlusApiSign,
             async run() {
-                // 使用 fetch 替代繁琐的 XMLHttpRequest
-                const fetchTask = async (id) => {
-                    let res = await fetch(`https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job&cid=${id}`);
-                    let text = await res.text();
-                    if (text.includes("还没超过")) {
-                        console.log(`[南+] 任务${id} 刷新时间未到`);
-                        return true;
-                    } else if (text.includes("已经申请")) {
-                        res = await fetch(`https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job2&cid=${id}`);
-                        text = await res.text();
-                        if (text.includes("已经完成")) {
-                            console.log(`[南+] 成功完成任务${id}`);
-                            return true;
-                        } else {
-                            console.log(`[南+] 任务${id}提交异常`);
-                        }
-                    }
-                    return false;
-                };
-
-                const w14 = await fetchTask('14'); // 周常
-                const w15 = await fetchTask('15'); // 日常
-                return w14 && w15;
+                return await runSouthPlusApiSign();
             }
         },
         {
@@ -618,24 +810,59 @@
             matches: ["galge.fun", "2dfan.com", "2dfan.org"],
             key: "2dfan",
             dashboard: {
-                url: "https://galge.fun/users/177256/recheckin",
-                openMode: "background",
-                resultMode: "script"
+                url: "https://2dfan.com/users/177256/recheckin",
+                openMode: "foreground",
+                resultMode: "script",
+                note: "签到提交需要阿里云验证码校验，需前台完成"
             },
             async run() {
-                // 注意：原代码中写死了 /users/177256/recheckin，这里保留你的原逻辑，若需要可修改为动态获取
-                if (!location.href.includes('recheckin') && !location.href.includes('not_authenticated')) {
-                    window.location.href = "users/177256/recheckin";
+                if (location.href.includes('not_authenticated') || location.href.includes('sign_in')) {
+                    recordTargetStatus('2dfan', 'needs-login', {
+                        stage: 'login',
+                        message: '2dfan 需要先登录账号',
+                        url: location.href
+                    });
                     return false;
                 }
-                const signFlag = await waitForElement('#checkin', 3000);
-                const signFlag2 = document.querySelector('.checkin-info .pull-right');
 
-                if ((signFlag && signFlag.innerText.includes('已签到')) ||
-                    (signFlag2 && signFlag2.innerText.includes('已连续签到'))) {
-                    console.log('已签到!');
+                if (!location.href.includes('recheckin')) {
+                    window.location.href = "/users/177256/recheckin";
+                    return false;
+                }
+
+                const isSigned = () => {
+                    const signFlag = document.querySelector('#checkin');
+                    const signFlag2 = document.querySelector('.checkin-info .pull-right');
+                    const bodyText = document.body?.innerText || '';
+                    return (signFlag && /已签到|已连续签到/.test(signFlag.innerText)) ||
+                        (signFlag2 && /已签到|已连续签到/.test(signFlag2.innerText)) ||
+                        /已连续签到|今日已签到/.test(bodyText);
+                };
+
+                if (isSigned()) {
                     return completeSign('2dfan', '页面显示今日已签到');
                 }
+
+                const btn = await waitForElement('#do_checkin, #checkin', 5000);
+                if (btn && /签到|今日签到/.test(btn.innerText || '')) {
+                    btn.click();
+                    console.log('[2dfan] 已点击签到按钮，等待页面验证和结果确认...');
+
+                    for (let i = 0; i < 20; i++) {
+                        await delay(500);
+                        if (isSigned()) {
+                            return completeSign('2dfan', '前台验证后确认签到成功');
+                        }
+                    }
+
+                    recordTargetStatus('2dfan', 'needs-foreground', {
+                        stage: 'captcha',
+                        message: '2dfan 可能需要在前台完成阿里云验证码后再确认',
+                        url: location.href
+                    });
+                    return false;
+                }
+
                 return false;
             }
         },
@@ -646,18 +873,12 @@
             dashboard: {
                 url: "https://www.sl-asmr.com/",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runSlAsmrApiSign,
             async run() {
-                const res = await fetch('https://www.sl-asmr.com/api/mission/fast', { method: 'POST' });
-                const text = await res.text();
-                if (text.includes("签到成功") || text.includes("您已签到")) {
-                    console.log('签到成功或今天已经签到过了');
-                    return completeSign('sl-asmr', '接口返回签到成功或已签到');
-                } else {
-                    console.log('签到异常，请检查是否登录', text);
-                    return false;
-                }
+                return await runSlAsmrApiSign();
             }
         },
         {
@@ -694,18 +915,15 @@
             dashboard: {
                 url: "https://www.acgndog.com/",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runAcgndogApiSign,
             async run() {
-                const btn = await waitForElement('#inn-nav__point-sign-daily > a', 5000);
-                if (btn) {
-                    if (btn.innerText.includes('已签到')) {
-                        console.log('已签到');
-                    } else {
-                        btn.click();
-                        console.log('执行签到点击');
-                    }
-                    return completeSign('acgndog', '签到按钮状态已确认');
+                try {
+                    return await runAcgndogApiSign();
+                } catch (err) {
+                    console.log('[次元狗] API 签到异常', err);
                 }
                 return false;
             }
@@ -821,29 +1039,59 @@
             }
         },
         {
+            name: "搜书吧",
+            matches: ["vr6erw5d.com"],
+            key: "soushuba",
+            dashboard: {
+                url: "https://mu3h.vr6erw5d.com/",
+                openMode: "background",
+                resultMode: "script",
+                note: "登录访问即自动获得 2 银币"
+            },
+            async run() {
+                await delay(1000);
+
+                const getDiscuzUid = () => {
+                    const rawUid = typeof unsafeWindow !== 'undefined' ? unsafeWindow.discuz_uid : '';
+                    if (rawUid && rawUid !== '0') return String(rawUid);
+                    const scripts = Array.from(document.scripts || []);
+                    for (const script of scripts) {
+                        const match = (script.textContent || '').match(/discuz_uid\s*=\s*['"]([^'"]+)['"]/);
+                        if (match) return match[1];
+                    }
+                    return '';
+                };
+
+                const uid = getDiscuzUid();
+                const hasLoginForm = document.querySelector('#lsform, #ls_username, input[name="username"][id="ls_username"]');
+                const hasLogoutLink = document.querySelector('a[href*="member.php?mod=logging"][href*="action=logout"]');
+                const hasUserSpaceLink = document.querySelector('a[href*="home.php?mod=space&uid="]');
+
+                if ((uid && uid !== '0') || hasLogoutLink || (hasUserSpaceLink && !hasLoginForm)) {
+                    return completeSign('soushuba', '已登录访问，站点自动获得 2 银币');
+                }
+
+                recordTargetStatus('soushuba', 'needs-login', {
+                    stage: 'login',
+                    message: '搜书吧需要先登录；登录成功访问首页会自动获得 2 银币',
+                    url: location.href
+                });
+                return false;
+            }
+        },
+        {
             name: "GalgameX 新站",
             matches: ["www.galgamex.top"],
             key: "galGameXNew",
             dashboard: {
                 url: "https://www.galgamex.top/",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runGalgameXNewApiSign,
             async run() {
-                const res = await fetch('https://www.galgamex.top/api/user/checkin', { method: 'POST' });
-                // 移除 res.ok 校验，因为返回 error 时 HTTP 状态码可能不是 200，但我们需要读取 body 里的错误信息
-                const text = await res.text();
-                if (text.includes("randomMoemoepoints")) {
-                    const json = JSON.parse(text);
-                    console.log('签到成功，获得' + json.randomMoemoepoints + '萌点');
-                    return completeSign('galGameXNew', `签到成功，获得 ${json.randomMoemoepoints} 萌点`);
-                } else if (text.includes("您今天已经签到过了")) {
-                    console.log('今天已经签到过了');
-                    return completeSign('galGameXNew', '接口返回今日已经签到过了');
-                } else {
-                    console.log('API 返回异常:', text);
-                }
-                return false;
+                return await runGalgameXNewApiSign();
             }
         },
         {
@@ -930,6 +1178,7 @@
                     name: site.name,
                     url: setting.url || site.dashboard.url,
                     enabled: setting.enabled !== false,
+                    directApi: typeof site.directRun === 'function',
                     openMode: setting.openMode || site.dashboard.openMode || 'background',
                     resultMode: setting.resultMode || site.dashboard.resultMode || 'script',
                     note: site.dashboard.note || ''
@@ -1037,13 +1286,64 @@
         });
     }
 
+    async function runDirectTarget(target) {
+        const site = siteConfigs.find(item => item.key === target.siteKey && typeof item.directRun === 'function');
+        if (!site) return false;
+
+        recordTargetStatus(target.id, 'running', {
+            stage: 'direct-api',
+            message: '正在从控制台发送 API 签到请求',
+            url: target.url,
+            incrementAttempt: true
+        });
+
+        try {
+            const isSuccess = await site.directRun();
+            if (!isSuccess && getNormalizedTargetStatus(target).status === 'running') {
+                recordTargetStatus(target.id, 'failed', {
+                    stage: 'direct-api',
+                    message: 'API 签到未返回成功标记',
+                    url: target.url
+                });
+            }
+            return isSuccess;
+        } catch (err) {
+            console.log(`[签到助手] ${target.name} 控制台直签异常`, err);
+            recordTargetStatus(target.id, 'failed', {
+                stage: 'direct-api',
+                message: `控制台直签异常：${err?.message || err}`,
+                url: target.url
+            });
+            return false;
+        }
+    }
+
+    async function runDirectTargets(targets, rerender) {
+        for (const target of targets) {
+            if (!target.enabled || !target.directApi || isTargetDone(getNormalizedTargetStatus(target).status)) continue;
+            const promise = runDirectTarget(target);
+            if (typeof rerender === 'function') rerender();
+            await promise;
+            if (typeof rerender === 'function') rerender();
+            await delay(200);
+        }
+    }
+
     function isTargetDone(status) {
         return status === 'success' || status === 'skipped';
     }
 
     function getLaunchableTargets() {
         return getAllTargets().filter(target => {
-            if (!target.enabled || target.openMode === 'manual') return false;
+            if (!target.enabled || target.openMode === 'manual' || target.directApi) return false;
+            const targetStatus = getNormalizedTargetStatus(target).status;
+            return !isTargetDone(targetStatus);
+        });
+    }
+
+    function getDirectRunnableTargets() {
+        return getAllTargets().filter(target => {
+            if (!target.enabled || !target.directApi) return false;
             const targetStatus = getNormalizedTargetStatus(target).status;
             return !isTargetDone(targetStatus);
         });
@@ -1715,7 +2015,7 @@
             el('div', { className: 'bbs-sign-message', text: status.message || STATUS_META[status.status]?.message || '' }),
             el('div', {
                 className: 'bbs-sign-meta',
-                text: `${OPEN_MODE_LABELS[target.openMode] || target.openMode} · ${RESULT_MODE_LABELS[target.resultMode] || target.resultMode} · 更新 ${getTimeLabel(status.updatedAt)}`
+                text: `${target.directApi ? '控制台直签 · ' : ''}${OPEN_MODE_LABELS[target.openMode] || target.openMode} · ${RESULT_MODE_LABELS[target.resultMode] || target.resultMode} · 更新 ${getTimeLabel(status.updatedAt)}`
             })
         );
         if (target.note) {
@@ -1723,8 +2023,21 @@
         }
 
         const actions = el('div', { className: 'bbs-sign-row-actions' });
-        const openBtn = el('button', {
+        const directBtn = target.directApi ? el('button', {
             className: 'bbs-sign-button primary',
+            type: 'button',
+            text: '直签',
+            onClick: async () => {
+                const promise = runDirectTarget(target);
+                rerender();
+                await promise;
+                rerender();
+            }
+        }) : null;
+        if (directBtn) directBtn.disabled = !target.enabled || status.status === 'running';
+
+        const openBtn = el('button', {
+            className: target.directApi ? 'bbs-sign-button ghost' : 'bbs-sign-button primary',
             type: 'button',
             text: target.openMode === 'foreground' ? '前台打开' : '打开',
             onClick: () => {
@@ -1733,7 +2046,8 @@
             }
         });
         openBtn.disabled = !target.enabled;
-        actions.append(
+        const rowActions = [
+            ...(directBtn ? [directBtn] : []),
             openBtn,
             el('button', {
                 className: 'bbs-sign-button',
@@ -1762,7 +2076,8 @@
                     rerender();
                 }
             })
-        );
+        ];
+        actions.append(...rowActions);
 
         row.append(main, actions);
         return row;
@@ -1777,7 +2092,7 @@
                 summary.success += 1;
             } else if (status === 'failed') {
                 summary.failed += 1;
-            } else if (status === 'opened' || status === 'needs-login' || status === 'needs-foreground') {
+            } else if (status === 'running' || status === 'opened' || status === 'needs-login' || status === 'needs-foreground') {
                 summary.pending += 1;
             } else if (status !== 'skipped') {
                 summary.todo += 1;
@@ -1853,6 +2168,7 @@
         const visibleTargets = targets.filter(target => targetMatchesSearch(target, dashboardSearchQuery));
         const summary = getDashboardSummary(targets);
         const launchableTargets = getLaunchableTargets();
+        const directRunnableTargets = getDirectRunnableTargets();
         const groups = splitDashboardTargets(visibleTargets);
         const searchInput = createSearchField(dashboardSearchQuery, '搜索站点名称、网址或备注', (event) => {
             dashboardSearchQuery = event.target.value;
@@ -1875,11 +2191,21 @@
                     el('button', {
                         className: 'bbs-sign-button primary',
                         type: 'button',
-                        text: '一键打开未完成',
-                        onClick: () => {
+                        text: '一键处理未完成',
+                        onClick: async () => {
+                            await runDirectTargets(getDirectRunnableTargets(), rerender);
                             for (const target of getLaunchableTargets()) {
                                 launchTarget(target);
                             }
+                            rerender();
+                        }
+                    }),
+                    el('button', {
+                        className: 'bbs-sign-button',
+                        type: 'button',
+                        text: '一键直签',
+                        onClick: async () => {
+                            await runDirectTargets(getDirectRunnableTargets(), rerender);
                             rerender();
                         }
                     }),
@@ -1901,7 +2227,7 @@
 
         body.append(el('div', {
             className: 'bbs-sign-message',
-            text: `今天 ${getToday()}，还有 ${launchableTargets.length} 个目标可一键打开。已禁用站点已从控制台隐藏，可在配置清单中管理。`
+            text: `今天 ${getToday()}，还有 ${directRunnableTargets.length} 个目标可控制台直签，${launchableTargets.length} 个目标需要打开页面。已禁用站点已从控制台隐藏，可在配置清单中管理。`
         }));
 
         if (!targets.length) {

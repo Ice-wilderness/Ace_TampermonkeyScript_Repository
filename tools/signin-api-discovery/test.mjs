@@ -7,6 +7,7 @@ import vm from "node:vm";
 const toolDir = dirname(fileURLToPath(import.meta.url));
 const source = await readFile(join(toolDir, "inject.js"), "utf8");
 const listeners = new Map();
+const storage = new Map();
 
 function addListener(type, handler) {
   const bucket = listeners.get(type) || [];
@@ -45,7 +46,15 @@ function element(tag, props = {}) {
 const passwordField = element("input", { type: "password", name: "password", value: "rawpass" });
 const tokenField = element("input", { type: "hidden", name: "formhash", value: "abc123" });
 const messageField = element("textarea", { name: "message", value: "hello" });
-const signButton = element("button", { innerText: "签到" });
+const signButton = element("a", {
+  id: "JD_sign",
+  innerText: "立即签到",
+  href: "https://example.test/plugin.php?id=k_misign:sign&operation=qiandao&formhash=raw-url-token",
+  attrs: {
+    href: "https://example.test/plugin.php?id=k_misign:sign&operation=qiandao&formhash=raw-url-token",
+    onclick: "ajaxget('plugin.php?id=k_misign:sign&operation=qiandao&formhash=raw-onclick-token', 'messagetext')"
+  }
+});
 const form = element("form", {
   id: "sign-form",
   action: "https://example.test/plugin.php?id=sign",
@@ -85,6 +94,7 @@ class FakeXHR {
     this.callbacks[type] = callback;
   }
   send() {
+    this.responseText += '<input type="hidden" name="auth" value="raw-html-auth">';
     if (this.callbacks.loadend) this.callbacks.loadend();
   }
 }
@@ -97,7 +107,22 @@ const context = {
   XMLHttpRequest: FakeXHR,
   Request: class {},
   Headers: class {},
-  navigator: {},
+  navigator: {
+    sendBeacon() {
+      return true;
+    }
+  },
+  sessionStorage: {
+    getItem(key) {
+      return storage.get(key) || null;
+    },
+    setItem(key, value) {
+      storage.set(key, String(value));
+    },
+    removeItem(key) {
+      storage.delete(key);
+    }
+  },
   location: new URL("https://example.test/checkin"),
   document: {
     title: "Example sign page",
@@ -122,7 +147,18 @@ const context = {
       url: String(url),
       clone() {
         return {
-          text: async () => "签到成功 token=raw-fetch-secret"
+          text: async () => JSON.stringify({
+            status: "success",
+            message: "签到成功 token=raw-fetch-secret",
+            data: {
+              email: "person@example.test",
+              username: "raw-user-name",
+              invite: {
+                code: "raw-invite-code"
+              },
+              credit: 100
+            }
+          })
         };
       }
     };
@@ -145,6 +181,8 @@ await context.fetch("/api/sign", {
   body: "formhash=abc123&password=rawpass&message=hello"
 });
 
+context.navigator.sendBeacon("/api/beacon-sign", "token=raw-beacon-token&message=hello");
+
 const xhr = new context.XMLHttpRequest();
 xhr.open("POST", "/ajax/sign");
 xhr.setRequestHeader("Cookie", "sid=rawcookie");
@@ -154,11 +192,16 @@ for (const handler of listeners.get("submit") || []) {
   handler({ target: form, submitter: signButton });
 }
 
+for (const handler of listeners.get("click") || []) {
+  handler({ target: signButton });
+}
+
 const report = api.report();
 const text = JSON.stringify(report);
 
-assert.equal(report.networkCandidates.length, 2);
+assert.equal(report.networkCandidates.length, 3);
 assert.equal(report.formSubmissions.length, 1);
+assert.equal(report.actionCandidates.length, 1);
 assert.ok(report.pageClues.buttons.length >= 1);
 assert.ok(report.pageClues.alreadySignedText.length >= 1);
 assert.match(text, /candidate/);
@@ -169,5 +212,16 @@ assert.doesNotMatch(text, /rawpass/);
 assert.doesNotMatch(text, /abc123/);
 assert.doesNotMatch(text, /raw-fetch-secret/);
 assert.doesNotMatch(text, /raw-xhr-secret/);
+assert.doesNotMatch(text, /raw-beacon-token/);
+assert.doesNotMatch(text, /raw-url-token/);
+assert.doesNotMatch(text, /raw-onclick-token/);
+assert.doesNotMatch(text, /raw-html-auth/);
+assert.doesNotMatch(text, /person@example\.test/);
+assert.doesNotMatch(text, /raw-user-name/);
+assert.doesNotMatch(text, /raw-invite-code/);
+assert.match(text, /sensitive-response-field/);
+assert.match(text, /sendBeacon/);
+assert.match(text, /JD_sign/);
+assert.ok(storage.has("__signinApiDiscoverySessionV1"));
 
 console.log("signin-api-discovery tests passed");
