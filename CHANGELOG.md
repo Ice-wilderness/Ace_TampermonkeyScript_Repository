@@ -10,6 +10,7 @@
 - [bilibili 查看关注时间](#bilibili-follow-time)
 - [Discuz 论坛帖子已读标记与图片预览](#discuz-read-image-preview)
 - [自用论坛辅助签到](#forum-auto-signin)
+- [通用请求抓包记录器](#universal-api-capture)
 
 <a id="bilibili-history"></a>
 <details>
@@ -259,6 +260,12 @@
 
 文件：[自用论坛辅助签到自写.js](./scripts/自用论坛辅助签到自写.js)
 
+### 2.5.0
+
+- 新增有叽叽论坛支持，并接入 `dsu_paulsign` 控制台直签流程。
+- 有叽叽论坛直签会动态读取 `formhash`，再发送签到请求，避免写死一次性参数。
+- 补充有叽叽论坛的脚本匹配规则和跨域请求权限。
+
 ### 2.4.0
 
 - 新增控制台直签能力，已适配站点可直接从 `limestart.cn` 控制台发送签到请求并记录状态。
@@ -278,5 +285,21 @@
 ### 2.2.1
 
 - 修复司机社点击签到后未等待页面确认，导致首次签到完成后本地签到日期可能延迟到下一次访问才记录的问题。
+
+</details>
+
+<a id="universal-api-capture"></a>
+<details>
+<summary><strong>通用请求抓包记录器</strong></summary>
+
+文件：[通用请求抓包记录器.js](./scripts/通用请求抓包记录器.js)
+
+### 0.1.1
+
+- 新增独立通用请求抓包记录器脚本，可按站点启用并导出 JSON 日志文件。
+- 支持记录 `fetch`、`XMLHttpRequest`、`sendBeacon`、普通表单提交和链接点击。
+- 表单记录支持提交按钮覆盖属性、GET 表单 URL 参数、POST 请求体、同名字段数组和基础敏感字段脱敏。
+- 修复 `fetch(new URL(...))` 等请求 URL 记录不准确的问题。
+- 收紧表单提交按钮兜底识别，避免把普通输入框误记为 submitter。
 
 </details>

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         【自写】通用请求抓包记录器
 // @namespace    bbshelperforme
-// @version      0.1.0
-// @description  通用 fetch/XHR/sendBeacon 请求记录工具，按站点启用后可导出接口日志
+// @version      0.1.1
+// @description  通用 fetch/XHR/表单/sendBeacon 请求记录工具，按站点启用后可导出接口日志
 // @author       Ice_wilderness
 // @match        *://*/*
 // @grant        unsafeWindow
@@ -70,6 +70,14 @@
         } catch (err) {
             return String(value || '');
         }
+    }
+
+    function getRequestUrl(input) {
+        if (typeof input === 'string') return input;
+        if (input instanceof URL) return input.href;
+        if (input?.href) return input.href;
+        if (input?.url) return input.url;
+        return String(input || location.href);
     }
 
     function redactSensitiveText(value) {
@@ -260,7 +268,10 @@
 
     function getSubmitter(form) {
         try {
-            return form?.ownerDocument?.activeElement?.closest?.('button, input, textarea, select');
+            const element = form?.ownerDocument?.activeElement?.closest?.('button, input');
+            if (!element || element.form !== form) return null;
+            const type = String(element.type || '').toLowerCase();
+            return type === 'submit' || type === 'image' ? element : null;
         } catch (err) {
             return null;
         }
@@ -369,7 +380,7 @@
 
         w.fetch = async function (input, init = {}) {
             const startedAt = Date.now();
-            const requestUrl = typeof input === 'string' ? input : input?.url;
+            const requestUrl = getRequestUrl(input);
             const method = init.method || input?.method || 'GET';
             const requestHeaders = {
                 ...headersToObject(input?.headers),

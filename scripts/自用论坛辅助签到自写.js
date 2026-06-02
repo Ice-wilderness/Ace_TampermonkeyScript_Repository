@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.4.0
+// @version      2.5.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -21,6 +21,7 @@
 // @match        http*://www.acgndog.com/*
 // @match        http*://www.galgamex.top/*
 // @match        http*://zodgame.xyz/*
+// @match        http*://www.uu-gg.one/*
 // @match        http*://www.fufugal.com/*
 // @match        *://sstm.moe/*
 // @connect      feixueacg.org
@@ -29,6 +30,7 @@
 // @connect      bbs.kfpromax.com
 // @connect      sjs47.com
 // @connect      www.galgamex.top
+// @connect      www.uu-gg.one
 // @connect      www.fufugal.com
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -553,6 +555,87 @@
         }
 
         console.log('[司机社] 签到接口未确认成功', rankText);
+        return false;
+    }
+
+    async function runUuGgApiSign() {
+        const requestText = async (url, headers = {}) => {
+            const targetUrl = new URL(url, 'https://www.uu-gg.one/').href;
+            const response = await gmRequest({
+                url: targetUrl,
+                responseType: 'arraybuffer',
+                headers: {
+                    Accept: 'text/html,application/xhtml+xml,application/xml,text/xml;q=0.9,*/*;q=0.8',
+                    ...headers
+                }
+            });
+            const contentType = response.responseHeaders || '';
+            const encoding = /gbk|gb2312/i.test(contentType) ? 'gbk' : 'utf-8';
+            try {
+                return new TextDecoder(encoding).decode(response.response);
+            } catch (err) {
+                return response.responseText || new TextDecoder().decode(response.response);
+            }
+        };
+
+        const pageText = await requestText('https://www.uu-gg.one/forum.php');
+        const uid = pageText.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '';
+        const hasLoginForm = /id=["']lsform|member\.php\?mod=logging&action=login|name=["']?username|name=["']?password|请先登录/.test(pageText);
+        if (!uid || uid === '0' || hasLoginForm) {
+            recordTargetStatus('uugg', 'needs-login', {
+                stage: 'login',
+                message: '有叽叽论坛需要先登录账号',
+                url: 'https://www.uu-gg.one/forum.php'
+            });
+            return false;
+        }
+
+        const signPageText = await requestText('https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign');
+        if (/已经签到|今日已|签到过了|您今天已经签到/.test(signPageText)) {
+            return completeSign('uugg', '页面显示今日已签到');
+        }
+
+        const formhash = signPageText.match(/formhash=([a-z0-9]+)/i)?.[1] ||
+            signPageText.match(/name=["']formhash["']\s+value=["']([a-z0-9]+)["']/i)?.[1] ||
+            pageText.match(/formhash=([a-z0-9]+)/i)?.[1] ||
+            pageText.match(/formhash\s*=\s*['"]([a-z0-9]+)['"]/i)?.[1] ||
+            '';
+        if (!formhash) {
+            console.log('[有叽叽论坛] 未找到 formhash');
+            return false;
+        }
+
+        const signUrl = new URL('https://www.uu-gg.one/plugin.php');
+        signUrl.searchParams.set('id', 'dsu_paulsign:sign');
+        signUrl.searchParams.set('operation', 'qiandao');
+        signUrl.searchParams.set('formhash', formhash);
+        signUrl.searchParams.set('qdmode', '2');
+        signUrl.searchParams.set('fastreply', '6');
+        signUrl.searchParams.set('qdxq', 'ng');
+        signUrl.searchParams.set('infloat', 'yes');
+        signUrl.searchParams.set('handlekey', 'dsu_paulsign');
+        signUrl.searchParams.set('inajax', '1');
+        signUrl.searchParams.set('ajaxtarget', 'fwin_content_dsu_paulsign');
+
+        const signText = await requestText(signUrl.href, {
+            'X-Requested-With': 'XMLHttpRequest'
+        });
+        if (/恭喜你签到成功|签到成功|获得随机奖励|获得.*叽币/.test(signText)) {
+            return completeSign('uugg', '接口返回签到成功');
+        }
+        if (/已经签到|今日已|签到过了|您今天已经签到/.test(signText)) {
+            return completeSign('uugg', '接口返回今日已签到');
+        }
+        if (/member\.php\?mod=logging|请先登录|登录后/.test(signText)) {
+            recordTargetStatus('uugg', 'needs-login', {
+                stage: 'login',
+                message: '有叽叽论坛登录状态失效，需要重新登录',
+                url: 'https://www.uu-gg.one/forum.php'
+            });
+            return false;
+        }
+
+        console.log('[有叽叽论坛] 签到接口未返回成功标记', signText);
         return false;
     }
 
@@ -1344,6 +1427,26 @@
                     return await runSijisheApiSign();
                 } catch (err) {
                     console.log('[司机社] API 签到异常', err);
+                }
+                return false;
+            }
+        },
+        {
+            name: "有叽叽论坛",
+            matches: ["www.uu-gg.one"],
+            key: "uugg",
+            dashboard: {
+                url: "https://www.uu-gg.one/forum.php",
+                openMode: "background",
+                resultMode: "script",
+                note: "支持控制台 API 直签"
+            },
+            directRun: runUuGgApiSign,
+            async run() {
+                try {
+                    return await runUuGgApiSign();
+                } catch (err) {
+                    console.log('[有叽叽论坛] API 签到异常', err);
                 }
                 return false;
             }
