@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.7.0
+// @version      2.7.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -152,16 +152,26 @@
         GM_setValue(key, value);
     }
 
+    function getScopedStorageKey(baseKey, ...parts) {
+        return [baseKey, ...parts.map(part => String(part))].join(':');
+    }
+
     // 获取数据
     function getData(key) {
+        if (key) {
+            const scopedValue = GM_getValue(getScopedStorageKey(STORAGE_KEYS.successData, key));
+            if (typeof scopedValue === 'string') return scopedValue;
+        }
         const data = readObject(STORAGE_KEYS.successData);
         return data[key];
     }
 
     // 设置数据并标记今日已签到
     function markSignSuccess(key, message = '今日签到已确认') {
+        const today = getToday();
         const data = readObject(STORAGE_KEYS.successData);
-        data[key] = getToday();
+        data[key] = today;
+        GM_setValue(getScopedStorageKey(STORAGE_KEYS.successData, key), today);
         writeObject(STORAGE_KEYS.successData, data);
         recordTargetStatus(key, 'success', {
             stage: 'verify',
@@ -213,13 +223,17 @@
         writeObject(STORAGE_KEYS.dashboardStatus, store);
     }
 
+    function getTargetStatusStorageKey(day, key) {
+        return getScopedStorageKey(STORAGE_KEYS.dashboardStatus, day, key);
+    }
+
     function recordTargetStatus(key, status, options = {}) {
         if (!key) return;
         const today = getToday();
         const store = getStatusStore();
         const dayStatus = store[today] || {};
         const previous = dayStatus[key] || {};
-        dayStatus[key] = {
+        const nextStatus = {
             status,
             stage: options.stage || previous.stage || '',
             message: options.message || STATUS_META[status]?.message || previous.message || '',
@@ -227,14 +241,21 @@
             url: options.url || previous.url || location.href,
             attemptCount: options.incrementAttempt ? (previous.attemptCount || 0) + 1 : (previous.attemptCount || 0)
         };
+        dayStatus[key] = nextStatus;
         store[today] = dayStatus;
+        GM_setValue(getTargetStatusStorageKey(today, key), nextStatus);
         saveStatusStore(store);
         updateDashboardReminderButton();
     }
 
     function getRawTargetStatus(key) {
+        const today = getToday();
+        const scopedValue = GM_getValue(getTargetStatusStorageKey(today, key));
+        if (scopedValue && typeof scopedValue === 'object' && !Array.isArray(scopedValue)) {
+            return scopedValue;
+        }
         const store = getStatusStore();
-        const todayStatus = store[getToday()] || {};
+        const todayStatus = store[today] || {};
         return todayStatus[key] || null;
     }
 
@@ -253,12 +274,13 @@
         if (raw?.stage === 'manual' && raw.status !== 'success') return raw;
 
         if (target.siteKey && getData(target.siteKey) === getToday()) {
+            const rawSuccess = raw?.status === 'success' ? raw : null;
             return {
                 status: 'success',
-                stage: raw?.stage || 'legacy',
-                message: raw?.message || '从既有签到记录同步为成功',
-                updatedAt: raw?.updatedAt || '',
-                url: raw?.url || target.url,
+                stage: rawSuccess?.stage || 'legacy',
+                message: rawSuccess?.message || '从既有签到记录同步为成功',
+                updatedAt: rawSuccess?.updatedAt || raw?.updatedAt || '',
+                url: rawSuccess?.url || raw?.url || target.url,
                 attemptCount: raw?.attemptCount || 0
             };
         }
@@ -1348,6 +1370,10 @@
             }
             console.log('[初音的青葱] 用户状态接口异常', vipJson);
             return false;
+        }
+
+        if (vipJson.obj.isCheck === true) {
+            return completeSign('fufugal', '用户状态接口显示今日已完成');
         }
 
         const huntJson = await requestJson('hunt');
