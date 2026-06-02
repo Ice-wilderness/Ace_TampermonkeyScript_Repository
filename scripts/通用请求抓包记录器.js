@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】通用请求抓包记录器
 // @namespace    bbshelperforme
-// @version      0.1.1
+// @version      0.1.2
 // @description  通用 fetch/XHR/表单/sendBeacon 请求记录工具，按站点启用后可导出接口日志
 // @author       Ice_wilderness
 // @match        *://*/*
@@ -52,6 +52,15 @@
 
     function getLogKey() {
         return `${LOG_KEY_PREFIX}${getHostKey()}`;
+    }
+
+    function getLocalDateTimeWithOffset(date = new Date()) {
+        const offsetMinutes = -date.getTimezoneOffset();
+        const sign = offsetMinutes >= 0 ? '+' : '-';
+        const absOffset = Math.abs(offsetMinutes);
+        const offsetHours = String(Math.floor(absOffset / 60)).padStart(2, '0');
+        const offsetMins = String(absOffset % 60).padStart(2, '0');
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}T${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}.${String(date.getMilliseconds()).padStart(3, '0')}${sign}${offsetHours}:${offsetMins}`;
     }
 
     function isCurrentHostEnabled() {
@@ -309,7 +318,7 @@
             ...entry,
             host: getHostKey(),
             pageUrl: sanitizeUrl(location.href),
-            time: new Date().toISOString()
+            time: getLocalDateTimeWithOffset()
         });
         GM_setValue(getLogKey(), safeLogs.slice(-MAX_LOGS));
     }
@@ -320,14 +329,14 @@
             host: getHostKey(),
             origin: location.origin,
             enabled: isCurrentHostEnabled(),
-            exportedAt: new Date().toISOString(),
+            exportedAt: getLocalDateTimeWithOffset(),
             logs: GM_getValue(getLogKey(), [])
         };
     }
 
     function getExportFileName() {
         const host = getHostKey().replace(/[^\w.-]+/g, '_');
-        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const timestamp = getLocalDateTimeWithOffset().replace(/[:.]/g, '-');
         return `api-capture-${host}-${timestamp}.json`;
     }
 

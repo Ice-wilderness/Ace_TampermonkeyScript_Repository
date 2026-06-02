@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.7.1
+// @version      2.7.2
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -130,6 +130,15 @@
         const date = new Date(value);
         if (Number.isNaN(date.getTime())) return '尚无记录';
         return `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+    }
+
+    function getLocalDateTimeWithOffset(date = new Date()) {
+        const offsetMinutes = -date.getTimezoneOffset();
+        const sign = offsetMinutes >= 0 ? '+' : '-';
+        const absOffset = Math.abs(offsetMinutes);
+        const offsetHours = String(Math.floor(absOffset / 60)).padStart(2, '0');
+        const offsetMins = String(absOffset % 60).padStart(2, '0');
+        return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}T${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}:${String(date.getSeconds()).padStart(2, '0')}.${String(date.getMilliseconds()).padStart(3, '0')}${sign}${offsetHours}:${offsetMins}`;
     }
 
     function readObject(key, fallback = {}) {
@@ -435,7 +444,7 @@
             siteName,
             mode,
             pageUrl: sanitizeDebugUrl(location.href),
-            startedAt: new Date().toISOString(),
+            startedAt: getLocalDateTimeWithOffset(),
             parent: activeSignDebugContext,
             entries: []
         };
@@ -456,7 +465,7 @@
         const item = {
             ...entry,
             pageUrl: sanitizeDebugUrl(location.href),
-            time: new Date().toISOString()
+            time: getLocalDateTimeWithOffset()
         };
         context.entries.push(item);
         console.log('[签到助手调试]', item.type || 'entry', item.method || '', item.url || '', item.status ?? item.error ?? '');
@@ -482,7 +491,7 @@
             mode: context.mode,
             pageUrl: context.pageUrl,
             startedAt: context.startedAt,
-            savedAt: new Date().toISOString(),
+            savedAt: getLocalDateTimeWithOffset(),
             reason,
             entries: context.entries
         });
@@ -494,7 +503,7 @@
         writeObject(STORAGE_KEYS.signDebugLogs, logs);
         return {
             tool: 'BBSSignHelperDebugLogs',
-            exportedAt: new Date().toISOString(),
+            exportedAt: getLocalDateTimeWithOffset(),
             retentionDays: 3,
             logs
         };
@@ -506,7 +515,7 @@
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `bbs-sign-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+        link.download = `bbs-sign-debug-${getLocalDateTimeWithOffset().replace(/[:.]/g, '-')}.json`;
         link.style.display = 'none';
         (document.body || document.documentElement).append(link);
         link.click();
