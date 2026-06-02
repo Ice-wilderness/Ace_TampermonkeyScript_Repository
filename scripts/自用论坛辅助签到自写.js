@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.6.0
+// @version      2.7.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -68,6 +68,8 @@
     const DEBUG_LOG_MAX_ENTRIES_PER_SESSION = 50;
     const DEBUG_SENSITIVE_KEY_RE = /authorization|cookie|set-cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey/i;
     const DEBUG_TEXT_RESPONSE_RE = /json|text|xml|html|javascript|form|plain|gbk|gb2312/i;
+    const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 2000;
+    const DASHBOARD_AUTO_REFRESH_DURATION_MS = 2 * 60 * 1000;
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
@@ -110,6 +112,8 @@
     let autoOpenCountdownLeft = 0;
     let autoOpenReminderSignature = '';
     let autoOpenSuppressedSignature = '';
+    let dashboardAutoRefreshTimer = null;
+    let dashboardAutoRefreshUntil = 0;
     let activeSignDebugContext = null;
 
     // 获取格式化后的今天日期 (yyyy-MM-dd)
@@ -2206,6 +2210,38 @@
         return `${getToday()}|${parts.join(',')}`;
     }
 
+    function getDashboardAutoRefreshLeftSeconds() {
+        if (!dashboardAutoRefreshUntil) return 0;
+        return Math.max(0, Math.ceil((dashboardAutoRefreshUntil - Date.now()) / 1000));
+    }
+
+    function isDashboardAutoRefreshActive() {
+        return getDashboardAutoRefreshLeftSeconds() > 0;
+    }
+
+    function stopDashboardAutoRefresh() {
+        if (dashboardAutoRefreshTimer) {
+            clearInterval(dashboardAutoRefreshTimer);
+            dashboardAutoRefreshTimer = null;
+        }
+        dashboardAutoRefreshUntil = 0;
+    }
+
+    function startDashboardAutoRefresh(rerender, durationMs = DASHBOARD_AUTO_REFRESH_DURATION_MS) {
+        stopDashboardAutoRefresh();
+        dashboardAutoRefreshUntil = Date.now() + durationMs;
+        dashboardAutoRefreshTimer = setInterval(() => {
+            const overlay = document.getElementById('bbs-sign-dashboard-overlay');
+            const shouldRerender = overlay?.dataset?.view === 'dashboard';
+            if (!shouldRerender || !isDashboardAutoRefreshActive()) {
+                stopDashboardAutoRefresh();
+                if (shouldRerender && typeof rerender === 'function') rerender();
+                return;
+            }
+            if (typeof rerender === 'function') rerender();
+        }, DASHBOARD_AUTO_REFRESH_INTERVAL_MS);
+    }
+
     function clearAutoOpenCountdown(suppressCurrent = false) {
         if (autoOpenTimer) {
             clearTimeout(autoOpenTimer);
@@ -3013,6 +3049,7 @@
         const launchableTargets = getLaunchableTargets();
         const directRunnableTargets = getDirectRunnableTargets();
         const groups = splitDashboardTargets(visibleTargets);
+        const autoRefreshLeft = getDashboardAutoRefreshLeftSeconds();
         const searchInput = createSearchField(dashboardSearchQuery, '搜索站点名称、网址或备注', (event) => {
             dashboardSearchQuery = event.target.value;
             showDashboard('dashboard');
@@ -3036,10 +3073,13 @@
                         type: 'button',
                         text: '一键处理未完成',
                         onClick: async () => {
+                            startDashboardAutoRefresh(rerender);
+                            rerender();
                             await runDirectTargets(getDirectRunnableTargets(), rerender);
                             for (const target of getLaunchableTargets()) {
                                 launchTarget(target);
                             }
+                            startDashboardAutoRefresh(rerender);
                             rerender();
                         }
                     }),
@@ -3048,7 +3088,10 @@
                         type: 'button',
                         text: '一键直签',
                         onClick: async () => {
+                            startDashboardAutoRefresh(rerender);
+                            rerender();
                             await runDirectTargets(getDirectRunnableTargets(), rerender);
+                            startDashboardAutoRefresh(rerender);
                             rerender();
                         }
                     }),
@@ -3070,7 +3113,7 @@
 
         body.append(el('div', {
             className: 'bbs-sign-message',
-            text: `今天 ${getToday()}，还有 ${directRunnableTargets.length} 个目标可控制台直签，${launchableTargets.length} 个目标需要打开页面。已禁用站点已从控制台隐藏，可在配置清单中管理。`
+            text: `今天 ${getToday()}，还有 ${directRunnableTargets.length} 个目标可控制台直签，${launchableTargets.length} 个目标需要打开页面。${autoRefreshLeft ? `自动刷新状态中，约 ${autoRefreshLeft} 秒后停止。` : '已禁用站点已从控制台隐藏，可在配置清单中管理。'}`
         }));
 
         if (!targets.length) {
@@ -3308,12 +3351,14 @@
     }
 
     function closeDashboardOverlay(overlay) {
+        stopDashboardAutoRefresh();
         overlay.remove();
         updateDashboardReminderButton();
     }
 
     function showDashboard(view = 'dashboard', editingId = '') {
         addDashboardStyles();
+        if (view !== 'dashboard') stopDashboardAutoRefresh();
         const existing = document.getElementById('bbs-sign-dashboard-overlay');
         const hadExisting = Boolean(existing);
         const launcherRect = !hadExisting
