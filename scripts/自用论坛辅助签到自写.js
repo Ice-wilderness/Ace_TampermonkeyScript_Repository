@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.5.0
+// @version      2.6.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -30,7 +30,6 @@
 // @connect      bbs.kfpromax.com
 // @connect      sjs47.com
 // @connect      www.galgamex.top
-// @connect      www.uu-gg.one
 // @connect      www.fufugal.com
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -59,8 +58,16 @@
     const STORAGE_KEYS = {
         successData: 'BBSSignHelperData',
         dashboardConfig: 'BBSSignHelperDashboardConfig',
-        dashboardStatus: 'BBSSignHelperDashboardStatus'
+        dashboardStatus: 'BBSSignHelperDashboardStatus',
+        signDebugLogs: 'BBSSignHelperDebugLogs'
     };
+
+    const DEBUG_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+    const DEBUG_LOG_TEXT_LIMIT = 6000;
+    const DEBUG_LOG_MAX_SESSIONS = 80;
+    const DEBUG_LOG_MAX_ENTRIES_PER_SESSION = 50;
+    const DEBUG_SENSITIVE_KEY_RE = /authorization|cookie|set-cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey/i;
+    const DEBUG_TEXT_RESPONSE_RE = /json|text|xml|html|javascript|form|plain|gbk|gb2312/i;
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
@@ -103,6 +110,7 @@
     let autoOpenCountdownLeft = 0;
     let autoOpenReminderSignature = '';
     let autoOpenSuppressedSignature = '';
+    let activeSignDebugContext = null;
 
     // 获取格式化后的今天日期 (yyyy-MM-dd)
     function getToday() {
@@ -123,6 +131,14 @@
     function readObject(key, fallback = {}) {
         const value = GM_getValue(key);
         if (!value || typeof value !== 'object' || Array.isArray(value)) {
+            return JSON.parse(JSON.stringify(fallback));
+        }
+        return value;
+    }
+
+    function readArray(key, fallback = []) {
+        const value = GM_getValue(key);
+        if (!Array.isArray(value)) {
             return JSON.parse(JSON.stringify(fallback));
         }
         return value;
@@ -269,6 +285,214 @@
         return '';
     }
 
+    function truncateDebugText(value, limit = DEBUG_LOG_TEXT_LIMIT) {
+        const text = String(value || '');
+        if (text.length <= limit) return text;
+        return `${text.slice(0, limit)}... [truncated ${text.length - limit} chars]`;
+    }
+
+    function redactDebugText(value) {
+        return String(value || '')
+            .replace(/(^|\r?\n)(set-cookie\s*:\s*)[^\r\n]*/gi, '$1$2[REDACTED]')
+            .replace(/("(?:[^"\\]|\\.)*(?:authorization|cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey)(?:[^"\\]|\\.)*"\s*:\s*)"[^"]*"/gi, '$1"[REDACTED]"')
+            .replace(/((?:authorization|cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey)=)[^&\s"'<>]+/gi, '$1[REDACTED]')
+            .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1[REDACTED]');
+    }
+
+    function stringifyDebugError(error) {
+        if (!error) return '';
+        if (typeof error === 'string') return redactDebugText(error);
+        if (error.message) return redactDebugText(error.message);
+        try {
+            return truncateDebugText(redactDebugText(JSON.stringify(error)));
+        } catch (err) {
+            return redactDebugText(String(error));
+        }
+    }
+
+    function sanitizeDebugUrl(value) {
+        try {
+            const url = new URL(String(value), location.href);
+            for (const key of Array.from(url.searchParams.keys())) {
+                if (DEBUG_SENSITIVE_KEY_RE.test(key)) {
+                    url.searchParams.set(key, '[REDACTED]');
+                }
+            }
+            return url.href;
+        } catch (err) {
+            return truncateDebugText(redactDebugText(value), 1000);
+        }
+    }
+
+    function normalizeDebugHeaderValue(value, key = '') {
+        if (DEBUG_SENSITIVE_KEY_RE.test(key)) return '[REDACTED]';
+        return truncateDebugText(redactDebugText(value), 1000);
+    }
+
+    function debugHeadersToObject(headers) {
+        const result = {};
+        if (!headers) return result;
+        try {
+            const normalized = new Headers(headers);
+            normalized.forEach((value, key) => {
+                result[key] = normalizeDebugHeaderValue(value, key);
+            });
+        } catch (err) {
+            if (headers && typeof headers === 'object') {
+                for (const [key, value] of Object.entries(headers)) {
+                    result[key] = normalizeDebugHeaderValue(value, key);
+                }
+            }
+        }
+        return result;
+    }
+
+    function debugBodyToText(body) {
+        if (body === undefined || body === null) return '';
+        const tag = Object.prototype.toString.call(body);
+        if (typeof body === 'string') return truncateDebugText(redactDebugText(body));
+        if (tag === '[object URLSearchParams]') return truncateDebugText(redactDebugText(body.toString()));
+        if (tag === '[object FormData]') {
+            const data = {};
+            body.forEach((value, key) => {
+                if (DEBUG_SENSITIVE_KEY_RE.test(key)) {
+                    data[key] = '[REDACTED]';
+                } else if (Object.prototype.toString.call(value) === '[object File]' || Object.prototype.toString.call(value) === '[object Blob]') {
+                    data[key] = `[File type=${value.type || 'unknown'} size=${value.size}]`;
+                } else {
+                    data[key] = truncateDebugText(redactDebugText(value), 1000);
+                }
+            });
+            return truncateDebugText(JSON.stringify(data));
+        }
+        if (tag === '[object Blob]' || tag === '[object File]') return `[${tag.slice(8, -1)} type=${body.type || 'unknown'} size=${body.size}]`;
+        if (tag === '[object ArrayBuffer]') return `[ArrayBuffer byteLength=${body.byteLength}]`;
+        if (ArrayBuffer.isView(body)) return `[${body.constructor?.name || 'TypedArray'} byteLength=${body.byteLength}]`;
+        try {
+            return truncateDebugText(redactDebugText(JSON.stringify(body)));
+        } catch (err) {
+            return `[${tag}]`;
+        }
+    }
+
+    function getDebugResponseHeaderText(response) {
+        return String(response?.responseHeaders || '');
+    }
+
+    function decodeDebugArrayBuffer(buffer, headers = '') {
+        if (!buffer) return '';
+        const encoding = /gbk|gb2312/i.test(headers) ? 'gbk' : 'utf-8';
+        try {
+            return new TextDecoder(encoding).decode(buffer);
+        } catch (err) {
+            try {
+                return new TextDecoder().decode(buffer);
+            } catch (fallbackErr) {
+                return `[ArrayBuffer byteLength=${buffer.byteLength || 0}]`;
+            }
+        }
+    }
+
+    function getDebugGmResponseText(response) {
+        if (response?.response instanceof ArrayBuffer) {
+            return truncateDebugText(redactDebugText(decodeDebugArrayBuffer(response.response, getDebugResponseHeaderText(response))));
+        }
+        if (typeof response?.responseText === 'string') {
+            return truncateDebugText(redactDebugText(response.responseText));
+        }
+        return '';
+    }
+
+    function startSignDebugCapture(siteKey, siteName, mode) {
+        const context = {
+            siteKey,
+            siteName,
+            mode,
+            pageUrl: sanitizeDebugUrl(location.href),
+            startedAt: new Date().toISOString(),
+            parent: activeSignDebugContext,
+            entries: []
+        };
+        activeSignDebugContext = context;
+        return context;
+    }
+
+    function finishSignDebugCapture(context) {
+        if (activeSignDebugContext === context) {
+            activeSignDebugContext = context.parent || null;
+        }
+        delete context.parent;
+    }
+
+    function addSignDebugEntry(entry) {
+        const context = activeSignDebugContext;
+        if (!context || context.entries.length >= DEBUG_LOG_MAX_ENTRIES_PER_SESSION) return null;
+        const item = {
+            ...entry,
+            pageUrl: sanitizeDebugUrl(location.href),
+            time: new Date().toISOString()
+        };
+        context.entries.push(item);
+        console.log('[签到助手调试]', item.type || 'entry', item.method || '', item.url || '', item.status ?? item.error ?? '');
+        return item;
+    }
+
+    function pruneSignDebugLogs(logs) {
+        const cutoff = Date.now() - DEBUG_LOG_RETENTION_MS;
+        return (Array.isArray(logs) ? logs : [])
+            .filter(item => {
+                const time = new Date(item.savedAt || item.startedAt || 0).getTime();
+                return Number.isFinite(time) && time >= cutoff;
+            })
+            .slice(-DEBUG_LOG_MAX_SESSIONS);
+    }
+
+    function persistSignDebugFailure(context, reason = {}) {
+        if (!context) return;
+        const logs = pruneSignDebugLogs(readArray(STORAGE_KEYS.signDebugLogs, []));
+        logs.push({
+            siteKey: context.siteKey,
+            siteName: context.siteName,
+            mode: context.mode,
+            pageUrl: context.pageUrl,
+            startedAt: context.startedAt,
+            savedAt: new Date().toISOString(),
+            reason,
+            entries: context.entries
+        });
+        writeObject(STORAGE_KEYS.signDebugLogs, pruneSignDebugLogs(logs));
+    }
+
+    function buildSignDebugExport() {
+        const logs = pruneSignDebugLogs(readArray(STORAGE_KEYS.signDebugLogs, []));
+        writeObject(STORAGE_KEYS.signDebugLogs, logs);
+        return {
+            tool: 'BBSSignHelperDebugLogs',
+            exportedAt: new Date().toISOString(),
+            retentionDays: 3,
+            logs
+        };
+    }
+
+    function downloadSignDebugLogs() {
+        const text = JSON.stringify(buildSignDebugExport(), null, 2);
+        const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `bbs-sign-debug-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+        link.style.display = 'none';
+        (document.body || document.documentElement).append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function clearSignDebugLogs() {
+        writeObject(STORAGE_KEYS.signDebugLogs, []);
+        console.log('[签到助手调试] 已清空失败请求调试日志');
+    }
+
     // 等待元素出现 (替代原先的 setInterval 轮询)
     function waitForElement(selector, timeout = 10000) {
         return new Promise((resolve) => {
@@ -292,25 +516,143 @@
     // 延时函数
     const delay = (ms) => new Promise(res => setTimeout(res, ms));
 
+    const SIGN_RECHECK_SCHEDULE = [
+        { durationMs: 30000, intervalMs: 1000 },
+        { durationMs: 60000, intervalMs: 3000 }
+    ];
+
+    function isSignSuccessRecorded(key) {
+        return getData(key) === getToday() || getRawTargetStatus(key)?.status === 'success';
+    }
+
+    async function waitForSiteSuccessRecheck(site) {
+        const startedAt = Date.now();
+        let elapsedBeforePhase = 0;
+        for (const phase of SIGN_RECHECK_SCHEDULE) {
+            const phaseEndAt = startedAt + elapsedBeforePhase + phase.durationMs;
+            while (Date.now() < phaseEndAt) {
+                await delay(Math.min(phase.intervalMs, Math.max(0, phaseEndAt - Date.now())));
+
+                if (isSignSuccessRecorded(site.key)) return true;
+
+                const urlBeforeRun = location.href;
+                try {
+                    const isSuccess = await site.run();
+                    if (isSuccess) {
+                        if (getData(site.key) !== getToday()) {
+                            markSignSuccess(site.key, '复查确认签到成功');
+                        }
+                        return true;
+                    }
+                    if (isSignSuccessRecorded(site.key)) return true;
+                } catch (err) {
+                    console.log(`[签到助手] ${site.name} 复查时发生异常:`, err);
+                }
+
+                if (location.href !== urlBeforeRun) {
+                    return isSignSuccessRecorded(site.key);
+                }
+            }
+            elapsedBeforePhase += phase.durationMs;
+        }
+        return false;
+    }
+
     function gmRequest(details) {
         return new Promise((resolve, reject) => {
             if (typeof GM_xmlhttpRequest !== 'function') {
                 reject(new Error('当前脚本管理器不支持 GM_xmlhttpRequest'));
                 return;
             }
+            const method = details.method || 'GET';
+            const startedAt = Date.now();
+            const debugEntry = addSignDebugEntry({
+                type: 'gmRequest',
+                method,
+                url: sanitizeDebugUrl(details.url),
+                requestHeaders: debugHeadersToObject(details.headers || {}),
+                requestBody: debugBodyToText(details.data),
+                responseType: details.responseType || 'text',
+                status: 'pending'
+            });
             GM_xmlhttpRequest({
-                method: details.method || 'GET',
+                method,
                 url: details.url,
                 headers: details.headers || {},
                 data: details.data,
                 responseType: details.responseType || 'text',
                 anonymous: false,
                 withCredentials: true,
-                onload: resolve,
-                onerror: reject,
-                ontimeout: reject
+                onload: (response) => {
+                    if (debugEntry) {
+                        debugEntry.status = response.status;
+                        debugEntry.finalUrl = sanitizeDebugUrl(response.finalUrl || details.url);
+                        debugEntry.responseHeaders = truncateDebugText(redactDebugText(getDebugResponseHeaderText(response)), 3000);
+                        debugEntry.response = getDebugGmResponseText(response);
+                        debugEntry.durationMs = Date.now() - startedAt;
+                    }
+                    resolve(response);
+                },
+                onerror: (err) => {
+                    if (debugEntry) {
+                        debugEntry.status = 'error';
+                        debugEntry.error = stringifyDebugError(err);
+                        debugEntry.durationMs = Date.now() - startedAt;
+                    }
+                    reject(err);
+                },
+                ontimeout: (err) => {
+                    if (debugEntry) {
+                        debugEntry.status = 'timeout';
+                        debugEntry.error = stringifyDebugError(err);
+                        debugEntry.durationMs = Date.now() - startedAt;
+                    }
+                    reject(err);
+                }
             });
         });
+    }
+
+    async function debugPageFetch(label, fetchFn, url, options = {}) {
+        const startedAt = Date.now();
+        const method = options.method || 'GET';
+        const debugEntry = addSignDebugEntry({
+            type: 'pageFetch',
+            label,
+            method,
+            url: sanitizeDebugUrl(url),
+            requestHeaders: debugHeadersToObject(options.headers || {}),
+            requestBody: debugBodyToText(options.body),
+            status: 'pending'
+        });
+
+        try {
+            const response = await fetchFn(url, options);
+            if (debugEntry) {
+                debugEntry.status = response.status;
+                debugEntry.ok = response.ok;
+                debugEntry.responseType = response.headers?.get?.('content-type') || '';
+                debugEntry.durationMs = Date.now() - startedAt;
+                if (DEBUG_TEXT_RESPONSE_RE.test(debugEntry.responseType)) {
+                    try {
+                        const text = await response.clone().text();
+                        debugEntry.response = truncateDebugText(redactDebugText(text));
+                    } catch (err) {
+                        debugEntry.responseError = err?.message || String(err);
+                    }
+                } else {
+                    debugEntry.response = debugEntry.responseType ? `[${debugEntry.responseType} body omitted]` : '[body omitted]';
+                }
+            }
+            return response;
+        } catch (err) {
+            if (debugEntry) {
+                debugEntry.status = 'error';
+                debugEntry.error = stringifyDebugError(err);
+                debugEntry.durationMs = Date.now() - startedAt;
+            }
+            throw err;
+        }
     }
 
     function extractCdata(text) {
@@ -444,8 +786,36 @@
     }
 
     async function runKfpromaxApiSign() {
+        const isKfpromaxPage = location.hostname === 'bbs.kfpromax.com';
+        const decodePageText = (buffer, headers = '') => {
+            const encoding = /gbk|gb2312/i.test(headers) ? 'gbk' : 'utf-8';
+            try {
+                return new TextDecoder(encoding).decode(buffer);
+            } catch (err) {
+                return new TextDecoder().decode(buffer);
+            }
+        };
         const requestPage = async (url) => {
             const targetUrl = new URL(url, 'https://bbs.kfpromax.com/').href;
+            if (isKfpromaxPage) {
+                const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+                    ? unsafeWindow.fetch.bind(unsafeWindow)
+                    : window.fetch.bind(window);
+                const response = await debugPageFetch('kfpromax-page', pageFetch, targetUrl, {
+                    credentials: 'include',
+                    headers: {
+                        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                    }
+                });
+                const contentType = response.headers?.get?.('content-type') || '';
+                const buffer = await response.arrayBuffer();
+                return {
+                    status: response.status,
+                    url: response.url || targetUrl,
+                    text: decodePageText(buffer, contentType)
+                };
+            }
+
             const response = await gmRequest({
                 url: targetUrl,
                 responseType: 'arraybuffer',
@@ -454,18 +824,21 @@
                 }
             });
             const contentType = response.responseHeaders || '';
-            const encoding = /gbk|gb2312/i.test(contentType) ? 'gbk' : 'utf-8';
             let text = '';
             try {
-                text = new TextDecoder(encoding).decode(response.response);
+                text = decodePageText(response.response, contentType);
             } catch (err) {
                 text = response.responseText || new TextDecoder().decode(response.response);
             }
             return { status: response.status, url: response.finalUrl || targetUrl, text };
         };
+        const isLoggedInPage = (text) => /login\.php\?action=quit|id=["']kf_topuser|id=["']kf_information|profile\.php\?action=show(?:&amp;|&)uid=/i.test(text);
+        const isLoginPage = (text) => !isLoggedInPage(text) && (
+            /<form[^>]+action=["'][^"']*login\.php|name=["']?pwpwd|您还没有登录|请先登录/.test(text)
+        );
 
         const growthPage = await requestPage('https://bbs.kfpromax.com/kf_growup.php');
-        if (/name=["']?pwuser|name=["']?pwpwd|action=["']?login\.php|您还没有登录|请先登录/.test(growthPage.text)) {
+        if (isLoginPage(growthPage.text)) {
             recordTargetStatus('kfpromax', 'needs-login', {
                 stage: 'login',
                 message: '绯月需要先登录账号',
@@ -491,7 +864,7 @@
         if (/领取成功|请明天继续|已经领过了|已领过/.test(signPage.text)) {
             return completeSign('kfpromax', '成长奖励接口返回领取成功');
         }
-        if (/name=["']?pwuser|name=["']?pwpwd|action=["']?login\.php|您还没有登录|请先登录/.test(signPage.text)) {
+        if (isLoginPage(signPage.text)) {
             recordTargetStatus('kfpromax', 'needs-login', {
                 stage: 'login',
                 message: '绯月登录状态失效，需要重新登录',
@@ -517,7 +890,8 @@
 
         const pageText = await requestText('https://sjs47.com/k_misign-sign.html');
         const uid = pageText.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '';
-        if (!uid || uid === '0' || /member\.php\?mod=logging|name=["']?username|name=["']?password|请先登录|登录后/.test(pageText)) {
+        const hasLogoutLink = /member\.php\?mod=logging(?:&amp;|&)action=logout/i.test(pageText);
+        if ((!uid || uid === '0') && !hasLogoutLink) {
             recordTargetStatus('sijishe', 'needs-login', {
                 stage: 'login',
                 message: '司机社需要先登录账号',
@@ -558,84 +932,63 @@
         return false;
     }
 
-    async function runUuGgApiSign() {
-        const requestText = async (url, headers = {}) => {
-            const targetUrl = new URL(url, 'https://www.uu-gg.one/').href;
-            const response = await gmRequest({
-                url: targetUrl,
-                responseType: 'arraybuffer',
-                headers: {
-                    Accept: 'text/html,application/xhtml+xml,application/xml,text/xml;q=0.9,*/*;q=0.8',
-                    ...headers
-                }
-            });
-            const contentType = response.responseHeaders || '';
-            const encoding = /gbk|gb2312/i.test(contentType) ? 'gbk' : 'utf-8';
-            try {
-                return new TextDecoder(encoding).decode(response.response);
-            } catch (err) {
-                return response.responseText || new TextDecoder().decode(response.response);
-            }
-        };
+    async function runUuGgPageSign() {
+        await delay(1200);
 
-        const pageText = await requestText('https://www.uu-gg.one/forum.php');
-        const uid = pageText.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '';
-        const hasLoginForm = /id=["']lsform|member\.php\?mod=logging&action=login|name=["']?username|name=["']?password|请先登录/.test(pageText);
-        if (!uid || uid === '0' || hasLoginForm) {
+        const html = document.documentElement?.innerHTML || '';
+        const bodyText = document.body?.innerText || '';
+        const pageText = `${document.title || ''}\n${bodyText}`;
+        const isSignPage = (() => {
+            try {
+                const url = new URL(location.href);
+                return url.pathname.endsWith('/plugin.php') && url.searchParams.get('id') === 'dsu_paulsign:sign';
+            } catch (err) {
+                return /plugin\.php\?id=dsu_paulsign(?::|%3A)sign/i.test(location.href);
+            }
+        })();
+
+        if (/Just a moment|Enable JavaScript and cookies to continue|_cf_chl_opt|cf-challenge|challenge-platform/i.test(`${pageText}\n${html}`)) {
+            recordTargetStatus('uugg', 'needs-foreground', {
+                stage: 'cloudflare',
+                message: '有叽叽论坛被 Cloudflare 验证页拦截，可能需要前台打开完成验证',
+                url: location.href
+            });
+            return false;
+        }
+
+        const rawUid = typeof unsafeWindow !== 'undefined' ? unsafeWindow.discuz_uid : '';
+        const uid = rawUid && rawUid !== '0'
+            ? String(rawUid)
+            : (html.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '');
+        const hasLogoutLink = Boolean(document.querySelector('a[href*="member.php?mod=logging"][href*="action=logout"]'));
+        const hasLoginForm = Boolean(document.querySelector('#lsform, #ls_username, input[name="username"][id="ls_username"]'));
+        const loginTextOnly = /请先登录|登录后|member\.php\?mod=logging(?:&amp;|&)action=login/i.test(pageText);
+
+        if ((!uid || uid === '0') && !hasLogoutLink && (hasLoginForm || loginTextOnly)) {
             recordTargetStatus('uugg', 'needs-login', {
                 stage: 'login',
                 message: '有叽叽论坛需要先登录账号',
-                url: 'https://www.uu-gg.one/forum.php'
+                url: location.href
             });
             return false;
         }
 
-        const signPageText = await requestText('https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign');
-        if (/已经签到|今日已|签到过了|您今天已经签到/.test(signPageText)) {
-            return completeSign('uugg', '页面显示今日已签到');
-        }
-
-        const formhash = signPageText.match(/formhash=([a-z0-9]+)/i)?.[1] ||
-            signPageText.match(/name=["']formhash["']\s+value=["']([a-z0-9]+)["']/i)?.[1] ||
-            pageText.match(/formhash=([a-z0-9]+)/i)?.[1] ||
-            pageText.match(/formhash\s*=\s*['"]([a-z0-9]+)['"]/i)?.[1] ||
-            '';
-        if (!formhash) {
-            console.log('[有叽叽论坛] 未找到 formhash');
+        if (!isSignPage) {
+            window.location.href = 'https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign';
             return false;
         }
 
-        const signUrl = new URL('https://www.uu-gg.one/plugin.php');
-        signUrl.searchParams.set('id', 'dsu_paulsign:sign');
-        signUrl.searchParams.set('operation', 'qiandao');
-        signUrl.searchParams.set('formhash', formhash);
-        signUrl.searchParams.set('qdmode', '2');
-        signUrl.searchParams.set('fastreply', '6');
-        signUrl.searchParams.set('qdxq', 'ng');
-        signUrl.searchParams.set('infloat', 'yes');
-        signUrl.searchParams.set('handlekey', 'dsu_paulsign');
-        signUrl.searchParams.set('inajax', '1');
-        signUrl.searchParams.set('ajaxtarget', 'fwin_content_dsu_paulsign');
+        const hasSignForm = Boolean(document.querySelector('#qiandao, form[name="qiandao"], input[name="qdxq"], input[name="todaysay"], textarea[name="todaysay"], a[href*="operation=qiandao"]')) ||
+            /今天签到了吗|写下今天最想说的话|我要签到|立即签到/.test(pageText);
+        const hasCurrentUserSignedRow = uid && new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,800}(?:今天已签到|已签到|${getToday()})`).test(html);
+        const hasSignedMessage = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到/.test(pageText);
+        const looksLikeSignedRankPage = !hasSignForm && /每日签到|签到排行|签到统计/.test(pageText) && /今日已签到|今天已签到/.test(pageText);
 
-        const signText = await requestText(signUrl.href, {
-            'X-Requested-With': 'XMLHttpRequest'
-        });
-        if (/恭喜你签到成功|签到成功|获得随机奖励|获得.*叽币/.test(signText)) {
-            return completeSign('uugg', '接口返回签到成功');
-        }
-        if (/已经签到|今日已|签到过了|您今天已经签到/.test(signText)) {
-            return completeSign('uugg', '接口返回今日已签到');
-        }
-        if (/member\.php\?mod=logging|请先登录|登录后/.test(signText)) {
-            recordTargetStatus('uugg', 'needs-login', {
-                stage: 'login',
-                message: '有叽叽论坛登录状态失效，需要重新登录',
-                url: 'https://www.uu-gg.one/forum.php'
-            });
-            return false;
+        if (hasCurrentUserSignedRow || hasSignedMessage || looksLikeSignedRankPage) {
+            return completeSign('uugg', '页面确认今日已签到');
         }
 
-        console.log('[有叽叽论坛] 签到接口未返回成功标记', signText);
+        console.log('[有叽叽论坛] 已打开签到页，等待页面自动签到或状态刷新');
         return false;
     }
 
@@ -646,7 +999,7 @@
             const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
                 ? unsafeWindow.fetch.bind(unsafeWindow)
                 : window.fetch.bind(window);
-            const response = await pageFetch(url, {
+            const response = await debugPageFetch('acgndog-api', pageFetch, url, {
                 credentials: 'include',
                 headers: {
                     'X-Requested-With': 'XMLHttpRequest'
@@ -699,49 +1052,58 @@
         return false;
     }
 
-    function findVikAuthTokenInValue(value, keyHint = '') {
-        if (!value) return '';
+    function collectVikAuthTokensFromValue(value, keyHint = '', tokens = []) {
+        if (!value) return tokens;
         const text = String(value).trim();
-        const bearerMatch = text.match(/Bearer\s+[A-Za-z0-9._-]+/i);
-        if (bearerMatch) return bearerMatch[0];
+        const addToken = (token) => {
+            const normalized = normalizeVikAuthToken(token);
+            if (normalized && !tokens.includes(normalized)) {
+                tokens.push(normalized);
+            }
+        };
 
-        const jwtMatch = text.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
-        if (jwtMatch) return jwtMatch[0];
+        for (const match of text.matchAll(/Bearer\s+[A-Za-z0-9._-]+/ig)) {
+            addToken(match[0]);
+        }
+
+        for (const match of text.matchAll(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g)) {
+            addToken(match[0]);
+        }
 
         const keyLooksAuth = /token|auth|jwt|authorization/i.test(keyHint);
-        if (keyLooksAuth && /^[A-Za-z0-9._-]{80,400}$/.test(text)) return text;
+        if (keyLooksAuth && /^[A-Za-z0-9._-]{80,400}$/.test(text)) {
+            addToken(text);
+        }
 
         try {
             const parsed = JSON.parse(text);
-            return findVikAuthTokenInObject(parsed);
+            collectVikAuthTokensFromObject(parsed, tokens);
         } catch (err) {
-            return '';
+            // Ignore non-JSON storage values.
         }
+        return tokens;
     }
 
-    function findVikAuthTokenInObject(value) {
-        if (!value || typeof value !== 'object') return '';
+    function collectVikAuthTokensFromObject(value, tokens = []) {
+        if (!value || typeof value !== 'object') return tokens;
         if (Array.isArray(value)) {
             for (const item of value) {
-                const token = findVikAuthTokenInObject(item);
-                if (token) return token;
+                collectVikAuthTokensFromObject(item, tokens);
             }
-            return '';
+            return tokens;
         }
 
         for (const [key, item] of Object.entries(value)) {
             if (typeof item === 'string') {
-                const token = findVikAuthTokenInValue(item, key);
-                if (token) return token;
+                collectVikAuthTokensFromValue(item, key, tokens);
             } else if (item && typeof item === 'object') {
-                const token = findVikAuthTokenInObject(item);
-                if (token) return token;
+                collectVikAuthTokensFromObject(item, tokens);
             }
         }
-        return '';
+        return tokens;
     }
 
-    function getVikAuthToken() {
+    function getVikAuthTokens() {
         const storages = [
             window.localStorage,
             window.sessionStorage,
@@ -758,14 +1120,32 @@
             }
         }
 
+        const tokens = [];
         for (const authKeyOnly of [true, false]) {
             for (const [key, value] of entries) {
                 if (authKeyOnly && !/token|auth|jwt|authorization/i.test(key)) continue;
-                const token = findVikAuthTokenInValue(value, key);
-                if (token) return token;
+                collectVikAuthTokensFromValue(value, key, tokens);
             }
         }
-        return '';
+        return tokens;
+    }
+
+    function normalizeVikAuthToken(token) {
+        const text = String(token || '').trim();
+        if (!text) return '';
+        if (/^Bearer\s+/i.test(text)) return text;
+        if (/^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(text)) {
+            return `Bearer ${text}`;
+        }
+        return text;
+    }
+
+    function isVikAuthError(payload) {
+        if (!payload || typeof payload !== 'object') return false;
+        const message = `${payload.message || ''}${payload.statusMessage || ''}`;
+        return payload.code === 401 ||
+            payload.statusCode === 401 ||
+            /登录|登陆|授权|令牌|token|unauthorized/i.test(message);
     }
 
     function isVikTodayTimestamp(value) {
@@ -787,8 +1167,8 @@
             return false;
         }
 
-        const authToken = getVikAuthToken();
-        if (!authToken) {
+        const authTokens = getVikAuthTokens();
+        if (!authTokens.length) {
             recordTargetStatus('vik', 'needs-login', {
                 stage: 'login',
                 message: '维咔需要先登录账号，或前台打开一次任务页刷新登录凭据',
@@ -801,19 +1181,23 @@
             ? unsafeWindow.fetch.bind(unsafeWindow)
             : window.fetch.bind(window);
 
-        const requestApi = async (path, payload) => {
-            const res = await pageFetch(`https://www.vikacg.com/api/vikacg/v1/${path}`, {
+        const requestApi = async (path, payload, authToken) => {
+            const headers = {
+                Accept: 'application/json',
+                'Content-Type': 'application/json',
+                Architecture: 'AixPot',
+                'Client-Country-Access': 'US',
+                'Client-Country-Origin': 'US',
+                'X-Client-Name': 'VikACG Moonlight'
+            };
+            if (authToken) {
+                headers.Authorization = authToken;
+            }
+            const requestUrl = `https://www.vikacg.com/api/vikacg/v1/${path}`;
+            const res = await debugPageFetch(`vik-${path}`, pageFetch, requestUrl, {
                 method: 'POST',
                 credentials: 'include',
-                headers: {
-                    Accept: 'application/json',
-                    'Content-Type': 'application/json',
-                    Authorization: authToken,
-                    Architecture: 'AixPot',
-                    'Client-Country-Access': 'US',
-                    'Client-Country-Origin': 'US',
-                    'X-Client-Name': 'VikACG Moonlight'
-                },
+                headers,
                 body: JSON.stringify(payload)
             });
             const text = await res.text();
@@ -825,13 +1209,36 @@
             }
         };
 
-        const userInfo = await requestApi('getUserInfo', { detail: true });
+        let authToken = '';
+        let userInfo = null;
+        let lastAuthError = null;
+        for (const candidateToken of authTokens) {
+            const candidateUserInfo = await requestApi('getUserInfo', { detail: true }, candidateToken);
+            if (candidateUserInfo?.status === 'success' && candidateUserInfo.data?.basic?.id) {
+                authToken = candidateToken;
+                userInfo = candidateUserInfo;
+                break;
+            }
+            if (isVikAuthError(candidateUserInfo)) {
+                lastAuthError = candidateUserInfo;
+                continue;
+            }
+            userInfo = candidateUserInfo;
+            break;
+        }
+        if ((!userInfo || userInfo.status !== 'success' || !userInfo.data?.basic?.id) && lastAuthError) {
+            const cookieUserInfo = await requestApi('getUserInfo', { detail: true }, '');
+            if (cookieUserInfo?.status === 'success' && cookieUserInfo.data?.basic?.id) {
+                authToken = '';
+                userInfo = cookieUserInfo;
+                lastAuthError = null;
+            }
+        }
         if (!userInfo || userInfo.status !== 'success' || !userInfo.data?.basic?.id) {
-            const message = `${userInfo?.message || ''}${userInfo?.statusMessage || ''}`;
-            if (/登录|登陆|授权|token|unauthorized/i.test(message)) {
+            if (lastAuthError || isVikAuthError(userInfo)) {
                 recordTargetStatus('vik', 'needs-login', {
                     stage: 'login',
-                    message: '维咔登录凭据已失效，需要重新登录',
+                    message: `维咔登录凭据已失效，${authTokens.length} 个候选令牌均未通过验证，请前台刷新任务页或重新登录`,
                     url: location.href
                 });
                 return false;
@@ -844,7 +1251,15 @@
             return completeSign('vik', '接口返回今日已签到');
         }
 
-        const signJson = await requestApi('userMission', {});
+        const signJson = await requestApi('userMission', {}, authToken);
+        if (isVikAuthError(signJson)) {
+            recordTargetStatus('vik', 'needs-login', {
+                stage: 'login',
+                message: '维咔登录凭据已失效，需要前台刷新任务页或重新登录',
+                url: location.href
+            });
+            return false;
+        }
         if (signJson?.status === 'success' && isVikTodayTimestamp(signJson.data?.sign_time)) {
             return completeSign('vik', `API 签到成功，连续 ${signJson.data?.sign_days || 0} 天`);
         }
@@ -857,7 +1272,15 @@
             page_count: 20,
             order: 'created_at',
             sort: null
-        });
+        }, authToken);
+        if (isVikAuthError(missionList)) {
+            recordTargetStatus('vik', 'needs-login', {
+                stage: 'login',
+                message: '维咔登录凭据已失效，需要前台刷新任务页或重新登录',
+                url: location.href
+            });
+            return false;
+        }
         const userId = String(userInfo.data.basic.id);
         const myMission = missionList?.data?.list?.find(item => String(item?.user?.id) === userId);
         if (isVikTodayTimestamp(myMission?.mission?.sign_time)) {
@@ -1436,19 +1859,13 @@
             matches: ["www.uu-gg.one"],
             key: "uugg",
             dashboard: {
-                url: "https://www.uu-gg.one/forum.php",
+                url: "https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign",
                 openMode: "background",
                 resultMode: "script",
-                note: "支持控制台 API 直签"
+                note: "后台打开签到页后自动签到并检测，Cloudflare 不支持控制台直签"
             },
-            directRun: runUuGgApiSign,
             async run() {
-                try {
-                    return await runUuGgApiSign();
-                } catch (err) {
-                    console.log('[有叽叽论坛] API 签到异常', err);
-                }
-                return false;
+                return await runUuGgPageSign();
             }
         },
         {
@@ -1705,6 +2122,7 @@
             incrementAttempt: true
         });
 
+        const debugContext = startSignDebugCapture(target.id, target.name, 'direct-api');
         try {
             const isSuccess = await site.directRun();
             if (!isSuccess && getNormalizedTargetStatus(target).status === 'running') {
@@ -1714,15 +2132,32 @@
                     url: target.url
                 });
             }
+            if (!isSuccess) {
+                const status = getNormalizedTargetStatus(target);
+                persistSignDebugFailure(debugContext, {
+                    outcome: 'failed',
+                    status: status.status,
+                    stage: status.stage || 'direct-api',
+                    message: status.message || '控制台直签未确认成功'
+                });
+            }
             return isSuccess;
         } catch (err) {
             console.log(`[签到助手] ${target.name} 控制台直签异常`, err);
             recordTargetStatus(target.id, 'failed', {
                 stage: 'direct-api',
-                message: `控制台直签异常：${err?.message || err}`,
+                message: `控制台直签异常：${stringifyDebugError(err)}`,
                 url: target.url
             });
+            persistSignDebugFailure(debugContext, {
+                outcome: 'error',
+                status: 'failed',
+                stage: 'direct-api',
+                message: stringifyDebugError(err)
+            });
             return false;
+        } finally {
+            finishSignDebugCapture(debugContext);
         }
     }
 
@@ -3040,8 +3475,14 @@
         }
     }
 
+    function registerSignDebugMenus() {
+        GM_registerMenuCommand('下载签到失败调试日志（保留3天）', downloadSignDebugLogs);
+        GM_registerMenuCommand('清空签到失败调试日志', clearSignDebugLogs);
+    }
+
     function registerDashboardMenu() {
         if (typeof GM_registerMenuCommand !== 'function') return;
+        registerSignDebugMenus();
         if (isLimestartHost()) {
             GM_registerMenuCommand('打开签到控制台', () => showDashboard());
             return;
@@ -3080,17 +3521,21 @@
                 return; // 当日已执行，退出
             }
 
+            const debugContext = startSignDebugCapture(site.key, site.name, 'site-run');
             try {
                 const beforeStatus = getRawTargetStatus(site.key);
                 // 运行该站点的特定逻辑，如果执行完成返回 true，则保存今天的日期
-                const isSuccess = await site.run();
+                let isSuccess = await site.run();
+                if (!isSuccess) {
+                    isSuccess = await waitForSiteSuccessRecheck(site);
+                }
                 if (isSuccess) {
                     if (getData(site.key) !== todayStr) {
                         markSignSuccess(site.key);
                     }
                 } else {
-                    const afterStatus = getRawTargetStatus(site.key);
-                    if (!afterStatus || afterStatus.updatedAt === beforeStatus?.updatedAt) {
+                    const rawAfterStatus = getRawTargetStatus(site.key);
+                    if (!rawAfterStatus || rawAfterStatus.updatedAt === beforeStatus?.updatedAt) {
                         const isSstm = site.key === 'sstm';
                         recordTargetStatus(site.key, isSstm ? 'needs-foreground' : 'opened', {
                             stage: 'run',
@@ -3100,14 +3545,29 @@
                             url: location.href
                         });
                     }
+                    const afterStatus = getRawTargetStatus(site.key);
+                    persistSignDebugFailure(debugContext, {
+                        outcome: 'failed',
+                        status: afterStatus?.status || 'opened',
+                        stage: afterStatus?.stage || 'run',
+                        message: afterStatus?.message || '站点脚本未确认签到成功'
+                    });
                 }
             } catch (err) {
                 console.error(`[签到助手] ${site.name} 执行时发生错误:`, err);
                 recordTargetStatus(site.key, 'failed', {
                     stage: 'error',
-                    message: err?.message ? `执行异常：${err.message}` : '执行时发生异常',
+                    message: `执行异常：${stringifyDebugError(err) || '未知错误'}`,
                     url: location.href
                 });
+                persistSignDebugFailure(debugContext, {
+                    outcome: 'error',
+                    status: 'failed',
+                    stage: 'error',
+                    message: stringifyDebugError(err)
+                });
+            } finally {
+                finishSignDebugCapture(debugContext);
             }
             break; // 匹配到一个站点后就不再往下走了
         }
