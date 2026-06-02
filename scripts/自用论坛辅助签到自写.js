@@ -26,8 +26,10 @@
 // @connect      feixueacg.org
 // @connect      www.south-plus.net
 // @connect      www.sl-asmr.com
+// @connect      bbs.kfpromax.com
+// @connect      sjs47.com
 // @connect      www.galgamex.top
-// @connect      www.acgndog.com
+// @connect      www.fufugal.com
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -439,17 +441,142 @@
         return false;
     }
 
+    async function runKfpromaxApiSign() {
+        const requestPage = async (url) => {
+            const targetUrl = new URL(url, 'https://bbs.kfpromax.com/').href;
+            const response = await gmRequest({
+                url: targetUrl,
+                responseType: 'arraybuffer',
+                headers: {
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                }
+            });
+            const contentType = response.responseHeaders || '';
+            const encoding = /gbk|gb2312/i.test(contentType) ? 'gbk' : 'utf-8';
+            let text = '';
+            try {
+                text = new TextDecoder(encoding).decode(response.response);
+            } catch (err) {
+                text = response.responseText || new TextDecoder().decode(response.response);
+            }
+            return { status: response.status, url: response.finalUrl || targetUrl, text };
+        };
+
+        const growthPage = await requestPage('https://bbs.kfpromax.com/kf_growup.php');
+        if (/name=["']?pwuser|name=["']?pwpwd|action=["']?login\.php|您还没有登录|请先登录/.test(growthPage.text)) {
+            recordTargetStatus('kfpromax', 'needs-login', {
+                stage: 'login',
+                message: '绯月需要先登录账号',
+                url: growthPage.url
+            });
+            return false;
+        }
+        if (/领取成功|请明天继续|已经领过了|已领过/.test(growthPage.text)) {
+            return completeSign('kfpromax', '页面显示成长奖励已领取');
+        }
+
+        const hrefMatch = growthPage.text.match(/href=["']([^"']*kf_growup\.php\?ok=3(?:&amp;|&)safeid=[^"']+)["']/i);
+        const safeidMatch = growthPage.text.match(/kf_growup\.php\?ok=3(?:&amp;|&)safeid=([a-z0-9]+)/i);
+        const signPath = hrefMatch?.[1]?.replace(/&amp;/g, '&') ||
+            (safeidMatch ? `kf_growup.php?ok=3&safeid=${safeidMatch[1]}` : '');
+
+        if (!signPath) {
+            console.log('[绯月] 未找到成长奖励领取链接');
+            return false;
+        }
+
+        const signPage = await requestPage(signPath);
+        if (/领取成功|请明天继续|已经领过了|已领过/.test(signPage.text)) {
+            return completeSign('kfpromax', '成长奖励接口返回领取成功');
+        }
+        if (/name=["']?pwuser|name=["']?pwpwd|action=["']?login\.php|您还没有登录|请先登录/.test(signPage.text)) {
+            recordTargetStatus('kfpromax', 'needs-login', {
+                stage: 'login',
+                message: '绯月登录状态失效，需要重新登录',
+                url: signPage.url
+            });
+            return false;
+        }
+
+        console.log('[绯月] 成长奖励接口未返回成功标记', signPage.text);
+        return false;
+    }
+
+    async function runSijisheApiSign() {
+        const requestText = async (url) => {
+            const response = await gmRequest({
+                url: new URL(url, 'https://sjs47.com/').href,
+                headers: {
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                }
+            });
+            return response.responseText || '';
+        };
+
+        const pageText = await requestText('https://sjs47.com/k_misign-sign.html');
+        const uid = pageText.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '';
+        if (!uid || uid === '0' || /member\.php\?mod=logging|name=["']?username|name=["']?password|请先登录|登录后/.test(pageText)) {
+            recordTargetStatus('sijishe', 'needs-login', {
+                stage: 'login',
+                message: '司机社需要先登录账号',
+                url: 'https://sjs47.com/k_misign-sign.html'
+            });
+            return false;
+        }
+
+        if (/btnvisted|今日已签到|已经签到|您今日已经签到|已签到/.test(pageText)) {
+            return completeSign('sijishe', '页面显示今日已签到');
+        }
+
+        const hrefMatch = pageText.match(/id=["']JD_sign["'][\s\S]*?href=["']([^"']+)["']/i) ||
+            pageText.match(/href=["']([^"']*plugin\.php\?id=k_misign(?::|%3A)sign[^"']*operation=qiandao[^"']*)["']/i);
+        const signPath = hrefMatch?.[1]?.replace(/&amp;/g, '&') || '';
+        if (!signPath) {
+            console.log('[司机社] 未找到签到链接');
+            return false;
+        }
+
+        const signUrl = new URL(signPath, 'https://sjs47.com/');
+        signUrl.searchParams.set('inajax', '1');
+        signUrl.searchParams.set('ajaxtarget', 'JD_sign');
+        await requestText(signUrl.href);
+
+        const rankText = await requestText('https://sjs47.com/plugin.php?id=k_misign:sign&operation=list&inajax=1&ajaxtarget=ranklist');
+        const uidPattern = new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,500}${getToday()}`);
+        if (uidPattern.test(rankText)) {
+            return completeSign('sijishe', '今日排行已确认签到记录');
+        }
+
+        const verifyText = await requestText('https://sjs47.com/k_misign-sign.html');
+        if (/btnvisted|今日已签到|已经签到|您今日已经签到|已签到/.test(verifyText)) {
+            return completeSign('sijishe', '页面复查确认今日已签到');
+        }
+
+        console.log('[司机社] 签到接口未确认成功', rankText);
+        return false;
+    }
+
     async function runAcgndogApiSign() {
         const checkAction = 'd2e5b56b75e2f3d4ab412a6d9561faee';
         const signAction = '5ced0113734a2bc46ecf3f30b0685b7b';
-        const checkRes = await gmRequest({
-            url: `https://www.acgndog.com/wp-admin/admin-ajax.php?action=${checkAction}&${signAction}%5Btype%5D=checkSigned`
-        });
+        const requestText = async (url) => {
+            const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+                ? unsafeWindow.fetch.bind(unsafeWindow)
+                : window.fetch.bind(window);
+            const response = await pageFetch(url, {
+                credentials: 'include',
+                headers: {
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            });
+            return await response.text();
+        };
+        const checkText = await requestText(`https://www.acgndog.com/wp-admin/admin-ajax.php?action=${checkAction}&${signAction}%5Btype%5D=checkSigned`);
         let checkJson = null;
         try {
-            checkJson = JSON.parse(checkRes.responseText || '{}');
+            checkJson = JSON.parse(checkText || '{}');
         } catch (err) {
-            console.log('[次元狗] 签到状态接口返回非 JSON', checkRes.responseText);
+            console.log('[次元狗] 签到状态接口返回非 JSON', checkText);
             return false;
         }
 
@@ -469,14 +596,12 @@
             return false;
         }
 
-        const signRes = await gmRequest({
-            url: `https://www.acgndog.com/wp-admin/admin-ajax.php?_nonce=${encodeURIComponent(checkJson._nonce)}&action=${signAction}&type=goSign`
-        });
+        const signText = await requestText(`https://www.acgndog.com/wp-admin/admin-ajax.php?_nonce=${encodeURIComponent(checkJson._nonce)}&action=${signAction}&type=goSign`);
         let signJson = null;
         try {
-            signJson = JSON.parse(signRes.responseText || '{}');
+            signJson = JSON.parse(signText || '{}');
         } catch (err) {
-            console.log('[次元狗] 签到接口返回非 JSON', signRes.responseText);
+            console.log('[次元狗] 签到接口返回非 JSON', signText);
             return false;
         }
 
@@ -488,6 +613,180 @@
         }
 
         console.log('[次元狗] API 返回异常:', signJson);
+        return false;
+    }
+
+    function findVikAuthTokenInValue(value, keyHint = '') {
+        if (!value) return '';
+        const text = String(value).trim();
+        const bearerMatch = text.match(/Bearer\s+[A-Za-z0-9._-]+/i);
+        if (bearerMatch) return bearerMatch[0];
+
+        const jwtMatch = text.match(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/);
+        if (jwtMatch) return jwtMatch[0];
+
+        const keyLooksAuth = /token|auth|jwt|authorization/i.test(keyHint);
+        if (keyLooksAuth && /^[A-Za-z0-9._-]{80,400}$/.test(text)) return text;
+
+        try {
+            const parsed = JSON.parse(text);
+            return findVikAuthTokenInObject(parsed);
+        } catch (err) {
+            return '';
+        }
+    }
+
+    function findVikAuthTokenInObject(value) {
+        if (!value || typeof value !== 'object') return '';
+        if (Array.isArray(value)) {
+            for (const item of value) {
+                const token = findVikAuthTokenInObject(item);
+                if (token) return token;
+            }
+            return '';
+        }
+
+        for (const [key, item] of Object.entries(value)) {
+            if (typeof item === 'string') {
+                const token = findVikAuthTokenInValue(item, key);
+                if (token) return token;
+            } else if (item && typeof item === 'object') {
+                const token = findVikAuthTokenInObject(item);
+                if (token) return token;
+            }
+        }
+        return '';
+    }
+
+    function getVikAuthToken() {
+        const storages = [
+            window.localStorage,
+            window.sessionStorage,
+            typeof unsafeWindow !== 'undefined' ? unsafeWindow.localStorage : null,
+            typeof unsafeWindow !== 'undefined' ? unsafeWindow.sessionStorage : null
+        ].filter(Boolean);
+
+        const entries = [];
+        for (const storage of storages) {
+            for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                if (!key) continue;
+                entries.push([key, storage.getItem(key)]);
+            }
+        }
+
+        for (const authKeyOnly of [true, false]) {
+            for (const [key, value] of entries) {
+                if (authKeyOnly && !/token|auth|jwt|authorization/i.test(key)) continue;
+                const token = findVikAuthTokenInValue(value, key);
+                if (token) return token;
+            }
+        }
+        return '';
+    }
+
+    function isVikTodayTimestamp(value) {
+        const raw = Number(value);
+        if (!Number.isFinite(raw) || raw <= 0) return false;
+        const timestamp = raw < 1e12 ? raw * 1000 : raw;
+        const date = new Date(timestamp);
+        if (Number.isNaN(date.getTime())) return false;
+        const y = date.getFullYear();
+        const m = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}` === getToday();
+    }
+
+    async function runVikApiSign() {
+        if (!location.href.includes('wallet/mission')) {
+            console.log('[维咔] 前往任务页');
+            window.location.href = '/wallet/mission';
+            return false;
+        }
+
+        const authToken = getVikAuthToken();
+        if (!authToken) {
+            recordTargetStatus('vik', 'needs-login', {
+                stage: 'login',
+                message: '维咔需要先登录账号，或前台打开一次任务页刷新登录凭据',
+                url: location.href
+            });
+            return false;
+        }
+
+        const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+            ? unsafeWindow.fetch.bind(unsafeWindow)
+            : window.fetch.bind(window);
+
+        const requestApi = async (path, payload) => {
+            const res = await pageFetch(`https://www.vikacg.com/api/vikacg/v1/${path}`, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    Accept: 'application/json',
+                    'Content-Type': 'application/json',
+                    Authorization: authToken,
+                    Architecture: 'AixPot',
+                    'Client-Country-Access': 'US',
+                    'Client-Country-Origin': 'US',
+                    'X-Client-Name': 'VikACG Moonlight'
+                },
+                body: JSON.stringify(payload)
+            });
+            const text = await res.text();
+            try {
+                return JSON.parse(text || '{}');
+            } catch (err) {
+                console.log(`[维咔] ${path} 接口返回非 JSON`, text);
+                return null;
+            }
+        };
+
+        const userInfo = await requestApi('getUserInfo', { detail: true });
+        if (!userInfo || userInfo.status !== 'success' || !userInfo.data?.basic?.id) {
+            const message = `${userInfo?.message || ''}${userInfo?.statusMessage || ''}`;
+            if (/登录|登陆|授权|token|unauthorized/i.test(message)) {
+                recordTargetStatus('vik', 'needs-login', {
+                    stage: 'login',
+                    message: '维咔登录凭据已失效，需要重新登录',
+                    url: location.href
+                });
+                return false;
+            }
+            console.log('[维咔] 用户信息接口异常', userInfo);
+            return false;
+        }
+
+        if (isVikTodayTimestamp(userInfo.data?.credit?.sign_time)) {
+            return completeSign('vik', '接口返回今日已签到');
+        }
+
+        const signJson = await requestApi('userMission', {});
+        if (signJson?.status === 'success' && isVikTodayTimestamp(signJson.data?.sign_time)) {
+            return completeSign('vik', `API 签到成功，连续 ${signJson.data?.sign_days || 0} 天`);
+        }
+        if (/已签到|已经签到|今日已/.test(signJson?.message || '')) {
+            return completeSign('vik', signJson.message || '接口返回今日已签到');
+        }
+
+        const missionList = await requestApi('getMissionList', {
+            paged: 1,
+            page_count: 20,
+            order: 'created_at',
+            sort: null
+        });
+        const userId = String(userInfo.data.basic.id);
+        const myMission = missionList?.data?.list?.find(item => String(item?.user?.id) === userId);
+        if (isVikTodayTimestamp(myMission?.mission?.sign_time)) {
+            return completeSign('vik', '任务列表确认今日已签到');
+        }
+
+        console.log('[维咔] API 返回异常:', signJson, missionList);
+        recordTargetStatus('vik', 'failed', {
+            stage: 'api',
+            message: signJson?.message || '维咔 API 签到未返回成功标记',
+            url: location.href
+        });
         return false;
     }
 
@@ -505,6 +804,64 @@
             return completeSign('galGameXNew', '接口返回今日已经签到过了');
         }
         console.log('[GalgameX 新站] API 返回异常:', text);
+        return false;
+    }
+
+    async function runFufugalApiSign() {
+        const requestJson = async (path) => {
+            const res = await gmRequest({
+                url: `https://www.fufugal.com/${path}`,
+                headers: {
+                    Accept: 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest'
+                }
+            });
+            const text = res.responseText || '';
+            try {
+                return JSON.parse(text || '{}');
+            } catch (err) {
+                console.log(`[初音的青葱] ${path} 接口返回非 JSON`, text);
+                return null;
+            }
+        };
+
+        const vipJson = await requestJson('getVip');
+        if (!vipJson || vipJson.code !== 0 || !vipJson.obj) {
+            const message = `${vipJson?.msg || ''}${vipJson?.message || ''}`;
+            if (/登录|登陆|未授权|unauthorized/i.test(message) || vipJson?.code === 401) {
+                recordTargetStatus('fufugal', 'needs-login', {
+                    stage: 'login',
+                    message: '初音的青葱需要先登录账号',
+                    url: location.href
+                });
+                return false;
+            }
+            console.log('[初音的青葱] 用户状态接口异常', vipJson);
+            return false;
+        }
+
+        const huntJson = await requestJson('hunt');
+        const huntText = Array.isArray(huntJson?.obj)
+            ? huntJson.obj.join(' ')
+            : `${huntJson?.msg || ''}${huntJson?.message || ''}${huntJson?.obj || ''}`;
+
+        if (huntJson?.code === 200 && /寻宝结束|获得|等级提升|积分/.test(huntText)) {
+            const score = Number.isFinite(Number(huntJson.wrap)) ? Number(huntJson.wrap) : 0;
+            return completeSign('fufugal', score > 0 ? `寻宝成功，获得 ${score} 积分` : '接口返回寻宝成功');
+        }
+        if (/已.*寻宝|已经.*寻宝|休息状态|今日已|明天再来/.test(huntText)) {
+            return completeSign('fufugal', huntJson?.msg || '接口返回今日已寻宝');
+        }
+        if (/登录|登陆|未授权|unauthorized/i.test(huntText) || huntJson?.code === 401) {
+            recordTargetStatus('fufugal', 'needs-login', {
+                stage: 'login',
+                message: '初音的青葱需要先登录账号',
+                url: location.href
+            });
+            return false;
+        }
+
+        console.log('[初音的青葱] 寻宝接口异常', huntJson);
         return false;
     }
 
@@ -916,9 +1273,8 @@
                 url: "https://www.acgndog.com/",
                 openMode: "background",
                 resultMode: "script",
-                note: "支持控制台 API 直签"
+                note: "后台打开页面后自动 API 签到"
             },
-            directRun: runAcgndogApiSign,
             async run() {
                 try {
                     return await runAcgndogApiSign();
@@ -935,22 +1291,20 @@
             dashboard: {
                 url: "https://bbs.kfpromax.com/kf_growup.php",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runKfpromaxApiSign,
             async run() {
                 if (!location.href.includes('kf_growup.php')) {
-                    window.location.href = "kf_growup.php";
+                    window.location.href = 'kf_growup.php';
                     return false;
                 }
-                const btn = await waitForElement('#alldiv .drow .dcol div div table tbody tr td div a', 5000);
-                if (btn) {
-                    if (btn.innerText.includes('已经领过了')) {
-                        console.log('已签到!');
-                    } else {
-                        btn.click();
-                        console.log('签到成功');
-                    }
-                    return completeSign('kfpromax', '成长奖励状态已确认');
+
+                try {
+                    return await runKfpromaxApiSign();
+                } catch (err) {
+                    console.log('[绯月] API 签到异常', err);
                 }
                 return false;
             }
@@ -962,27 +1316,14 @@
             dashboard: {
                 url: "https://www.vikacg.com/wallet/mission",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "后台打开任务页后自动 API 签到"
             },
             async run() {
-                if (!location.href.includes('wallet/mission')) {
-                    console.log('前往签到');
-                    window.location.href = "wallet/mission";
-                    return false;
-                }
-
-                // 更新为精确选择器，并对 CSS 转义字符进行 JS 双重转义
-                const selector = '#main-container > div > div > div.tablet\\:flex-\\[3\\].w-full.min-w-0 > div:nth-child(1) > div.arco-menu.arco-menu-light.arco-menu-vertical.mt-2 > div > div:nth-child(2) > div > div.ml-auto > button';
-                const btn = await waitForElement(selector, 5000);
-
-                if (btn) {
-                    if (!btn.innerText.includes('立即签到')) {
-                        console.log('已签到!');
-                    } else {
-                        btn.click();
-                        console.log('签到成功');
-                    }
-                    return completeSign('vik', '任务签到状态已确认');
+                try {
+                    return await runVikApiSign();
+                } catch (err) {
+                    console.log('[维咔] API 签到异常', err);
                 }
                 return false;
             }
@@ -994,46 +1335,15 @@
             dashboard: {
                 url: "https://sjs47.com/k_misign-sign.html",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runSijisheApiSign,
             async run() {
-                if (!location.href.includes('k_misign-sign.html')) {
-                    console.log('前往签到');
-                    window.location.href = "k_misign-sign.html";
-                    return false;
-                }
-
-                await delay(1000); // 稍微等待页面渲染
-                if ($('#fwin_login').length > 0) {
-                    console.log('检测到登录弹窗，等待用户登录...');
-                    return false;
-                }
-
-                const isSigned = () => {
-                    const btnVisited = document.querySelector('.btnvisted');
-                    const statusText = document.querySelector('.qdleft .font');
-                    return btnVisited || (statusText && !statusText.innerText.includes("您今天还没有签到"));
-                };
-
-                if (isSigned()) {
-                    console.log('已签到!');
-                    return completeSign('sijishe', '页面显示今日已签到');
-                }
-
-                const btnSign = document.querySelector('#JD_sign');
-                if (btnSign) {
-                    btnSign.click();
-                    console.log('已点击签到，等待页面确认...');
-
-                    for (let i = 0; i < 10; i++) {
-                        await delay(500);
-                        if (isSigned()) {
-                            console.log('签到成功');
-                            return completeSign('sijishe', '点击后已检测到签到成功');
-                        }
-                    }
-
-                    console.log('签到点击后未检测到已签到状态，暂不记录签到时间。');
+                try {
+                    return await runSijisheApiSign();
+                } catch (err) {
+                    console.log('[司机社] API 签到异常', err);
                 }
                 return false;
             }
@@ -1143,20 +1453,15 @@
             dashboard: {
                 url: "https://www.fufugal.com/",
                 openMode: "background",
-                resultMode: "script"
+                resultMode: "script",
+                note: "支持控制台 API 直签"
             },
+            directRun: runFufugalApiSign,
             async run() {
-                // 等待指定的寻宝(签到)按钮出现
-                const btn = await waitForElement('#photo_wrap > figure > div.user-infos > div.xbs.el-tooltip__trigger.el-tooltip__trigger', 5000);
-                if (btn) {
-                    // 如果按钮文本包含"寻宝"说明还没签到，进行点击
-                    if (btn.innerText.includes('寻宝')) {
-                        btn.click();
-                        console.log('执行寻宝(签到)点击');
-                    } else {
-                        console.log('已寻宝(签到)');
-                    }
-                    return completeSign('fufugal', '寻宝按钮状态已确认');
+                try {
+                    return await runFufugalApiSign();
+                } catch (err) {
+                    console.log('[初音的青葱] API 签到异常', err);
                 }
                 return false;
             }
