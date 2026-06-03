@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.7.2
+// @version      2.8.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -70,6 +70,9 @@
     const DEBUG_TEXT_RESPONSE_RE = /json|text|xml|html|javascript|form|plain|gbk|gb2312/i;
     const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 2000;
     const DASHBOARD_AUTO_REFRESH_DURATION_MS = 2 * 60 * 1000;
+    const DIRECT_SIGN_CONCURRENCY = 4;
+    const DIRECT_SIGN_RETRY_ATTEMPTS = 3;
+    const DIRECT_SIGN_RETRY_DELAY_MS = 3000;
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
@@ -115,6 +118,8 @@
     let dashboardAutoRefreshTimer = null;
     let dashboardAutoRefreshUntil = 0;
     let activeSignDebugContext = null;
+    let dismissedPageSignToastSignature = '';
+    let uuGgPageSubmitAttempted = false;
 
     // 获取格式化后的今天日期 (yyyy-MM-dd)
     function getToday() {
@@ -254,7 +259,160 @@
         store[today] = dayStatus;
         GM_setValue(getTargetStatusStorageKey(today, key), nextStatus);
         saveStatusStore(store);
+        showPageSignToast(key, status, nextStatus);
         updateDashboardReminderButton();
+    }
+
+    function addPageSignToastStyles() {
+        if (document.getElementById('bbs-sign-page-toast-style')) return;
+        const css = `
+            #bbs-sign-page-toast {
+                position: fixed;
+                top: 18px;
+                left: 50%;
+                z-index: 2147483647;
+                display: flex;
+                align-items: flex-start;
+                gap: 10px;
+                width: min(520px, calc(100vw - 28px));
+                box-sizing: border-box;
+                border: 1px solid rgba(15, 23, 42, 0.12);
+                border-radius: 12px;
+                padding: 12px 14px;
+                color: #0f172a;
+                background: rgba(255, 255, 255, 0.96);
+                box-shadow: 0 18px 52px rgba(15, 23, 42, 0.22);
+                font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                transform: translateX(-50%);
+                cursor: pointer;
+                backdrop-filter: blur(12px);
+            }
+            #bbs-sign-page-toast .bbs-sign-page-toast-dot {
+                width: 10px;
+                height: 10px;
+                flex: 0 0 auto;
+                border-radius: 999px;
+                margin-top: 5px;
+                background: #2563eb;
+                box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.14);
+            }
+            #bbs-sign-page-toast .bbs-sign-page-toast-main {
+                min-width: 0;
+                flex: 1;
+            }
+            #bbs-sign-page-toast .bbs-sign-page-toast-title {
+                font-weight: 800;
+                line-height: 1.25;
+            }
+            #bbs-sign-page-toast .bbs-sign-page-toast-message {
+                margin-top: 3px;
+                color: #475569;
+                font-size: 13px;
+                overflow-wrap: anywhere;
+            }
+            #bbs-sign-page-toast .bbs-sign-page-toast-hint {
+                color: #94a3b8;
+                font-size: 12px;
+                white-space: nowrap;
+            }
+            #bbs-sign-page-toast.success {
+                border-color: rgba(16, 185, 129, 0.35);
+                background: rgba(240, 253, 244, 0.96);
+            }
+            #bbs-sign-page-toast.success .bbs-sign-page-toast-dot {
+                background: #10b981;
+                box-shadow: 0 0 0 4px rgba(16, 185, 129, 0.14);
+            }
+            #bbs-sign-page-toast.danger {
+                border-color: rgba(244, 63, 94, 0.35);
+                background: rgba(255, 241, 242, 0.97);
+            }
+            #bbs-sign-page-toast.danger .bbs-sign-page-toast-dot {
+                background: #f43f5e;
+                box-shadow: 0 0 0 4px rgba(244, 63, 94, 0.14);
+            }
+            #bbs-sign-page-toast.warning {
+                border-color: rgba(245, 158, 11, 0.42);
+                background: rgba(255, 251, 235, 0.97);
+            }
+            #bbs-sign-page-toast.warning .bbs-sign-page-toast-dot {
+                background: #f59e0b;
+                box-shadow: 0 0 0 4px rgba(245, 158, 11, 0.16);
+            }
+            #bbs-sign-page-toast.muted,
+            #bbs-sign-page-toast.neutral {
+                background: rgba(248, 250, 252, 0.97);
+            }
+            @media (max-width: 560px) {
+                #bbs-sign-page-toast {
+                    top: 10px;
+                    align-items: flex-start;
+                    padding: 11px 12px;
+                }
+                #bbs-sign-page-toast .bbs-sign-page-toast-hint {
+                    display: none;
+                }
+            }
+        `;
+        const style = document.createElement('style');
+        style.id = 'bbs-sign-page-toast-style';
+        style.textContent = css;
+        (document.head || document.documentElement).append(style);
+    }
+
+    function getPageSignToastTitle(status) {
+        if (status === 'running') return '签到中';
+        if (status === 'success') return '签到成功';
+        if (status === 'opened') return '等待确认';
+        if (status === 'failed' || status === 'needs-login' || status === 'needs-foreground') return '签到失败';
+        return STATUS_META[status]?.label || '签到状态';
+    }
+
+    function showPageSignToast(key, status, options = {}) {
+        if (isLimestartHost()) return;
+        const mount = document.body || document.documentElement;
+        if (!mount) return;
+
+        const message = options.message || STATUS_META[status]?.message || '';
+        const signature = `${key}|${status}|${message}`;
+        if (dismissedPageSignToastSignature === signature) return;
+
+        addPageSignToastStyles();
+        let toast = document.getElementById('bbs-sign-page-toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'bbs-sign-page-toast';
+            toast.setAttribute('role', 'status');
+            toast.setAttribute('aria-live', 'polite');
+            toast.addEventListener('click', () => {
+                dismissedPageSignToastSignature = toast.dataset.signature || '';
+                toast.remove();
+            });
+            mount.append(toast);
+        }
+
+        const meta = STATUS_META[status] || STATUS_META['not-started'];
+        toast.className = meta.tone || 'neutral';
+        toast.dataset.signature = signature;
+        toast.title = '点击关闭';
+        toast.innerHTML = '';
+
+        const dot = document.createElement('span');
+        dot.className = 'bbs-sign-page-toast-dot';
+        const main = document.createElement('div');
+        main.className = 'bbs-sign-page-toast-main';
+        const title = document.createElement('div');
+        title.className = 'bbs-sign-page-toast-title';
+        title.textContent = getPageSignToastTitle(status);
+        const messageNode = document.createElement('div');
+        messageNode.className = 'bbs-sign-page-toast-message';
+        messageNode.textContent = message;
+        const hint = document.createElement('div');
+        hint.className = 'bbs-sign-page-toast-hint';
+        hint.textContent = '点击关闭';
+
+        main.append(title, messageNode);
+        toast.append(dot, main, hint);
     }
 
     function getRawTargetStatus(key) {
@@ -446,6 +604,7 @@
             pageUrl: sanitizeDebugUrl(location.href),
             startedAt: getLocalDateTimeWithOffset(),
             parent: activeSignDebugContext,
+            finished: false,
             entries: []
         };
         activeSignDebugContext = context;
@@ -453,15 +612,19 @@
     }
 
     function finishSignDebugCapture(context) {
+        context.finished = true;
         if (activeSignDebugContext === context) {
-            activeSignDebugContext = context.parent || null;
+            let parent = context.parent || null;
+            while (parent?.finished) {
+                parent = parent.parent || null;
+            }
+            activeSignDebugContext = parent;
         }
         delete context.parent;
     }
 
-    function addSignDebugEntry(entry) {
-        const context = activeSignDebugContext;
-        if (!context || context.entries.length >= DEBUG_LOG_MAX_ENTRIES_PER_SESSION) return null;
+    function addSignDebugEntry(entry, context = activeSignDebugContext) {
+        if (!context || context.finished || context.entries.length >= DEBUG_LOG_MAX_ENTRIES_PER_SESSION) return null;
         const item = {
             ...entry,
             pageUrl: sanitizeDebugUrl(location.href),
@@ -609,7 +772,7 @@
                 requestBody: debugBodyToText(details.data),
                 responseType: details.responseType || 'text',
                 status: 'pending'
-            });
+            }, details.debugContext || activeSignDebugContext);
             GM_xmlhttpRequest({
                 method,
                 url: details.url,
@@ -648,7 +811,7 @@
         });
     }
 
-    async function debugPageFetch(label, fetchFn, url, options = {}) {
+    async function debugPageFetch(label, fetchFn, url, options = {}, debugContext = activeSignDebugContext) {
         const startedAt = Date.now();
         const method = options.method || 'GET';
         const debugEntry = addSignDebugEntry({
@@ -659,7 +822,7 @@
             requestHeaders: debugHeadersToObject(options.headers || {}),
             requestBody: debugBodyToText(options.body),
             status: 'pending'
-        });
+        }, debugContext);
 
         try {
             const response = await fetchFn(url, options);
@@ -716,9 +879,10 @@
         return params;
     }
 
-    async function runFeixueApiSign() {
+    async function runFeixueApiSign(debugContext) {
         const modalRes = await gmRequest({
-            url: 'https://feixueacg.org/plugin.php?id=dc_signin:sign&infloat=yes&handlekey=sign&inajax=1&ajaxtarget=fwin_content_sign'
+            url: 'https://feixueacg.org/plugin.php?id=dc_signin:sign&infloat=yes&handlekey=sign&inajax=1&ajaxtarget=fwin_content_sign',
+            debugContext
         });
         const modalHtml = extractCdata(modalRes.responseText);
 
@@ -752,7 +916,8 @@
             headers: {
                 'Content-Type': 'application/x-www-form-urlencoded'
             },
-            data: params.toString()
+            data: params.toString(),
+            debugContext
         });
         const submitText = submitRes.responseText || '';
 
@@ -775,10 +940,11 @@
         return false;
     }
 
-    async function runSouthPlusApiSign() {
+    async function runSouthPlusApiSign(debugContext) {
         const fetchTask = async (id) => {
             let res = await gmRequest({
-                url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job&cid=${id}`
+                url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job&cid=${id}`,
+                debugContext
             });
             let text = res.responseText || '';
             if (text.includes('还没超过')) {
@@ -787,7 +953,8 @@
             }
             if (text.includes('已经申请')) {
                 res = await gmRequest({
-                    url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job2&cid=${id}`
+                    url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job2&cid=${id}`,
+                    debugContext
                 });
                 text = res.responseText || '';
                 if (text.includes('已经完成')) {
@@ -799,18 +966,21 @@
             return false;
         };
 
-        const w14 = await fetchTask('14');
-        const w15 = await fetchTask('15');
+        const [w14, w15] = await Promise.all([
+            fetchTask('14'),
+            fetchTask('15')
+        ]);
         if (w14 && w15) {
             return completeSign('southplus', '接口返回任务已完成');
         }
         return false;
     }
 
-    async function runSlAsmrApiSign() {
+    async function runSlAsmrApiSign(debugContext) {
         const res = await gmRequest({
             method: 'POST',
-            url: 'https://www.sl-asmr.com/api/mission/fast'
+            url: 'https://www.sl-asmr.com/api/mission/fast',
+            debugContext
         });
         const text = res.responseText || '';
         if (text.includes('签到成功') || text.includes('您已签到')) {
@@ -820,7 +990,7 @@
         return false;
     }
 
-    async function runKfpromaxApiSign() {
+    async function runKfpromaxApiSign(debugContext) {
         const isKfpromaxPage = location.hostname === 'bbs.kfpromax.com';
         const decodePageText = (buffer, headers = '') => {
             const encoding = /gbk|gb2312/i.test(headers) ? 'gbk' : 'utf-8';
@@ -841,7 +1011,7 @@
                     headers: {
                         Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
                     }
-                });
+                }, debugContext);
                 const contentType = response.headers?.get?.('content-type') || '';
                 const buffer = await response.arrayBuffer();
                 return {
@@ -856,7 +1026,8 @@
                 responseType: 'arraybuffer',
                 headers: {
                     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                }
+                },
+                debugContext
             });
             const contentType = response.responseHeaders || '';
             let text = '';
@@ -912,13 +1083,14 @@
         return false;
     }
 
-    async function runSijisheApiSign() {
+    async function runSijisheApiSign(debugContext) {
         const requestText = async (url) => {
             const response = await gmRequest({
                 url: new URL(url, 'https://sjs47.com/').href,
                 headers: {
                     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                }
+                },
+                debugContext
             });
             return response.responseText || '';
         };
@@ -1013,17 +1185,95 @@
             return false;
         }
 
-        const hasSignForm = Boolean(document.querySelector('#qiandao, form[name="qiandao"], input[name="qdxq"], input[name="todaysay"], textarea[name="todaysay"], a[href*="operation=qiandao"]')) ||
+        const signForm = document.querySelector('#qiandao, form[name="qiandao"]');
+        const hasSignForm = Boolean(signForm || document.querySelector('input[name="qdxq"], input[name="todaysay"], textarea[name="todaysay"], a[href*="operation=qiandao"]')) ||
             /今天签到了吗|写下今天最想说的话|我要签到|立即签到/.test(pageText);
         const hasCurrentUserSignedRow = uid && new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,800}(?:今天已签到|已签到|${getToday()})`).test(html);
-        const hasSignedMessage = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到/.test(pageText);
+        const hasSignedMessage = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|今日已签到|今天已签到|已经签到|签到过了|您今天已经签到|您今日已经签到/.test(pageText);
         const looksLikeSignedRankPage = !hasSignForm && /每日签到|签到排行|签到统计/.test(pageText) && /今日已签到|今天已签到/.test(pageText);
 
         if (hasCurrentUserSignedRow || hasSignedMessage || looksLikeSignedRankPage) {
             return completeSign('uugg', '页面确认今日已签到');
         }
 
-        console.log('[有叽叽论坛] 已打开签到页，等待页面自动签到或状态刷新');
+        if (signForm && !uuGgPageSubmitAttempted) {
+            uuGgPageSubmitAttempted = true;
+            const params = new URLSearchParams();
+            signForm.querySelectorAll('input, textarea, select').forEach(el => {
+                const name = el.getAttribute('name');
+                if (!name || el.disabled) return;
+                const type = String(el.type || '').toLowerCase();
+                if ((type === 'checkbox' || type === 'radio') && !el.checked) return;
+                let value = el.getAttribute('value') || el.value || '';
+                if (el.tagName === 'TEXTAREA') {
+                    value = el.value || el.textContent || value;
+                } else if (el.tagName === 'SELECT') {
+                    const selected = el.querySelector('option:checked') || el.querySelector('option');
+                    value = selected?.value || selected?.getAttribute('value') || value;
+                }
+                params.set(name, value);
+            });
+            if (!params.get('qdxq')) params.set('qdxq', 'wl');
+
+            if (!params.get('formhash')) {
+                console.log('[有叽叽论坛] 未找到签到 formhash');
+                recordTargetStatus('uugg', 'needs-foreground', {
+                    stage: 'formhash',
+                    message: '有叽叽论坛未找到签到 formhash，可能需要前台刷新签到页',
+                    url: location.href
+                });
+                return false;
+            }
+
+            const signUrl = new URL(
+                signForm.getAttribute('action') || 'plugin.php?id=dsu_paulsign:sign&operation=qiandao&infloat=1&inajax=1',
+                location.href
+            );
+            signUrl.searchParams.set('operation', 'qiandao');
+            signUrl.searchParams.set('infloat', '1');
+            signUrl.searchParams.set('inajax', '1');
+            recordTargetStatus('uugg', 'running', {
+                stage: 'page-api',
+                message: '正在从有叽叽页面内提交签到请求',
+                url: signUrl.href,
+                incrementAttempt: true
+            });
+
+            const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+                ? unsafeWindow.fetch.bind(unsafeWindow)
+                : window.fetch.bind(window);
+            const response = await debugPageFetch('uugg-page-sign', pageFetch, signUrl.href, {
+                method: 'POST',
+                credentials: 'include',
+                headers: {
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest'
+                },
+                body: params.toString()
+            });
+            const resultText = extractCdata(await response.text());
+            if (/恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|今日已签到|今天已签到|已经签到|签到过了|您今天已经签到|您今日已经签到/.test(resultText)) {
+                return completeSign('uugg', '页面内 API 返回签到成功或今日已签到');
+            }
+            if (/请先登录|登录后|member\.php\?mod=logging(?:&amp;|&)action=login/i.test(resultText)) {
+                recordTargetStatus('uugg', 'needs-login', {
+                    stage: 'login',
+                    message: '有叽叽论坛登录状态失效，需要重新登录',
+                    url: location.href
+                });
+                return false;
+            }
+            console.log('[有叽叽论坛] 页面内签到接口未确认成功', resultText);
+            recordTargetStatus('uugg', 'needs-foreground', {
+                stage: 'page-api',
+                message: '页面内签到请求已提交，但未确认成功，请前台检查结果',
+                url: location.href
+            });
+            return false;
+        }
+
+        console.log('[有叽叽论坛] 已打开签到页，等待页面内签到结果确认');
         return false;
     }
 
@@ -1331,10 +1581,11 @@
         return false;
     }
 
-    async function runGalgameXNewApiSign() {
+    async function runGalgameXNewApiSign(debugContext) {
         const res = await gmRequest({
             method: 'POST',
-            url: 'https://www.galgamex.top/api/user/checkin'
+            url: 'https://www.galgamex.top/api/user/checkin',
+            debugContext
         });
         const text = res.responseText || '';
         if (text.includes('randomMoemoepoints')) {
@@ -1348,14 +1599,15 @@
         return false;
     }
 
-    async function runFufugalApiSign() {
+    async function runFufugalApiSign(debugContext) {
         const requestJson = async (path) => {
             const res = await gmRequest({
                 url: `https://www.fufugal.com/${path}`,
                 headers: {
                     Accept: 'application/json',
                     'X-Requested-With': 'XMLHttpRequest'
-                }
+                },
+                debugContext
             });
             const text = res.responseText || '';
             try {
@@ -1901,7 +2153,7 @@
                 url: "https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign",
                 openMode: "background",
                 resultMode: "script",
-                note: "后台打开签到页后自动签到并检测，Cloudflare 不支持控制台直签"
+                note: "后台打开签到页后由页面内 API 提交，Cloudflare 验证需前台完成"
             },
             async run() {
                 return await runUuGgPageSign();
@@ -2150,65 +2402,108 @@
         });
     }
 
-    async function runDirectTarget(target) {
-        const site = siteConfigs.find(item => item.key === target.siteKey && typeof item.directRun === 'function');
-        if (!site) return false;
-
+    async function runDirectTargetOnce(target, site, attempt, totalAttempts) {
         recordTargetStatus(target.id, 'running', {
             stage: 'direct-api',
-            message: '正在从控制台发送 API 签到请求',
+            message: `正在从控制台发送 API 签到请求（${attempt}/${totalAttempts}）`,
             url: target.url,
             incrementAttempt: true
         });
 
         const debugContext = startSignDebugCapture(target.id, target.name, 'direct-api');
         try {
-            const isSuccess = await site.directRun();
-            if (!isSuccess && getNormalizedTargetStatus(target).status === 'running') {
-                recordTargetStatus(target.id, 'failed', {
-                    stage: 'direct-api',
-                    message: 'API 签到未返回成功标记',
-                    url: target.url
-                });
-            }
+            const isSuccess = await site.directRun(debugContext);
             if (!isSuccess) {
                 const status = getNormalizedTargetStatus(target);
-                persistSignDebugFailure(debugContext, {
-                    outcome: 'failed',
-                    status: status.status,
-                    stage: status.stage || 'direct-api',
-                    message: status.message || '控制台直签未确认成功'
-                });
+                const reason = status.status === 'running'
+                    ? {
+                        outcome: 'failed',
+                        status: 'failed',
+                        stage: 'direct-api',
+                        message: 'API 签到未返回成功标记'
+                    }
+                    : {
+                        outcome: 'failed',
+                        status: status.status,
+                        stage: status.stage || 'direct-api',
+                        message: status.message || '控制台直签未确认成功'
+                    };
+                return {
+                    isSuccess: false,
+                    debugContext,
+                    reason
+                };
             }
-            return isSuccess;
+            return { isSuccess: true, debugContext, reason: null };
         } catch (err) {
             console.log(`[签到助手] ${target.name} 控制台直签异常`, err);
-            recordTargetStatus(target.id, 'failed', {
-                stage: 'direct-api',
-                message: `控制台直签异常：${stringifyDebugError(err)}`,
-                url: target.url
-            });
-            persistSignDebugFailure(debugContext, {
-                outcome: 'error',
-                status: 'failed',
-                stage: 'direct-api',
-                message: stringifyDebugError(err)
-            });
-            return false;
+            return {
+                isSuccess: false,
+                debugContext,
+                reason: {
+                    outcome: 'error',
+                    status: 'failed',
+                    stage: 'direct-api',
+                    message: stringifyDebugError(err)
+                }
+            };
         } finally {
             finishSignDebugCapture(debugContext);
         }
     }
 
-    async function runDirectTargets(targets, rerender) {
-        for (const target of targets) {
-            if (!target.enabled || !target.directApi || isTargetDone(getNormalizedTargetStatus(target).status)) continue;
-            const promise = runDirectTarget(target);
-            if (typeof rerender === 'function') rerender();
-            await promise;
-            if (typeof rerender === 'function') rerender();
-            await delay(200);
+    async function runDirectTarget(target, onProgress) {
+        const site = siteConfigs.find(item => item.key === target.siteKey && typeof item.directRun === 'function');
+        if (!site) return false;
+
+        let lastResult = null;
+        for (let attempt = 1; attempt <= DIRECT_SIGN_RETRY_ATTEMPTS; attempt++) {
+            lastResult = await runDirectTargetOnce(target, site, attempt, DIRECT_SIGN_RETRY_ATTEMPTS);
+            if (lastResult.isSuccess) return true;
+
+            if (attempt < DIRECT_SIGN_RETRY_ATTEMPTS) {
+                const status = getNormalizedTargetStatus(target);
+                recordTargetStatus(target.id, 'running', {
+                    stage: 'retry',
+                    message: `第 ${attempt} 次未确认成功，${DIRECT_SIGN_RETRY_DELAY_MS / 1000} 秒后自动重试（${attempt + 1}/${DIRECT_SIGN_RETRY_ATTEMPTS}）`,
+                    url: status.url || target.url
+                });
+                if (typeof onProgress === 'function') onProgress();
+                await delay(DIRECT_SIGN_RETRY_DELAY_MS);
+            }
         }
+
+        if (lastResult?.debugContext && lastResult?.reason) {
+            recordTargetStatus(target.id, lastResult.reason.status || 'failed', {
+                stage: lastResult.reason.stage || 'direct-api',
+                message: lastResult.reason.message || '控制台直签未确认成功',
+                url: target.url
+            });
+            persistSignDebugFailure(lastResult.debugContext, lastResult.reason);
+        }
+        return false;
+    }
+
+    async function runDirectTargets(targets, rerender) {
+        const runnableTargets = targets.filter(target => {
+            if (!target.enabled || !target.directApi) return false;
+            return !isTargetDone(getNormalizedTargetStatus(target).status);
+        });
+        if (!runnableTargets.length) return;
+
+        let nextIndex = 0;
+        const workerCount = Math.min(DIRECT_SIGN_CONCURRENCY, runnableTargets.length);
+        if (typeof rerender === 'function') rerender();
+
+        await Promise.all(Array.from({ length: workerCount }, async () => {
+            while (nextIndex < runnableTargets.length) {
+                const target = runnableTargets[nextIndex++];
+                const promise = runDirectTarget(target, rerender);
+                if (typeof rerender === 'function') rerender();
+                await promise;
+                if (typeof rerender === 'function') rerender();
+            }
+        }));
     }
 
     function isTargetDone(status) {
@@ -2942,7 +3237,7 @@
             type: 'button',
             text: '直签',
             onClick: async () => {
-                const promise = runDirectTarget(target);
+                const promise = runDirectTarget(target, rerender);
                 rerender();
                 await promise;
                 rerender();
@@ -3603,6 +3898,11 @@
 
             const debugContext = startSignDebugCapture(site.key, site.name, 'site-run');
             try {
+                recordTargetStatus(site.key, 'running', {
+                    stage: 'run',
+                    message: `${site.name} 签到处理中`,
+                    url: location.href
+                });
                 const beforeStatus = getRawTargetStatus(site.key);
                 // 运行该站点的特定逻辑，如果执行完成返回 true，则保存今天的日期
                 let isSuccess = await site.run();
