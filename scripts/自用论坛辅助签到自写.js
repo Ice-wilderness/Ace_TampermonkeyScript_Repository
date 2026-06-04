@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.8.0
+// @version      2.8.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -30,7 +30,6 @@
 // @connect      bbs.kfpromax.com
 // @connect      sjs47.com
 // @connect      www.galgamex.top
-// @connect      www.fufugal.com
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -1599,57 +1598,44 @@
         return false;
     }
 
-    async function runFufugalApiSign(debugContext) {
-        const requestJson = async (path) => {
-            const res = await gmRequest({
-                url: `https://www.fufugal.com/${path}`,
-                headers: {
-                    Accept: 'application/json',
-                    'X-Requested-With': 'XMLHttpRequest'
-                },
-                debugContext
-            });
-            const text = res.responseText || '';
-            try {
-                return JSON.parse(text || '{}');
-            } catch (err) {
-                console.log(`[初音的青葱] ${path} 接口返回非 JSON`, text);
-                return null;
-            }
+    async function runFufugalPageSign() {
+        const extractResultText = (text) => {
+            const source = String(text || '');
+            const reportMatch = source.match(/寻宝报告[\s\S]{0,700}(?:确定|$)/);
+            if (reportMatch) return reportMatch[0].trim();
+            const doneMatch = source.match(/今日已完成寻宝[^\n。]*(?:[。！!])?/);
+            if (doneMatch) return doneMatch[0].trim();
+            const scoreMatch = source.match(/(?:最终携带回了|携带回了)[^\n]*积分/);
+            return scoreMatch ? scoreMatch[0].trim() : '';
         };
-
-        const vipJson = await requestJson('getVip');
-        if (!vipJson || vipJson.code !== 0 || !vipJson.obj) {
-            const message = `${vipJson?.msg || ''}${vipJson?.message || ''}`;
-            if (/登录|登陆|未授权|unauthorized/i.test(message) || vipJson?.code === 401) {
-                recordTargetStatus('fufugal', 'needs-login', {
-                    stage: 'login',
-                    message: '初音的青葱需要先登录账号',
-                    url: location.href
-                });
-                return false;
+        const getNoticeText = () => {
+            const texts = Array.from(document.querySelectorAll('.el-notification__content, .el-message__content, [role="dialog"]'))
+                .map(node => extractResultText(node.innerText || node.textContent) || (node.innerText || node.textContent || '').trim())
+                .filter(Boolean);
+            const bodyResultText = extractResultText(document.body?.innerText || '');
+            if (bodyResultText && !texts.includes(bodyResultText)) texts.push(bodyResultText);
+            return texts.join('\n');
+        };
+        const waitForNoticeText = async (beforeText = '', timeout = 5000) => {
+            const startedAt = Date.now();
+            let lastText = '';
+            while (Date.now() - startedAt < timeout) {
+                const text = getNoticeText();
+                if (text && text !== beforeText) return text;
+                if (text) lastText = text;
+                await delay(250);
             }
-            console.log('[初音的青葱] 用户状态接口异常', vipJson);
-            return false;
-        }
+            return lastText;
+        };
+        const isAlreadyDoneText = (text) => /今日已完成寻宝|请明日再来|今日已.*寻宝|已经.*寻宝|明天再来/.test(text);
+        const isSuccessText = (text) => isAlreadyDoneText(text) || /寻宝报告|寻宝成功|寻宝结束|休息状态|(?:最终携带回了|携带回了)[^\n]*积分|获得[^\n]*积分|等级提升|成功/.test(text);
+        const isLoginText = (text) => /请先登录|登录后|登陆后|未登录|未登陆/.test(text);
+        const isFailureText = (text) => /失败|错误|异常|无法|请稍后|error/i.test(text);
 
-        if (vipJson.obj.isCheck === true) {
-            return completeSign('fufugal', '用户状态接口显示今日已完成');
-        }
-
-        const huntJson = await requestJson('hunt');
-        const huntText = Array.isArray(huntJson?.obj)
-            ? huntJson.obj.join(' ')
-            : `${huntJson?.msg || ''}${huntJson?.message || ''}${huntJson?.obj || ''}`;
-
-        if (huntJson?.code === 200 && /寻宝结束|获得|等级提升|积分/.test(huntText)) {
-            const score = Number.isFinite(Number(huntJson.wrap)) ? Number(huntJson.wrap) : 0;
-            return completeSign('fufugal', score > 0 ? `寻宝成功，获得 ${score} 积分` : '接口返回寻宝成功');
-        }
-        if (/已.*寻宝|已经.*寻宝|休息状态|今日已|明天再来/.test(huntText)) {
-            return completeSign('fufugal', huntJson?.msg || '接口返回今日已寻宝');
-        }
-        if (/登录|登陆|未授权|unauthorized/i.test(huntText) || huntJson?.code === 401) {
+        const bodyText = document.body?.innerText || '';
+        const hasLoginForm = Boolean(document.querySelector('input[type="password"], input[name="username"], input[name="password"]'));
+        const hasUserPanel = Boolean(document.querySelector('#photo_wrap .user-infos, .user-infos'));
+        if (!hasUserPanel && hasLoginForm && /登录|登陆/.test(bodyText)) {
             recordTargetStatus('fufugal', 'needs-login', {
                 stage: 'login',
                 message: '初音的青葱需要先登录账号',
@@ -1658,8 +1644,48 @@
             return false;
         }
 
-        console.log('[初音的青葱] 寻宝接口异常', huntJson);
-        return false;
+        const btn = await waitForElement(
+            '#photo_wrap > figure > div.user-infos > div.xbs.el-tooltip__trigger.el-tooltip__trigger, #photo_wrap .user-infos .xbs',
+            5000
+        );
+        if (!btn) {
+            console.log('[初音的青葱] 未找到寻宝按钮');
+            return false;
+        }
+
+        const beforeNoticeText = getNoticeText();
+        if (isAlreadyDoneText(beforeNoticeText)) {
+            return completeSign('fufugal', beforeNoticeText);
+        }
+
+        btn.click();
+        console.log('执行寻宝(签到)点击');
+        const noticeText = await waitForNoticeText(beforeNoticeText);
+        if (isSuccessText(noticeText)) {
+            return completeSign('fufugal', noticeText || '寻宝按钮状态已确认');
+        }
+        if (isLoginText(noticeText)) {
+            recordTargetStatus('fufugal', 'needs-login', {
+                stage: 'login',
+                message: '初音的青葱需要先登录账号',
+                url: location.href
+            });
+            return false;
+        }
+        if (isFailureText(noticeText)) {
+            recordTargetStatus('fufugal', 'failed', {
+                stage: 'notice',
+                message: noticeText,
+                url: location.href
+            });
+            return false;
+        }
+        if ((btn.innerText || '').includes('寻宝')) {
+            return completeSign('fufugal', '已点击寻宝按钮，未检测到异常提示');
+        }
+
+        console.log('[初音的青葱] 寻宝按钮点击后未识别站点提示', noticeText);
+        return completeSign('fufugal', '寻宝按钮状态已确认');
     }
 
     // ================== 各站点签到策略配置 ==================
@@ -2265,14 +2291,13 @@
                 url: "https://www.fufugal.com/",
                 openMode: "background",
                 resultMode: "script",
-                note: "支持控制台 API 直签"
+                note: "后台打开页面后点击寻宝按钮"
             },
-            directRun: runFufugalApiSign,
             async run() {
                 try {
-                    return await runFufugalApiSign();
+                    return await runFufugalPageSign();
                 } catch (err) {
-                    console.log('[初音的青葱] API 签到异常', err);
+                    console.log('[初音的青葱] 页面寻宝异常', err);
                 }
                 return false;
             }
