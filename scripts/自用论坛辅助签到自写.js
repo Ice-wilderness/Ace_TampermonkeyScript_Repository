@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.8.1
+// @version      2.8.2
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -69,7 +69,6 @@
     const DEBUG_TEXT_RESPONSE_RE = /json|text|xml|html|javascript|form|plain|gbk|gb2312/i;
     const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 2000;
     const DASHBOARD_AUTO_REFRESH_DURATION_MS = 2 * 60 * 1000;
-    const DIRECT_SIGN_CONCURRENCY = 4;
     const DIRECT_SIGN_RETRY_ATTEMPTS = 3;
     const DIRECT_SIGN_RETRY_DELAY_MS = 3000;
 
@@ -192,6 +191,14 @@
             url: location.href
         });
         console.log(`[签到助手] ${key} 签到状态已更新为：${data[key]}`);
+    }
+
+    function clearSignSuccess(key, message = '已清除错误的今日成功记录') {
+        const data = readObject(STORAGE_KEYS.successData);
+        delete data[key];
+        GM_setValue(getScopedStorageKey(STORAGE_KEYS.successData, key), '');
+        writeObject(STORAGE_KEYS.successData, data);
+        console.log(`[签到助手] ${key} ${message}`);
     }
 
     function completeSign(key, message) {
@@ -1153,7 +1160,12 @@
             }
         })();
 
-        if (/Just a moment|Enable JavaScript and cookies to continue|_cf_chl_opt|cf-challenge|challenge-platform/i.test(`${pageText}\n${html}`)) {
+        const hasExpectedUuGgContent = /今天签到了吗|写下今天最想说的话|开始签到|签到排行榜|签到服务台|签到中心|今日已签到/.test(pageText) ||
+            Boolean(document.querySelector('#qiandao, form[name="qiandao"], input[name="qdxq"], input[name="todaysay"], textarea[name="todaysay"], a[href*="dsu_paulsign"]'));
+        const hasCloudflareChallengeText = /Just a moment|Enable JavaScript and cookies to continue/i.test(pageText);
+        const hasCloudflareChallengeMarkup = /_cf_chl_opt|cf-challenge|challenge-platform/i.test(html);
+
+        if (!hasExpectedUuGgContent && (hasCloudflareChallengeText || hasCloudflareChallengeMarkup)) {
             recordTargetStatus('uugg', 'needs-foreground', {
                 stage: 'cloudflare',
                 message: '有叽叽论坛被 Cloudflare 验证页拦截，可能需要前台打开完成验证',
@@ -1187,11 +1199,20 @@
         const signForm = document.querySelector('#qiandao, form[name="qiandao"]');
         const hasSignForm = Boolean(signForm || document.querySelector('input[name="qdxq"], input[name="todaysay"], textarea[name="todaysay"], a[href*="operation=qiandao"]')) ||
             /今天签到了吗|写下今天最想说的话|我要签到|立即签到/.test(pageText);
+        const getSignServiceText = (text) => {
+            const signServiceIndex = text.indexOf('签到服务台');
+            return signServiceIndex >= 0 ? text.slice(signServiceIndex, signServiceIndex + 900) : '';
+        };
+        const signServiceText = getSignServiceText(pageText);
+        const hasCurrentUserUnsignedText = /今天未签到|今日未签到/.test(signServiceText);
+        const hasCurrentUserSignedText = /今天已签到|今日已签到|您今天已经签到|您今日已经签到/.test(signServiceText);
+        if (hasCurrentUserUnsignedText && getData('uugg') === getToday()) {
+            clearSignSuccess('uugg', '页面显示今天未签到，已清除错误的今日成功记录');
+        }
         const hasCurrentUserSignedRow = uid && new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,800}(?:今天已签到|已签到|${getToday()})`).test(html);
-        const hasSignedMessage = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|今日已签到|今天已签到|已经签到|签到过了|您今天已经签到|您今日已经签到/.test(pageText);
-        const looksLikeSignedRankPage = !hasSignForm && /每日签到|签到排行|签到统计/.test(pageText) && /今日已签到|今天已签到/.test(pageText);
+        const hasSignedMessage = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到|您今日已经签到/.test(pageText);
 
-        if (hasCurrentUserSignedRow || hasSignedMessage || looksLikeSignedRankPage) {
+        if (!hasCurrentUserUnsignedText && (hasCurrentUserSignedText || hasCurrentUserSignedRow || hasSignedMessage)) {
             return completeSign('uugg', '页面确认今日已签到');
         }
 
@@ -1252,7 +1273,7 @@
                 body: params.toString()
             });
             const resultText = extractCdata(await response.text());
-            if (/恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|今日已签到|今天已签到|已经签到|签到过了|您今天已经签到|您今日已经签到/.test(resultText)) {
+            if (/恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到|您今日已经签到/.test(resultText)) {
                 return completeSign('uugg', '页面内 API 返回签到成功或今日已签到');
             }
             if (/请先登录|登录后|member\.php\?mod=logging(?:&amp;|&)action=login/i.test(resultText)) {
@@ -1262,6 +1283,24 @@
                     url: location.href
                 });
                 return false;
+            }
+
+            await delay(1000);
+            const verifyResponse = await debugPageFetch('uugg-verify-page', pageFetch, new URL('plugin.php?id=dsu_paulsign:sign', location.href).href, {
+                credentials: 'include',
+                headers: {
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                }
+            });
+            const verifyHtml = await verifyResponse.text();
+            const verifyDoc = new DOMParser().parseFromString(verifyHtml, 'text/html');
+            const verifyPageText = `${verifyDoc.title || ''}\n${verifyDoc.body?.textContent || ''}`;
+            const verifySignServiceText = getSignServiceText(verifyPageText);
+            if (/今天已签到|今日已签到|您今天已经签到|您今日已经签到/.test(verifySignServiceText)) {
+                return completeSign('uugg', '提交后复查签到服务台确认今日已签到');
+            }
+            if (/今天未签到|今日未签到/.test(verifySignServiceText)) {
+                console.log('[有叽叽论坛] 提交后复查仍显示今天未签到', verifySignServiceText);
             }
             console.log('[有叽叽论坛] 页面内签到接口未确认成功', resultText);
             recordTargetStatus('uugg', 'needs-foreground', {
@@ -2516,18 +2555,13 @@
         });
         if (!runnableTargets.length) return;
 
-        let nextIndex = 0;
-        const workerCount = Math.min(DIRECT_SIGN_CONCURRENCY, runnableTargets.length);
         if (typeof rerender === 'function') rerender();
 
-        await Promise.all(Array.from({ length: workerCount }, async () => {
-            while (nextIndex < runnableTargets.length) {
-                const target = runnableTargets[nextIndex++];
-                const promise = runDirectTarget(target, rerender);
-                if (typeof rerender === 'function') rerender();
-                await promise;
-                if (typeof rerender === 'function') rerender();
-            }
+        await Promise.all(runnableTargets.map(async target => {
+            const promise = runDirectTarget(target, rerender);
+            if (typeof rerender === 'function') rerender();
+            await promise;
+            if (typeof rerender === 'function') rerender();
         }));
     }
 
@@ -3430,10 +3464,12 @@
                         onClick: async () => {
                             startDashboardAutoRefresh(rerender);
                             rerender();
-                            await runDirectTargets(getDirectRunnableTargets(), rerender);
+                            const directSignPromise = runDirectTargets(getDirectRunnableTargets(), rerender);
                             for (const target of getLaunchableTargets()) {
                                 launchTarget(target);
                             }
+                            rerender();
+                            await directSignPromise;
                             startDashboardAutoRefresh(rerender);
                             rerender();
                         }
@@ -3911,7 +3947,8 @@
             console.log(`[签到助手] 进入 ${site.name} 模块`);
 
             const lastSignDate = getData(site.key);
-            if (lastSignDate === todayStr) {
+            const shouldRecheckUuGgSignPage = site.key === 'uugg' && /plugin\.php\?id=dsu_paulsign(?::|%3A)sign/i.test(location.href);
+            if (lastSignDate === todayStr && !shouldRecheckUuGgSignPage) {
                 console.log(`[签到助手] ${site.name} 今日已完成，跳过。`);
                 recordTargetStatus(site.key, 'success', {
                     stage: 'skip',
