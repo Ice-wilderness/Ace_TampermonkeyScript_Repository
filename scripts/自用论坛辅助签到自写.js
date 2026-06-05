@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.8.3
+// @version      2.8.4
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1196,6 +1196,9 @@
             return false;
         }
 
+        const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+            ? unsafeWindow.fetch.bind(unsafeWindow)
+            : window.fetch.bind(window);
         const signForm = document.querySelector('#qiandao, form[name="qiandao"]');
         const hasSignForm = Boolean(signForm || document.querySelector('input[name="qdxq"], input[name="todaysay"], textarea[name="todaysay"], a[href*="operation=qiandao"]')) ||
             /今天签到了吗|写下今天最想说的话|我要签到|立即签到/.test(pageText);
@@ -1203,14 +1206,62 @@
             const signServiceIndex = text.indexOf('签到服务台');
             return signServiceIndex >= 0 ? text.slice(signServiceIndex, signServiceIndex + 900) : '';
         };
+        const signedStateRe = /今天已签到|今日已签到|您今天已经签到|您今日已经签到/;
+        const unsignedStateRe = /今天未签到|今日未签到/;
+        const signSuccessMessageRe = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到|您今日已经签到/;
+        const hasCurrentUserSignedRowInHtml = (sourceHtml) => uid && new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,800}(?:今天已签到|已签到|${getToday()})`).test(sourceHtml);
+        const isConfirmedSignedPage = (text, sourceHtml) => {
+            const serviceText = getSignServiceText(text);
+            const hasUnsignedText = unsignedStateRe.test(serviceText);
+            return !hasUnsignedText && (
+                signedStateRe.test(serviceText) ||
+                hasCurrentUserSignedRowInHtml(sourceHtml) ||
+                signSuccessMessageRe.test(text)
+            );
+        };
+        const fetchVerifyPage = async (label) => {
+            const verifyUrl = new URL('plugin.php?id=dsu_paulsign:sign', location.href);
+            verifyUrl.searchParams.set('_', String(Date.now()));
+            const verifyResponse = await debugPageFetch(label, pageFetch, verifyUrl.href, {
+                credentials: 'include',
+                cache: 'no-store',
+                headers: {
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                }
+            });
+            const verifyHtml = await verifyResponse.text();
+            const verifyDoc = new DOMParser().parseFromString(verifyHtml, 'text/html');
+            const verifyPageText = `${verifyDoc.title || ''}\n${verifyDoc.body?.textContent || ''}`;
+            return {
+                html: verifyHtml,
+                pageText: verifyPageText,
+                signServiceText: getSignServiceText(verifyPageText)
+            };
+        };
+        const verifySignedAfterSubmit = async (attemptCount = 1, firstDelayMs = 0) => {
+            let lastSignServiceText = '';
+            for (let i = 0; i < attemptCount; i++) {
+                if (i === 0 && firstDelayMs) {
+                    await delay(firstDelayMs);
+                } else if (i > 0) {
+                    await delay(Math.min(4000, 1000 + i * 1000));
+                }
+                const verifyPage = await fetchVerifyPage(`uugg-verify-page-${i + 1}`);
+                lastSignServiceText = verifyPage.signServiceText;
+                if (isConfirmedSignedPage(verifyPage.pageText, verifyPage.html)) {
+                    return { confirmed: true, signServiceText: lastSignServiceText };
+                }
+            }
+            return { confirmed: false, signServiceText: lastSignServiceText };
+        };
         const signServiceText = getSignServiceText(pageText);
-        const hasCurrentUserUnsignedText = /今天未签到|今日未签到/.test(signServiceText);
-        const hasCurrentUserSignedText = /今天已签到|今日已签到|您今天已经签到|您今日已经签到/.test(signServiceText);
+        const hasCurrentUserUnsignedText = unsignedStateRe.test(signServiceText);
+        const hasCurrentUserSignedText = signedStateRe.test(signServiceText);
         if (hasCurrentUserUnsignedText && getData('uugg') === getToday()) {
             clearSignSuccess('uugg', '页面显示今天未签到，已清除错误的今日成功记录');
         }
-        const hasCurrentUserSignedRow = uid && new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,800}(?:今天已签到|已签到|${getToday()})`).test(html);
-        const hasSignedMessage = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到|您今日已经签到/.test(pageText);
+        const hasCurrentUserSignedRow = hasCurrentUserSignedRowInHtml(html);
+        const hasSignedMessage = signSuccessMessageRe.test(pageText);
 
         if (!hasCurrentUserUnsignedText && (hasCurrentUserSignedText || hasCurrentUserSignedRow || hasSignedMessage)) {
             return completeSign('uugg', '页面确认今日已签到');
@@ -1259,9 +1310,6 @@
                 incrementAttempt: true
             });
 
-            const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
-                ? unsafeWindow.fetch.bind(unsafeWindow)
-                : window.fetch.bind(window);
             const response = await debugPageFetch('uugg-page-sign', pageFetch, signUrl.href, {
                 method: 'POST',
                 credentials: 'include',
@@ -1273,7 +1321,7 @@
                 body: params.toString()
             });
             const resultText = extractCdata(await response.text());
-            if (/恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到|您今日已经签到/.test(resultText)) {
+            if (signSuccessMessageRe.test(resultText)) {
                 return completeSign('uugg', '页面内 API 返回签到成功或今日已签到');
             }
             if (/请先登录|登录后|member\.php\?mod=logging(?:&amp;|&)action=login/i.test(resultText)) {
@@ -1285,22 +1333,12 @@
                 return false;
             }
 
-            await delay(1000);
-            const verifyResponse = await debugPageFetch('uugg-verify-page', pageFetch, new URL('plugin.php?id=dsu_paulsign:sign', location.href).href, {
-                credentials: 'include',
-                headers: {
-                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                }
-            });
-            const verifyHtml = await verifyResponse.text();
-            const verifyDoc = new DOMParser().parseFromString(verifyHtml, 'text/html');
-            const verifyPageText = `${verifyDoc.title || ''}\n${verifyDoc.body?.textContent || ''}`;
-            const verifySignServiceText = getSignServiceText(verifyPageText);
-            if (/今天已签到|今日已签到|您今天已经签到|您今日已经签到/.test(verifySignServiceText)) {
-                return completeSign('uugg', '提交后复查签到服务台确认今日已签到');
+            const verifyResult = await verifySignedAfterSubmit(5, 1000);
+            if (verifyResult.confirmed) {
+                return completeSign('uugg', '提交后复查确认今日已签到');
             }
-            if (/今天未签到|今日未签到/.test(verifySignServiceText)) {
-                console.log('[有叽叽论坛] 提交后复查仍显示今天未签到', verifySignServiceText);
+            if (unsignedStateRe.test(verifyResult.signServiceText)) {
+                console.log('[有叽叽论坛] 提交后复查仍显示今天未签到', verifyResult.signServiceText);
             }
             console.log('[有叽叽论坛] 页面内签到接口未确认成功', resultText);
             recordTargetStatus('uugg', 'needs-foreground', {
@@ -1309,6 +1347,13 @@
                 url: location.href
             });
             return false;
+        }
+
+        if (uuGgPageSubmitAttempted) {
+            const verifyResult = await verifySignedAfterSubmit(1);
+            if (verifyResult.confirmed) {
+                return completeSign('uugg', '后续复查确认今日已签到');
+            }
         }
 
         console.log('[有叽叽论坛] 已打开签到页，等待页面内签到结果确认');
