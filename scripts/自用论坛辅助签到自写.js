@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.8.2
+// @version      2.8.3
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1318,26 +1318,46 @@
     async function runAcgndogApiSign() {
         const checkAction = 'd2e5b56b75e2f3d4ab412a6d9561faee';
         const signAction = '5ced0113734a2bc46ecf3f30b0685b7b';
-        const requestText = async (url) => {
-            const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
-                ? unsafeWindow.fetch.bind(unsafeWindow)
-                : window.fetch.bind(window);
-            const response = await debugPageFetch('acgndog-api', pageFetch, url, {
+        const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+            ? unsafeWindow.fetch.bind(unsafeWindow)
+            : window.fetch.bind(window);
+        const withCacheBust = (url) => {
+            const targetUrl = new URL(url);
+            targetUrl.searchParams.set('_', String(Date.now()));
+            return targetUrl.href;
+        };
+        const requestText = async (url, label = 'acgndog-api') => {
+            const response = await debugPageFetch(label, pageFetch, withCacheBust(url), {
                 credentials: 'include',
+                cache: 'no-store',
                 headers: {
-                    'X-Requested-With': 'XMLHttpRequest'
+                    Accept: 'application/json'
                 }
             });
             return await response.text();
         };
-        const checkText = await requestText(`https://www.acgndog.com/wp-admin/admin-ajax.php?action=${checkAction}&${signAction}%5Btype%5D=checkSigned`);
-        let checkJson = null;
-        try {
-            checkJson = JSON.parse(checkText || '{}');
-        } catch (err) {
-            console.log('[次元狗] 签到状态接口返回非 JSON', checkText);
-            return false;
-        }
+        const parseApiJson = (text, label) => {
+            try {
+                return JSON.parse(text || '{}');
+            } catch (err) {
+                console.log(`[次元狗] ${label}返回非 JSON`, text);
+                return null;
+            }
+        };
+        const isSignedPayload = (payload) => {
+            const signedValue = payload?.customPointSignDaily?.signed ?? payload?.data?.customPointSignDaily?.signed;
+            return signedValue === true || signedValue === 1 || signedValue === '1' || signedValue === 'true';
+        };
+        const requestCheckJson = async (label = 'acgndog-check') => {
+            const checkText = await requestText(
+                `https://www.acgndog.com/wp-admin/admin-ajax.php?action=${checkAction}&${signAction}%5Btype%5D=checkSigned`,
+                label
+            );
+            return parseApiJson(checkText, '签到状态接口');
+        };
+
+        const checkJson = await requestCheckJson('acgndog-check-before');
+        if (!checkJson) return false;
 
         if (!checkJson.user || checkJson.user.isLoggedIn === false) {
             recordTargetStatus('acgndog', 'needs-login', {
@@ -1347,28 +1367,33 @@
             });
             return false;
         }
-        if (checkJson.customPointSignDaily?.signed === true) {
-            return completeSign('acgndog', '接口返回今日已签到');
-        }
         if (!checkJson._nonce) {
             console.log('[次元狗] 未获取到签到 nonce', checkJson);
             return false;
         }
 
-        const signText = await requestText(`https://www.acgndog.com/wp-admin/admin-ajax.php?_nonce=${encodeURIComponent(checkJson._nonce)}&action=${signAction}&type=goSign`);
-        let signJson = null;
-        try {
-            signJson = JSON.parse(signText || '{}');
-        } catch (err) {
-            console.log('[次元狗] 签到接口返回非 JSON', signText);
-            return false;
-        }
+        const signText = await requestText(
+            `https://www.acgndog.com/wp-admin/admin-ajax.php?_nonce=${encodeURIComponent(checkJson._nonce)}&action=${signAction}&type=goSign`,
+            'acgndog-go-sign'
+        );
+        const signJson = parseApiJson(signText, '签到接口');
+        if (!signJson) return false;
 
-        if (signJson.code === 0 && /签到成功|获得/.test(signJson.msg || '')) {
-            return completeSign('acgndog', signJson.msg || '接口返回签到成功');
-        }
-        if (/已签到|已经签到|今日已/.test(signJson.msg || '')) {
-            return completeSign('acgndog', signJson.msg || '接口返回今日已签到');
+        if ((signJson.code === 0 && /签到成功|获得/.test(signJson.msg || '')) || /已签到|已经签到|今日已/.test(signJson.msg || '')) {
+            for (let i = 0; i < 3; i++) {
+                await delay(1000);
+                const verifyJson = await requestCheckJson(`acgndog-check-after-${i + 1}`);
+                if (verifyJson && isSignedPayload(verifyJson)) {
+                    return completeSign('acgndog', signJson.msg || '提交后复查确认今日已签到');
+                }
+            }
+            console.log('[次元狗] 签到接口返回成功，但复查未确认完成', signJson);
+            recordTargetStatus('acgndog', 'failed', {
+                stage: 'verify',
+                message: '次元狗接口返回成功，但复查未确认今日已签到，请前台检查',
+                url: 'https://www.acgndog.com/'
+            });
+            return false;
         }
 
         console.log('[次元狗] API 返回异常:', signJson);
