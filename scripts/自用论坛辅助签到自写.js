@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.8.4
+// @version      2.9.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -58,7 +58,8 @@
         successData: 'BBSSignHelperData',
         dashboardConfig: 'BBSSignHelperDashboardConfig',
         dashboardStatus: 'BBSSignHelperDashboardStatus',
-        signDebugLogs: 'BBSSignHelperDebugLogs'
+        signDebugLogs: 'BBSSignHelperDebugLogs',
+        pageToastSuppressed: 'BBSSignHelperPageToastSuppressed'
     };
 
     const DEBUG_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
@@ -247,6 +248,21 @@
         return getScopedStorageKey(STORAGE_KEYS.dashboardStatus, day, key);
     }
 
+    function isPageSignToastSuppressedToday(key, status) {
+        if (status !== 'success') return false;
+        const today = getToday();
+        const store = readObject(STORAGE_KEYS.pageToastSuppressed, { date: today, keys: {} });
+        return store.date === today && store.keys?.[key] === true;
+    }
+
+    function suppressPageSignToastToday(key) {
+        const today = getToday();
+        const store = readObject(STORAGE_KEYS.pageToastSuppressed, { date: today, keys: {} });
+        const keys = store.date === today && store.keys && typeof store.keys === 'object' ? store.keys : {};
+        keys[key] = true;
+        writeObject(STORAGE_KEYS.pageToastSuppressed, { date: today, keys });
+    }
+
     function recordTargetStatus(key, status, options = {}) {
         if (!key) return;
         const today = getToday();
@@ -321,6 +337,28 @@
                 font-size: 12px;
                 white-space: nowrap;
             }
+            #bbs-sign-page-toast .bbs-sign-page-toast-actions {
+                display: flex;
+                align-items: center;
+                flex: 0 0 auto;
+                gap: 8px;
+            }
+            #bbs-sign-page-toast .bbs-sign-page-toast-suppress {
+                border: 1px solid rgba(16, 185, 129, 0.38);
+                border-radius: 999px;
+                padding: 4px 10px;
+                color: #047857;
+                background: rgba(255, 255, 255, 0.72);
+                font: inherit;
+                font-size: 12px;
+                line-height: 1.2;
+                white-space: nowrap;
+                cursor: pointer;
+            }
+            #bbs-sign-page-toast .bbs-sign-page-toast-suppress:hover {
+                border-color: rgba(16, 185, 129, 0.62);
+                background: rgba(255, 255, 255, 0.94);
+            }
             #bbs-sign-page-toast.success {
                 border-color: rgba(16, 185, 129, 0.35);
                 background: rgba(240, 253, 244, 0.96);
@@ -358,6 +396,9 @@
                 #bbs-sign-page-toast .bbs-sign-page-toast-hint {
                     display: none;
                 }
+                #bbs-sign-page-toast .bbs-sign-page-toast-actions {
+                    align-items: flex-start;
+                }
             }
         `;
         const style = document.createElement('style');
@@ -382,6 +423,7 @@
         const message = options.message || STATUS_META[status]?.message || '';
         const signature = `${key}|${status}|${message}`;
         if (dismissedPageSignToastSignature === signature) return;
+        if (isPageSignToastSuppressedToday(key, status)) return;
 
         addPageSignToastStyles();
         let toast = document.getElementById('bbs-sign-page-toast');
@@ -400,7 +442,7 @@
         const meta = STATUS_META[status] || STATUS_META['not-started'];
         toast.className = meta.tone || 'neutral';
         toast.dataset.signature = signature;
-        toast.title = '点击关闭';
+        toast.title = status === 'success' ? '点击关闭，或今日不再提示' : '点击关闭';
         toast.innerHTML = '';
 
         const dot = document.createElement('span');
@@ -413,12 +455,28 @@
         const messageNode = document.createElement('div');
         messageNode.className = 'bbs-sign-page-toast-message';
         messageNode.textContent = message;
+        const actions = document.createElement('div');
+        actions.className = 'bbs-sign-page-toast-actions';
+        if (status === 'success') {
+            const suppressButton = document.createElement('button');
+            suppressButton.className = 'bbs-sign-page-toast-suppress';
+            suppressButton.type = 'button';
+            suppressButton.textContent = '今日不再提示';
+            suppressButton.addEventListener('click', (event) => {
+                event.stopPropagation();
+                suppressPageSignToastToday(key);
+                dismissedPageSignToastSignature = signature;
+                toast.remove();
+            });
+            actions.append(suppressButton);
+        }
         const hint = document.createElement('div');
         hint.className = 'bbs-sign-page-toast-hint';
         hint.textContent = '点击关闭';
+        actions.append(hint);
 
         main.append(title, messageNode);
-        toast.append(dot, main, hint);
+        toast.append(dot, main, actions);
     }
 
     function getRawTargetStatus(key) {
