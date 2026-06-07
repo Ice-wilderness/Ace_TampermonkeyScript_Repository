@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.9.0
+// @version      2.9.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1257,6 +1257,16 @@
         const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
             ? unsafeWindow.fetch.bind(unsafeWindow)
             : window.fetch.bind(window);
+        const readUuGgResponseText = async (response) => {
+            const contentType = response.headers?.get?.('content-type') || '';
+            const encoding = /gbk|gb2312/i.test(contentType) ? 'gbk' : 'utf-8';
+            const buffer = await response.arrayBuffer();
+            try {
+                return new TextDecoder(encoding).decode(buffer);
+            } catch (err) {
+                return new TextDecoder().decode(buffer);
+            }
+        };
         const signForm = document.querySelector('#qiandao, form[name="qiandao"]');
         const hasSignForm = Boolean(signForm || document.querySelector('input[name="qdxq"], input[name="todaysay"], textarea[name="todaysay"], a[href*="operation=qiandao"]')) ||
             /今天签到了吗|写下今天最想说的话|我要签到|立即签到/.test(pageText);
@@ -1287,7 +1297,7 @@
                     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
                 }
             });
-            const verifyHtml = await verifyResponse.text();
+            const verifyHtml = await readUuGgResponseText(verifyResponse);
             const verifyDoc = new DOMParser().parseFromString(verifyHtml, 'text/html');
             const verifyPageText = `${verifyDoc.title || ''}\n${verifyDoc.body?.textContent || ''}`;
             return {
@@ -1378,7 +1388,7 @@
                 },
                 body: params.toString()
             });
-            const resultText = extractCdata(await response.text());
+            const resultText = extractCdata(await readUuGgResponseText(response));
             if (signSuccessMessageRe.test(resultText)) {
                 return completeSign('uugg', '页面内 API 返回签到成功或今日已签到');
             }
