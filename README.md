@@ -201,6 +201,7 @@
 
 - 控制台入口：`https://limestart.cn/*`、`https://www.limestart.cn/*`。
 - 自动签到站点：脚本头部 `@match` 中列出的论坛与资源站页面。
+- 老王论坛 `https://laowang.vip/*` 采用前台签到流程，遇到站点点击验证时需在前台完成后再确认状态。
 - 有叽叽论坛 `https://www.uu-gg.one/*` 因 Cloudflare 验证限制，采用后台打开签到页后由页面内 API 提交并检测完成状态。
 
 ### 维护说明

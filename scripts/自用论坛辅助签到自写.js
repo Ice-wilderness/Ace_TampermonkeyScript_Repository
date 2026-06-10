@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.10.1
+// @version      2.11.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -14,6 +14,7 @@
 // @match        http*://www.sl-asmr.com/*
 // @match        http*://bbs.kfpromax.com/*
 // @match        http*://sjs47.com/*
+// @match        http*://laowang.vip/*
 // @match        http*://*.vr6erw5d.com/*
 // @match        http*://www.vikacg.com/*
 // @match        http*://feixueacg.org/*
@@ -2224,6 +2225,80 @@
                     console.log('签到成功!');
                     return completeSign('wcccc', '已点击签到按钮', CLOSE_PAGE_AFTER_SIGN_ACTION);
                 }
+                return false;
+            }
+        },
+        {
+            name: "老王论坛",
+            matches: ["laowang.vip"],
+            key: "laowang",
+            dashboard: {
+                url: "https://laowang.vip/plugin.php?id=k_misign:sign",
+                openMode: "foreground",
+                resultMode: "script",
+                note: "签到提交需要站点点击验证，需前台完成"
+            },
+            async run() {
+                const bodyText = document.body?.innerText || '';
+                const isLoginPage = /member\.php\?mod=logging(?:&|&amp;)action=login/i.test(location.href) ||
+                    /登录老王论坛|立即登录|用户名|找回密码/.test(bodyText);
+                if (isLoginPage) {
+                    recordTargetStatus('laowang', 'needs-login', {
+                        stage: 'login',
+                        message: '老王论坛需要先登录账号',
+                        url: location.href
+                    });
+                    return false;
+                }
+
+                if (!/plugin\.php\?id=k_misign(?::|%3A)sign/i.test(location.href)) {
+                    window.location.href = 'https://laowang.vip/plugin.php?id=k_misign:sign';
+                    return false;
+                }
+
+                const isSigned = () => {
+                    const text = document.body?.innerText || '';
+                    return Boolean(document.querySelector('.btnvisted')) ||
+                        /签到成功|恭喜你签到成功|今日已签到|您今日已经签到|已经签到/.test(text);
+                };
+                if (isSigned()) {
+                    return completeSign('laowang', '页面显示今日已签到');
+                }
+
+                const isCaptchaPage = () => Boolean(document.querySelector('#v2_captcha_form, #tncode, input[name="clicaptcha-submit-info"]')) ||
+                    /请点击下面的按钮验证|点击进行验证/.test(document.body?.innerText || '');
+                if (isCaptchaPage()) {
+                    recordTargetStatus('laowang', 'needs-foreground', {
+                        stage: 'captcha',
+                        message: '老王论坛需要在前台完成点击验证后再确认',
+                        url: location.href
+                    });
+                    return false;
+                }
+
+                const btn = await waitForElement('a[href*="operation=qiandao"], #JD_sign, .qdleft a.btn', 5000);
+                if (btn) {
+                    btn.click();
+                    console.log('[老王论坛] 已点击签到按钮，等待验证和结果确认...');
+
+                    for (let i = 0; i < 20; i++) {
+                        await delay(500);
+                        if (isSigned()) {
+                            return completeSign('laowang', '前台验证后确认签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
+                        }
+                        if (isCaptchaPage()) {
+                            recordTargetStatus('laowang', 'needs-foreground', {
+                                stage: 'captcha',
+                                message: '老王论坛需要在前台完成点击验证后再确认',
+                                url: location.href
+                            });
+                            return false;
+                        }
+                    }
+
+                    return false;
+                }
+
                 return false;
             }
         },
