@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.4.0
+// @version      3.5.0
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -33,6 +33,14 @@
 (function () {
     'use strict';
 
+    const FLOATING_BUTTON_VISIBILITY = {
+        SHOW_ALL: 'show-all',
+        HIDE_VIDEO: 'hide-video',
+        HIDE_NON_VIDEO: 'hide-non-video',
+        HIDE_ALL: 'hide-all'
+    };
+    const FLOATING_BUTTON_VISIBILITY_VALUES = Object.values(FLOATING_BUTTON_VISIBILITY);
+
     const DEFAULT_CONFIG = {
         showProgressBar: true,
         showVisitedTag: true,
@@ -41,10 +49,30 @@
         tagPosition: 'top-left',
         lowThreshold: 30,
         highThreshold: 80,
-        autoResumePrompt: true
+        autoResumePrompt: true,
+        floatingButtonVisibility: FLOATING_BUTTON_VISIBILITY.SHOW_ALL
     };
 
     const CONFIG = Object.assign({}, DEFAULT_CONFIG, GM_getValue('bvh_settings', {}));
+
+    const getFloatingButtonVisibility = () => (
+        FLOATING_BUTTON_VISIBILITY_VALUES.includes(CONFIG.floatingButtonVisibility)
+            ? CONFIG.floatingButtonVisibility
+            : FLOATING_BUTTON_VISIBILITY.SHOW_ALL
+    );
+    const shouldHideVideoPageFloat = () => {
+        const visibility = getFloatingButtonVisibility();
+        return visibility === FLOATING_BUTTON_VISIBILITY.HIDE_VIDEO
+            || visibility === FLOATING_BUTTON_VISIBILITY.HIDE_ALL;
+    };
+    const shouldHideNonVideoPageFloat = () => {
+        const visibility = getFloatingButtonVisibility();
+        return visibility === FLOATING_BUTTON_VISIBILITY.HIDE_NON_VIDEO
+            || visibility === FLOATING_BUTTON_VISIBILITY.HIDE_ALL;
+    };
+    const isVideoPageRoute = () => /\/(video|v|medialist\/play|list)\//.test(location.href)
+        || !!window.__INITIAL_STATE__?.bvid
+        || /[?&]bvid=/.test(location.href);
 
     const RECORD_STATUS = {
         WATCHED: '已观看',
@@ -1844,6 +1872,7 @@
             const existing = document.getElementById('bvh-view-panel');
             if (existing) existing.remove();
 
+            if (shouldHideVideoPageFloat()) return;
             if (!record) return;
 
             const el = document.createElement('div');
@@ -1945,6 +1974,12 @@
         },
         showQuickEntry: () => {
             let el = document.getElementById('bvh-quick-entry');
+            const isVideoPage = isVideoPageRoute();
+            if (shouldHideNonVideoPageFloat() || (isVideoPage && shouldHideVideoPageFloat())) {
+                if (el) el.remove();
+                return;
+            }
+
             const panel = document.getElementById('bvh-view-panel');
             if (panel) {
                 if (el) el.remove();
@@ -1960,6 +1995,34 @@
                 el.addEventListener('click', () => UIComponent.showManagerPanel({ activeTab: 'settings' }));
                 document.body.appendChild(el);
             }
+        },
+        refreshFloatingButtons: () => {
+            const panel = document.getElementById('bvh-view-panel');
+            const quickEntry = document.getElementById('bvh-quick-entry');
+            const isVideoPage = isVideoPageRoute();
+
+            if (isVideoPage) {
+                if (shouldHideVideoPageFloat()) {
+                    if (panel) panel.remove();
+                    if (quickEntry) quickEntry.remove();
+                    return;
+                }
+
+                const currentKey = EpisodeResolver.getCurrentKey()
+                    || VideoKey.fromUrl(location.href)
+                    || VideoKey.normalize(window.__INITIAL_STATE__?.bvid);
+                const record = currentKey ? StorageManager.getRecord(currentKey) : null;
+                if (record) UIComponent.showViewPanel(record, currentKey);
+                else UIComponent.showQuickEntry();
+                return;
+            }
+
+            if (panel) panel.remove();
+            if (shouldHideNonVideoPageFloat()) {
+                if (quickEntry) quickEntry.remove();
+                return;
+            }
+            UIComponent.showQuickEntry();
         },
         jumpToProgress: (record) => {
             if (!record?.currentTime) {
@@ -2100,6 +2163,7 @@
             const renderSettings = () => {
                 const pane = mask.querySelector('[data-pane="settings"]');
                 const currentRecord = options.currentKey ? StorageManager.getRecord(options.currentKey) : null;
+                const floatingButtonVisibility = getFloatingButtonVisibility();
                 pane.innerHTML = `
                     <div class="bvh-settings-card">
                         <p class="bvh-section-title">显示与提示</p>
@@ -2107,6 +2171,12 @@
                             <div class="bvh-field"><label>显示进度条</label><input type="checkbox" data-setting="showProgressBar" ${CONFIG.showProgressBar ? 'checked' : ''}></div>
                             <div class="bvh-field"><label>显示已访问标记</label><input type="checkbox" data-setting="showVisitedTag" ${CONFIG.showVisitedTag ? 'checked' : ''}></div>
                             <div class="bvh-field"><label>自动续播提示</label><input type="checkbox" data-setting="autoResumePrompt" ${CONFIG.autoResumePrompt ? 'checked' : ''}></div>
+                            <div class="bvh-field"><label>悬浮按钮隐藏规则</label><select data-setting="floatingButtonVisibility">
+                                <option value="${FLOATING_BUTTON_VISIBILITY.SHOW_ALL}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.SHOW_ALL ? 'selected' : ''}>不隐藏（默认选项）</option>
+                                <option value="${FLOATING_BUTTON_VISIBILITY.HIDE_VIDEO}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.HIDE_VIDEO ? 'selected' : ''}>隐藏视频页悬浮按钮</option>
+                                <option value="${FLOATING_BUTTON_VISIBILITY.HIDE_NON_VIDEO}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.HIDE_NON_VIDEO ? 'selected' : ''}>隐藏非视频页悬浮按钮</option>
+                                <option value="${FLOATING_BUTTON_VISIBILITY.HIDE_ALL}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.HIDE_ALL ? 'selected' : ''}>全部隐藏</option>
+                            </select></div>
                             <div class="bvh-field"><label>调试日志</label><input type="checkbox" data-setting="debug" ${CONFIG.debug ? 'checked' : ''}></div>
                         </div>
                     </div>
@@ -2587,12 +2657,14 @@
                         return;
                     }
                     SettingsManager.save(patch);
+                    UIComponent.refreshFloatingButtons();
                     Utils.log('Settings saved', patch);
                     UIComponent.toast('设置已保存', 'success', 2000);
                     render();
                 }
                 if (target.dataset.action === 'reset-settings') {
                     SettingsManager.reset();
+                    UIComponent.refreshFloatingButtons();
                     Utils.log('Settings reset to default');
                     UIComponent.toast('设置已恢复默认', 'success', 2000);
                     render();
@@ -4378,7 +4450,7 @@
         }
 
         checkAndInitVideoPage() {
-            const isVideoPage = /\/(video|v|medialist\/play|list)\//.test(location.href) || window.__INITIAL_STATE__?.bvid || /[?&]bvid=/.test(location.href);
+            const isVideoPage = isVideoPageRoute();
             const routeKey = this.getRouteVideoKey();
             const observerKey = this.playerObserver?.bvId ? VideoKey.normalize(this.playerObserver.bvId) : '';
             Utils.log('AppController.checkAndInitVideoPage', `isVideoPage=${!!isVideoPage}`, `routeKey=${routeKey || 'none'}`, `observerKey=${observerKey || 'none'}`, `url=${location.href}`, `stateBvid=${window.__INITIAL_STATE__?.bvid || 'none'}`);
