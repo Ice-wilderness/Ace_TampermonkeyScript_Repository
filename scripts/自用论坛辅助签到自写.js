@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.10.0
+// @version      2.10.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -68,6 +68,8 @@
     const DEBUG_LOG_MAX_ENTRIES_PER_SESSION = 50;
     const DEBUG_SENSITIVE_KEY_RE = /authorization|cookie|set-cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey/i;
     const DEBUG_TEXT_RESPONSE_RE = /json|text|xml|html|javascript|form|plain|gbk|gb2312/i;
+    const PAGE_COMPLETED_TOAST_AUTO_CLOSE_MS = 3000;
+    const PAGE_COMPLETED_TOAST_DAILY_LIMIT = 3;
     const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 2000;
     const DASHBOARD_AUTO_REFRESH_DURATION_MS = 2 * 60 * 1000;
     const DIRECT_SIGN_RETRY_ATTEMPTS = 3;
@@ -120,6 +122,7 @@
     let dashboardAutoRefreshUntil = 0;
     let activeSignDebugContext = null;
     let dismissedPageSignToastSignature = '';
+    let pageSignToastAutoCloseTimer = null;
     let uuGgPageSubmitAttempted = false;
 
     // 获取格式化后的今天日期 (yyyy-MM-dd)
@@ -253,19 +256,47 @@
         return getScopedStorageKey(STORAGE_KEYS.dashboardStatus, day, key);
     }
 
-    function isPageSignToastSuppressedToday(key, status) {
-        if (status !== 'success') return false;
+    function getPageSignToastSuppressionStore() {
         const today = getToday();
-        const store = readObject(STORAGE_KEYS.pageToastSuppressed, { date: today, keys: {} });
-        return store.date === today && store.keys?.[key] === true;
+        const store = readObject(STORAGE_KEYS.pageToastSuppressed, { date: today, keys: {}, completedCounts: {} });
+        return {
+            date: today,
+            keys: store.date === today && store.keys && typeof store.keys === 'object' ? store.keys : {},
+            completedCounts: store.date === today && store.completedCounts && typeof store.completedCounts === 'object' ? store.completedCounts : {}
+        };
+    }
+
+    function savePageSignToastSuppressionStore(store) {
+        writeObject(STORAGE_KEYS.pageToastSuppressed, {
+            date: store.date || getToday(),
+            keys: store.keys || {},
+            completedCounts: store.completedCounts || {}
+        });
+    }
+
+    function isPageSignToastSuppressedToday(key, status, options = {}) {
+        if (status !== 'success') return false;
+        const store = getPageSignToastSuppressionStore();
+        if (store.keys?.[key] === true) return true;
+        if (options.countCompletedToast === true) {
+            return Number(store.completedCounts?.[key] || 0) >= PAGE_COMPLETED_TOAST_DAILY_LIMIT;
+        }
+        return false;
     }
 
     function suppressPageSignToastToday(key) {
-        const today = getToday();
-        const store = readObject(STORAGE_KEYS.pageToastSuppressed, { date: today, keys: {} });
-        const keys = store.date === today && store.keys && typeof store.keys === 'object' ? store.keys : {};
-        keys[key] = true;
-        writeObject(STORAGE_KEYS.pageToastSuppressed, { date: today, keys });
+        const store = getPageSignToastSuppressionStore();
+        store.keys[key] = true;
+        savePageSignToastSuppressionStore(store);
+    }
+
+    function incrementCompletedPageSignToastCount(key) {
+        const store = getPageSignToastSuppressionStore();
+        const currentCount = Number(store.completedCounts?.[key] || 0);
+        const nextCount = Math.min(PAGE_COMPLETED_TOAST_DAILY_LIMIT, currentCount + 1);
+        store.completedCounts[key] = nextCount;
+        savePageSignToastSuppressionStore(store);
+        return nextCount;
     }
 
     function recordTargetStatus(key, status, options = {}) {
@@ -286,7 +317,11 @@
         store[today] = dayStatus;
         GM_setValue(getTargetStatusStorageKey(today, key), nextStatus);
         saveStatusStore(store);
-        showPageSignToast(key, status, nextStatus);
+        showPageSignToast(key, status, {
+            ...nextStatus,
+            autoCloseAfterMs: options.autoClosePageSignToastAfterMs || 0,
+            countCompletedToast: options.countCompletedPageSignToast === true
+        });
         updateDashboardReminderButton();
     }
 
@@ -428,7 +463,14 @@
         const message = options.message || STATUS_META[status]?.message || '';
         const signature = `${key}|${status}|${message}`;
         if (dismissedPageSignToastSignature === signature) return;
-        if (isPageSignToastSuppressedToday(key, status)) return;
+        const shouldCountCompletedToast = options.countCompletedToast === true && status === 'success';
+        if (isPageSignToastSuppressedToday(key, status, { countCompletedToast: shouldCountCompletedToast })) return;
+        const completedToastCount = shouldCountCompletedToast ? incrementCompletedPageSignToastCount(key) : 0;
+        const autoCloseAfterMs = Math.max(0, Number(options.autoCloseAfterMs) || 0);
+        if (pageSignToastAutoCloseTimer) {
+            clearTimeout(pageSignToastAutoCloseTimer);
+            pageSignToastAutoCloseTimer = null;
+        }
 
         addPageSignToastStyles();
         let toast = document.getElementById('bbs-sign-page-toast');
@@ -477,11 +519,28 @@
         }
         const hint = document.createElement('div');
         hint.className = 'bbs-sign-page-toast-hint';
-        hint.textContent = '点击关闭';
+        if (autoCloseAfterMs > 0) {
+            const seconds = Math.ceil(autoCloseAfterMs / 1000);
+            hint.textContent = completedToastCount
+                ? `${seconds}秒后关闭 · 今日 ${completedToastCount}/${PAGE_COMPLETED_TOAST_DAILY_LIMIT}`
+                : `${seconds}秒后关闭`;
+        } else {
+            hint.textContent = '点击关闭';
+        }
         actions.append(hint);
 
         main.append(title, messageNode);
         toast.append(dot, main, actions);
+
+        if (autoCloseAfterMs > 0) {
+            pageSignToastAutoCloseTimer = setTimeout(() => {
+                const currentToast = document.getElementById('bbs-sign-page-toast');
+                if (currentToast?.dataset.signature === signature) {
+                    currentToast.remove();
+                }
+                pageSignToastAutoCloseTimer = null;
+            }, autoCloseAfterMs);
+        }
     }
 
     function getRawTargetStatus(key) {
@@ -4146,7 +4205,9 @@
                 recordTargetStatus(site.key, 'success', {
                     stage: 'skip',
                     message: '今日已完成，跳过执行',
-                    url: location.href
+                    url: location.href,
+                    autoClosePageSignToastAfterMs: PAGE_COMPLETED_TOAST_AUTO_CLOSE_MS,
+                    countCompletedPageSignToast: true
                 });
                 return; // 当日已执行，退出
             }
