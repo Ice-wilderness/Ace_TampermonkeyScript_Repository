@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.9.1
+// @version      2.10.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -72,6 +72,7 @@
     const DASHBOARD_AUTO_REFRESH_DURATION_MS = 2 * 60 * 1000;
     const DIRECT_SIGN_RETRY_ATTEMPTS = 3;
     const DIRECT_SIGN_RETRY_DELAY_MS = 3000;
+    const CLOSE_PAGE_AFTER_SIGN_ACTION = { closePageAfterSignAction: true };
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
@@ -101,7 +102,8 @@
         targetSettings: {},
         customTargets: [],
         preferences: {
-            autoOpenDashboardOnAttention: false
+            autoOpenDashboardOnAttention: false,
+            autoClosePageAfterSign: false
         }
     };
 
@@ -202,8 +204,9 @@
         console.log(`[签到助手] ${key} ${message}`);
     }
 
-    function completeSign(key, message) {
+    function completeSign(key, message, options = {}) {
         markSignSuccess(key, message);
+        maybeAutoClosePageAfterSign(key, options);
         return true;
     }
 
@@ -214,7 +217,8 @@
             targetSettings: config.targetSettings && typeof config.targetSettings === 'object' ? config.targetSettings : {},
             customTargets: Array.isArray(config.customTargets) ? config.customTargets : [],
             preferences: {
-                autoOpenDashboardOnAttention: preferences.autoOpenDashboardOnAttention === true
+                autoOpenDashboardOnAttention: preferences.autoOpenDashboardOnAttention === true,
+                autoClosePageAfterSign: preferences.autoClosePageAfterSign === true
             }
         };
     }
@@ -224,7 +228,8 @@
             targetSettings: config.targetSettings || {},
             customTargets: Array.isArray(config.customTargets) ? config.customTargets : [],
             preferences: {
-                autoOpenDashboardOnAttention: config.preferences?.autoOpenDashboardOnAttention === true
+                autoOpenDashboardOnAttention: config.preferences?.autoOpenDashboardOnAttention === true,
+                autoClosePageAfterSign: config.preferences?.autoClosePageAfterSign === true
             }
         });
         updateDashboardReminderButton();
@@ -530,6 +535,27 @@
 
     function isLimestartHost(host = location.hostname) {
         return host === 'limestart.cn' || host === 'www.limestart.cn';
+    }
+
+    function isCurrentPageForSite(key) {
+        const site = siteConfigs.find(item => item.key === key);
+        return Boolean(site && site.matches.some(domain => location.hostname.includes(domain)));
+    }
+
+    function maybeAutoClosePageAfterSign(key, options = {}) {
+        if (options.closePageAfterSignAction !== true) return;
+        const config = getDashboardConfig();
+        if (!config.preferences.autoClosePageAfterSign) return;
+        if (isLimestartHost() || !isCurrentPageForSite(key)) return;
+
+        console.log(`[签到助手] ${key} 本次签到动作已完成，准备自动关闭页面。`);
+        setTimeout(() => {
+            try {
+                window.close();
+            } catch (err) {
+                console.log('[签到助手] 自动关闭页面失败，可能是浏览器限制。', err);
+            }
+        }, 800);
     }
 
     function safeUrl(value) {
@@ -986,10 +1012,10 @@
         const submitText = submitRes.responseText || '';
 
         if (/签到成功|随机奖励|succeedhandle_signin/.test(submitText)) {
-            return completeSign('fxacg', '接口返回签到成功');
+            return completeSign('fxacg', '接口返回签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (/已签到|已经签到|今日已/.test(submitText)) {
-            return completeSign('fxacg', '接口返回今日已签到');
+            return completeSign('fxacg', '接口返回今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (/尚未登录|请先登录|member\.php\?mod=logging&action=login/.test(submitText)) {
             recordTargetStatus('fxacg', 'needs-login', {
@@ -1005,6 +1031,7 @@
     }
 
     async function runSouthPlusApiSign(debugContext) {
+        let completedByAction = false;
         const fetchTask = async (id) => {
             let res = await gmRequest({
                 url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job&cid=${id}`,
@@ -1016,6 +1043,7 @@
                 return true;
             }
             if (text.includes('已经申请')) {
+                completedByAction = true;
                 res = await gmRequest({
                     url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job2&cid=${id}`,
                     debugContext
@@ -1035,7 +1063,11 @@
             fetchTask('15')
         ]);
         if (w14 && w15) {
-            return completeSign('southplus', '接口返回任务已完成');
+            return completeSign(
+                'southplus',
+                '接口返回任务已完成',
+                completedByAction ? CLOSE_PAGE_AFTER_SIGN_ACTION : {}
+            );
         }
         return false;
     }
@@ -1047,8 +1079,11 @@
             debugContext
         });
         const text = res.responseText || '';
-        if (text.includes('签到成功') || text.includes('您已签到')) {
-            return completeSign('sl-asmr', '接口返回签到成功或已签到');
+        if (text.includes('签到成功')) {
+            return completeSign('sl-asmr', '接口返回签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
+        }
+        if (text.includes('您已签到')) {
+            return completeSign('sl-asmr', '接口返回今日已签到');
         }
         console.log('[夜世界] 签到接口异常', text);
         return false;
@@ -1132,7 +1167,7 @@
 
         const signPage = await requestPage(signPath);
         if (/领取成功|请明天继续|已经领过了|已领过/.test(signPage.text)) {
-            return completeSign('kfpromax', '成长奖励接口返回领取成功');
+            return completeSign('kfpromax', '成长奖励接口返回领取成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (isLoginPage(signPage.text)) {
             recordTargetStatus('kfpromax', 'needs-login', {
@@ -1191,12 +1226,12 @@
         const rankText = await requestText('https://sjs47.com/plugin.php?id=k_misign:sign&operation=list&inajax=1&ajaxtarget=ranklist');
         const uidPattern = new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,500}${getToday()}`);
         if (uidPattern.test(rankText)) {
-            return completeSign('sijishe', '今日排行已确认签到记录');
+            return completeSign('sijishe', '今日排行已确认签到记录', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
         const verifyText = await requestText('https://sjs47.com/k_misign-sign.html');
         if (/btnvisted|今日已签到|已经签到|您今日已经签到|已签到/.test(verifyText)) {
-            return completeSign('sijishe', '页面复查确认今日已签到');
+            return completeSign('sijishe', '页面复查确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
         console.log('[司机社] 签到接口未确认成功', rankText);
@@ -1390,7 +1425,7 @@
             });
             const resultText = extractCdata(await readUuGgResponseText(response));
             if (signSuccessMessageRe.test(resultText)) {
-                return completeSign('uugg', '页面内 API 返回签到成功或今日已签到');
+                return completeSign('uugg', '页面内 API 返回签到成功或今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
             }
             if (/请先登录|登录后|member\.php\?mod=logging(?:&amp;|&)action=login/i.test(resultText)) {
                 recordTargetStatus('uugg', 'needs-login', {
@@ -1403,7 +1438,7 @@
 
             const verifyResult = await verifySignedAfterSubmit(5, 1000);
             if (verifyResult.confirmed) {
-                return completeSign('uugg', '提交后复查确认今日已签到');
+                return completeSign('uugg', '提交后复查确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
             }
             if (unsignedStateRe.test(verifyResult.signServiceText)) {
                 console.log('[有叽叽论坛] 提交后复查仍显示今天未签到', verifyResult.signServiceText);
@@ -1420,7 +1455,7 @@
         if (uuGgPageSubmitAttempted) {
             const verifyResult = await verifySignedAfterSubmit(1);
             if (verifyResult.confirmed) {
-                return completeSign('uugg', '后续复查确认今日已签到');
+                return completeSign('uugg', '后续复查确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
             }
         }
 
@@ -1484,6 +1519,9 @@
             console.log('[次元狗] 未获取到签到 nonce', checkJson);
             return false;
         }
+        if (isSignedPayload(checkJson)) {
+            return completeSign('acgndog', '接口返回今日已签到');
+        }
 
         const signText = await requestText(
             `https://www.acgndog.com/wp-admin/admin-ajax.php?_nonce=${encodeURIComponent(checkJson._nonce)}&action=${signAction}&type=goSign`,
@@ -1492,12 +1530,12 @@
         const signJson = parseApiJson(signText, '签到接口');
         if (!signJson) return false;
 
-        if ((signJson.code === 0 && /签到成功|获得/.test(signJson.msg || '')) || /已签到|已经签到|今日已/.test(signJson.msg || '')) {
+        if (signJson.code === 0 && /签到成功|获得/.test(signJson.msg || '')) {
             for (let i = 0; i < 3; i++) {
                 await delay(1000);
                 const verifyJson = await requestCheckJson(`acgndog-check-after-${i + 1}`);
                 if (verifyJson && isSignedPayload(verifyJson)) {
-                    return completeSign('acgndog', signJson.msg || '提交后复查确认今日已签到');
+                    return completeSign('acgndog', signJson.msg || '提交后复查确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
                 }
             }
             console.log('[次元狗] 签到接口返回成功，但复查未确认完成', signJson);
@@ -1507,6 +1545,9 @@
                 url: 'https://www.acgndog.com/'
             });
             return false;
+        }
+        if (/已签到|已经签到|今日已/.test(signJson.msg || '')) {
+            return completeSign('acgndog', signJson.msg || '接口返回今日已签到');
         }
 
         console.log('[次元狗] API 返回异常:', signJson);
@@ -1722,7 +1763,7 @@
             return false;
         }
         if (signJson?.status === 'success' && isVikTodayTimestamp(signJson.data?.sign_time)) {
-            return completeSign('vik', `API 签到成功，连续 ${signJson.data?.sign_days || 0} 天`);
+            return completeSign('vik', `API 签到成功，连续 ${signJson.data?.sign_days || 0} 天`, CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (/已签到|已经签到|今日已/.test(signJson?.message || '')) {
             return completeSign('vik', signJson.message || '接口返回今日已签到');
@@ -1745,7 +1786,7 @@
         const userId = String(userInfo.data.basic.id);
         const myMission = missionList?.data?.list?.find(item => String(item?.user?.id) === userId);
         if (isVikTodayTimestamp(myMission?.mission?.sign_time)) {
-            return completeSign('vik', '任务列表确认今日已签到');
+            return completeSign('vik', '任务列表确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
         console.log('[维咔] API 返回异常:', signJson, missionList);
@@ -1766,7 +1807,7 @@
         const text = res.responseText || '';
         if (text.includes('randomMoemoepoints')) {
             const json = JSON.parse(text);
-            return completeSign('galGameXNew', `签到成功，获得 ${json.randomMoemoepoints} 萌点`);
+            return completeSign('galGameXNew', `签到成功，获得 ${json.randomMoemoepoints} 萌点`, CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (text.includes('您今天已经签到过了')) {
             return completeSign('galGameXNew', '接口返回今日已经签到过了');
@@ -1839,7 +1880,7 @@
         console.log('执行寻宝(签到)点击');
         const noticeText = await waitForNoticeText(beforeNoticeText);
         if (isSuccessText(noticeText)) {
-            return completeSign('fufugal', noticeText || '寻宝按钮状态已确认');
+            return completeSign('fufugal', noticeText || '寻宝按钮状态已确认', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (isLoginText(noticeText)) {
             recordTargetStatus('fufugal', 'needs-login', {
@@ -1858,11 +1899,11 @@
             return false;
         }
         if ((btn.innerText || '').includes('寻宝')) {
-            return completeSign('fufugal', '已点击寻宝按钮，未检测到异常提示');
+            return completeSign('fufugal', '已点击寻宝按钮，未检测到异常提示', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
         console.log('[初音的青葱] 寻宝按钮点击后未识别站点提示', noticeText);
-        return completeSign('fufugal', '寻宝按钮状态已确认');
+        return completeSign('fufugal', '寻宝按钮状态已确认', CLOSE_PAGE_AFTER_SIGN_ACTION);
     }
 
     // ================== 各站点签到策略配置 ==================
@@ -2067,7 +2108,7 @@
                             if (document.body.innerText.includes(timeString)) {
                                 console.log('[签到助手] 校验成功！');
                                 GM_setValue('sstm_retry_count', 0);
-                                return completeSign('sstm', '回帖提交后已校验成功');
+                                return completeSign('sstm', '回帖提交后已校验成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
                             }
                         }
                     }
@@ -2122,7 +2163,7 @@
                 } else if (btnSign) {
                     btnSign.click();
                     console.log('签到成功!');
-                    return completeSign('wcccc', '已点击签到按钮');
+                    return completeSign('wcccc', '已点击签到按钮', CLOSE_PAGE_AFTER_SIGN_ACTION);
                 }
                 return false;
             }
@@ -2208,7 +2249,7 @@
                     for (let i = 0; i < 20; i++) {
                         await delay(500);
                         if (isSigned()) {
-                            return completeSign('2dfan', '前台验证后确认签到成功');
+                            return completeSign('2dfan', '前台验证后确认签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
                         }
                     }
 
@@ -2257,10 +2298,11 @@
                     if (!btn.innerText.includes('恭喜')) {
                         btn.click();
                         console.log('执行签到点击');
+                        return completeSign('galgamex', '签到按钮状态已确认', CLOSE_PAGE_AFTER_SIGN_ACTION);
                     } else {
                         console.log('已签到');
+                        return completeSign('galgamex', '签到按钮状态已确认');
                     }
-                    return completeSign('galgamex', '签到按钮状态已确认');
                 }
                 return false;
             }
@@ -2452,8 +2494,9 @@
                     if (say) say.value = "每天签到水一发。。。";
 
                     const form = document.querySelector('#qiandao');
-                    markSignSuccess('ZodGame', '已提交签到表单');
                     if (form) form.submit();
+                    markSignSuccess('ZodGame', '已提交签到表单');
+                    maybeAutoClosePageAfterSign('ZodGame', form ? CLOSE_PAGE_AFTER_SIGN_ACTION : {});
 
                     return true;
                 }
@@ -3714,6 +3757,14 @@
                 showDashboard('settings', editingId);
             }
         });
+        const autoCloseInput = el('input', {
+            type: 'checkbox',
+            checked: config.preferences.autoClosePageAfterSign,
+            onChange: (event) => {
+                updateDashboardPreference({ autoClosePageAfterSign: event.target.checked });
+                showDashboard('settings', editingId);
+            }
+        });
         body.append(
             el('div', { className: 'bbs-sign-section-title', text: '控制台选项' }),
             el('div', { className: 'bbs-sign-card' }, [
@@ -3721,7 +3772,11 @@
                     autoOpenInput,
                     el('span', { text: '提醒状态下 3 秒后自动展开控制台' })
                 ]),
-                el('div', { className: 'bbs-sign-meta', text: '倒计时会显示在悬浮按钮上，可点击“取消”停止本次自动展开。' })
+                el('label', { className: 'bbs-sign-check' }, [
+                    autoCloseInput,
+                    el('span', { text: '签到动作完成后自动关闭站点页面' })
+                ]),
+                el('div', { className: 'bbs-sign-meta', text: '倒计时会显示在悬浮按钮上，可点击“取消”停止本次自动展开；自动关闭仅在脚本本次完成点击、提交或接口签到后尝试执行，打开时已签到不会关闭。' })
             ])
         );
 
