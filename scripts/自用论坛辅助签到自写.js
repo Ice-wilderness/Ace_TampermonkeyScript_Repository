@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.11.0
+// @version      2.11.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -60,7 +60,8 @@
         dashboardConfig: 'BBSSignHelperDashboardConfig',
         dashboardStatus: 'BBSSignHelperDashboardStatus',
         signDebugLogs: 'BBSSignHelperDebugLogs',
-        pageToastSuppressed: 'BBSSignHelperPageToastSuppressed'
+        pageToastSuppressed: 'BBSSignHelperPageToastSuppressed',
+        autoClosePending: 'BBSSignHelperAutoClosePending'
     };
 
     const DEBUG_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
@@ -75,7 +76,9 @@
     const DASHBOARD_AUTO_REFRESH_DURATION_MS = 2 * 60 * 1000;
     const DIRECT_SIGN_RETRY_ATTEMPTS = 3;
     const DIRECT_SIGN_RETRY_DELAY_MS = 3000;
+    const AUTO_CLOSE_PENDING_TTL_MS = 10 * 60 * 1000;
     const CLOSE_PAGE_AFTER_SIGN_ACTION = { closePageAfterSignAction: true };
+    const AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS = new Set(['uugg', 'soushuba']);
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
@@ -602,8 +605,53 @@
         return Boolean(site && site.matches.some(domain => location.hostname.includes(domain)));
     }
 
+    function getAutoClosePendingStorageKey(key) {
+        return getScopedStorageKey(STORAGE_KEYS.autoClosePending, key);
+    }
+
+    function markPendingAutoCloseAfterSignAction(key, source = 'action') {
+        const config = getDashboardConfig();
+        if (!config.preferences.autoClosePageAfterSign) return;
+        if (isLimestartHost() || !isCurrentPageForSite(key)) return;
+        GM_setValue(getAutoClosePendingStorageKey(key), {
+            date: getToday(),
+            source,
+            url: location.href,
+            expiresAt: Date.now() + AUTO_CLOSE_PENDING_TTL_MS
+        });
+    }
+
+    function markPendingAutoCloseAfterDashboardLaunch(target) {
+        const key = target?.siteKey;
+        if (!key || !AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS.has(key)) return;
+        const config = getDashboardConfig();
+        if (!config.preferences.autoClosePageAfterSign) return;
+        GM_setValue(getAutoClosePendingStorageKey(key), {
+            date: getToday(),
+            source: 'dashboard-launch',
+            url: target.url,
+            expiresAt: Date.now() + AUTO_CLOSE_PENDING_TTL_MS
+        });
+    }
+
+    function consumePendingAutoCloseAfterSignAction(key) {
+        const storageKey = getAutoClosePendingStorageKey(key);
+        const pending = GM_getValue(storageKey);
+        if (!pending || typeof pending !== 'object' || Array.isArray(pending)) {
+            if (pending) GM_setValue(storageKey, '');
+            return false;
+        }
+
+        const isValid = pending.date === getToday() &&
+            Number(pending.expiresAt || 0) > Date.now();
+        GM_setValue(storageKey, '');
+        return isValid;
+    }
+
     function maybeAutoClosePageAfterSign(key, options = {}) {
-        if (options.closePageAfterSignAction !== true) return;
+        const hasPendingAction = consumePendingAutoCloseAfterSignAction(key);
+        const shouldClose = options.closePageAfterSignAction === true || hasPendingAction;
+        if (!shouldClose) return;
         const config = getDashboardConfig();
         if (!config.preferences.autoClosePageAfterSign) return;
         if (isLimestartHost() || !isCurrentPageForSite(key)) return;
@@ -2160,6 +2208,7 @@
                         const submitBtn = document.querySelector('button[type="submit"].ipsButton_primary, [data-action="submitReply"], .ipsComposeArea_submit button');
                         if (submitBtn) {
                             console.log('[签到助手] 点击提交按钮...');
+                            markPendingAutoCloseAfterSignAction('sstm', 'reply-submit');
                             submitBtn.click();
 
                             // 4. 等待并校验
@@ -2278,6 +2327,7 @@
 
                 const btn = await waitForElement('a[href*="operation=qiandao"], #JD_sign, .qdleft a.btn', 5000);
                 if (btn) {
+                    markPendingAutoCloseAfterSignAction('laowang', 'sign-click');
                     btn.click();
                     console.log('[老王论坛] 已点击签到按钮，等待验证和结果确认...');
 
@@ -2628,9 +2678,9 @@
                     if (say) say.value = "每天签到水一发。。。";
 
                     const form = document.querySelector('#qiandao');
+                    if (form) markPendingAutoCloseAfterSignAction('ZodGame', 'sign-form-submit');
                     if (form) form.submit();
                     markSignSuccess('ZodGame', '已提交签到表单');
-                    maybeAutoClosePageAfterSign('ZodGame', form ? CLOSE_PAGE_AFTER_SIGN_ACTION : {});
 
                     return true;
                 }
@@ -2769,6 +2819,7 @@
     }
 
     function launchTarget(target) {
+        markPendingAutoCloseAfterDashboardLaunch(target);
         openUrl(target.url, target.openMode);
         const message = target.resultMode === 'script'
             ? '已打开，等待站点脚本确认签到结果'
@@ -4284,6 +4335,7 @@
                     autoClosePageSignToastAfterMs: PAGE_COMPLETED_TOAST_AUTO_CLOSE_MS,
                     countCompletedPageSignToast: true
                 });
+                maybeAutoClosePageAfterSign(site.key);
                 return; // 当日已执行，退出
             }
 
