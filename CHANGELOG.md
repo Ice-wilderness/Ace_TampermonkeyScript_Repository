@@ -6,11 +6,26 @@
 
 ## 目录
 
+- [ChatGPT 图片批量下载器](#chatgpt-image-batch)
 - [Bilibili 视频观看历史记录](#bilibili-history)
 - [bilibili 查看关注时间](#bilibili-follow-time)
 - [Discuz 论坛帖子已读标记与图片预览](#discuz-read-image-preview)
 - [自用论坛辅助签到](#forum-auto-signin)
 - [通用请求抓包记录器](#universal-api-capture)
+
+<a id="chatgpt-image-batch"></a>
+<details>
+<summary><strong>ChatGPT 图片批量下载器</strong></summary>
+
+文件：[ChatGPT 图片批量下载器.js](./scripts/ChatGPT%20图片批量下载器.js)
+
+### 1.0.0
+
+- 新增 ChatGPT 图片批量下载器脚本，可在 ChatGPT 图片页面勾选多张图片后批量下载。
+- 支持右下角批量下载面板、全选/取消全选和已选数量显示。
+- 批量下载时通过 ChatGPT 页面原生保存/下载按钮逐张触发下载。
+
+</details>
 
 <a id="bilibili-history"></a>
 <details>
