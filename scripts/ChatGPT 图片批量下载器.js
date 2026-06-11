@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 图片批量下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.0.1
+// @version      1.0.2
 // @description  在 ChatGPT 图片页面为图片添加复选框，并通过页面原生保存按钮批量下载。
 // @author       Ice_wilderness
 // @match        https://chatgpt.com/images*
@@ -305,16 +305,20 @@
             return;
         }
 
-        const root = getScanRoot();
+        const { root, ownImagesHeading } = getScanContext();
         const images = Array.from(root.querySelectorAll('img'));
 
         for (const img of images) {
+            if (!isInsideOwnImagesScope(img, ownImagesHeading)) {
+                continue;
+            }
+
             if (isCandidateImage(img)) {
                 injectCheckbox(img);
             }
         }
 
-        pruneMissingItems();
+        pruneMissingItems(ownImagesHeading);
         updatePanel();
     }
 
@@ -322,18 +326,24 @@
         return /^\/images(?:\/|$)/.test(location.pathname);
     }
 
-    function getScanRoot() {
+    function getScanContext() {
         const main = document.querySelector('main') || document.body;
 
         if (isImagesRoute()) {
             const ownImagesHeading = findOwnImagesHeading(main);
             if (ownImagesHeading) {
                 const scopedRoot = ownImagesHeading.closest('section') || ownImagesHeading.parentElement || main;
-                return scopedRoot.querySelector('img') ? scopedRoot : main;
+                return {
+                    root: scopedRoot.querySelector('img') ? scopedRoot : main,
+                    ownImagesHeading
+                };
             }
         }
 
-        return main;
+        return {
+            root: main,
+            ownImagesHeading: null
+        };
     }
 
     function findOwnImagesHeading(root) {
@@ -352,6 +362,14 @@
             const rect = element.getBoundingClientRect();
             return rect.width > 0 && rect.height > 0 && element.children.length <= 2 && isOwnImagesText(element);
         });
+    }
+
+    function isInsideOwnImagesScope(element, ownImagesHeading) {
+        if (!ownImagesHeading) {
+            return true;
+        }
+
+        return Boolean(ownImagesHeading.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING);
     }
 
     function isCandidateImage(img) {
@@ -502,9 +520,9 @@
         }
     }
 
-    function pruneMissingItems() {
+    function pruneMissingItems(ownImagesHeading) {
         for (const [id, item] of state.items) {
-            if (!item.img.isConnected || !item.checkbox.isConnected) {
+            if (!item.img.isConnected || !item.checkbox.isConnected || !isInsideOwnImagesScope(item.img, ownImagesHeading)) {
                 item.img.removeAttribute(ITEM_ATTR);
                 item.checkbox.remove();
                 state.items.delete(id);
