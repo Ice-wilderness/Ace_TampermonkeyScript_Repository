@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT 图片批量下载器
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.0.1
 // @description  在 ChatGPT 图片页面为图片添加复选框，并通过页面原生保存按钮批量下载。
 // @author       Ice_wilderness
 // @match        https://chatgpt.com/images*
@@ -594,6 +594,7 @@
         setStatus('准备下载...');
 
         const failures = [];
+        const failedItemIds = new Set();
         let nativeTriggered = 0;
         let thumbnailTriggered = 0;
 
@@ -611,6 +612,7 @@
                         thumbnailTriggered++;
                     }
                 } catch (error) {
+                    failedItemIds.add(item.id);
                     failures.push({
                         index: displayIndex,
                         reason: '页面下载按钮触发失败',
@@ -627,9 +629,15 @@
         }
 
         if (failures.length) {
+            for (const item of selectedItems) {
+                if (item.checkbox.isConnected) {
+                    item.checkbox.checked = failedItemIds.has(item.id);
+                }
+            }
+            updatePanel();
             console.warn('[ChatGPT 图片批量下载器] 部分图片下载失败。脚本当前只使用 ChatGPT 页面原生保存/下载按钮。', failures);
-            setStatus(`完成，失败 ${failures.length} 张`);
-            window.alert(`已完成，失败 ${failures.length} 张。失败原因已输出到控制台。`);
+            setStatus(`完成，失败 ${failures.length} 张，已保留失败项`);
+            window.alert(`已完成，失败 ${failures.length} 张。已自动取消成功图片勾选，仅保留失败图片，可直接再次点击批量下载。失败原因已输出到控制台。`);
         } else {
             setStatus(thumbnailTriggered ? `完成 ${selectedItems.length} 张，缩略图切换 ${thumbnailTriggered} 张` : (nativeTriggered ? `完成 ${selectedItems.length} 张，页面触发 ${nativeTriggered} 张` : `完成 ${selectedItems.length} 张`));
         }
