@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.11.2
+// @version      2.11.3
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -78,7 +78,8 @@
     const DIRECT_SIGN_RETRY_DELAY_MS = 3000;
     const AUTO_CLOSE_PENDING_TTL_MS = 10 * 60 * 1000;
     const CLOSE_PAGE_AFTER_SIGN_ACTION = { closePageAfterSignAction: true };
-    const AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS = new Set(['uugg', 'soushuba']);
+    const AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS = new Set(['uugg', 'soushuba', 'ZodGame']);
+    const TRACK_LAUNCHED_AUTO_CLOSE_SITE_KEYS = new Set([...AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS, 'sstm']);
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
@@ -124,6 +125,8 @@
     let autoOpenSuppressedSignature = '';
     let dashboardAutoRefreshTimer = null;
     let dashboardAutoRefreshUntil = 0;
+    let launchedAutoCloseMonitorTimer = null;
+    const launchedAutoCloseTabs = new Map();
     let activeSignDebugContext = null;
     let dismissedPageSignToastSignature = '';
     let pageSignToastAutoCloseTimer = null;
@@ -2806,21 +2809,100 @@
         saveDashboardConfig(config);
     }
 
+    function getLaunchedAutoCloseKey(target) {
+        return target?.siteKey || target?.id || '';
+    }
+
+    function stopLaunchedAutoCloseMonitor() {
+        if (launchedAutoCloseMonitorTimer) {
+            clearInterval(launchedAutoCloseMonitorTimer);
+            launchedAutoCloseMonitorTimer = null;
+        }
+    }
+
+    function closeLaunchedAutoCloseTab(key, entry, reason) {
+        try {
+            entry.tab.close();
+            console.log(`[签到助手] ${key} 已由控制台关闭签到页面：${reason}`);
+        } catch (err) {
+            console.log(`[签到助手] ${key} 控制台关闭签到页面失败，可能是浏览器限制。`, err);
+        }
+        launchedAutoCloseTabs.delete(key);
+    }
+
+    function syncLaunchedAutoCloseTabs(targets = getAllTargets()) {
+        const config = getDashboardConfig();
+        const now = Date.now();
+
+        for (const [key, entry] of launchedAutoCloseTabs) {
+            if (!config.preferences.autoClosePageAfterSign) {
+                launchedAutoCloseTabs.delete(key);
+                continue;
+            }
+            if (!entry?.tab || typeof entry.tab.close !== 'function') {
+                launchedAutoCloseTabs.delete(key);
+                continue;
+            }
+            if (entry.tab.closed || now - entry.openedAt > AUTO_CLOSE_PENDING_TTL_MS) {
+                launchedAutoCloseTabs.delete(key);
+                continue;
+            }
+
+            const target = targets.find(item => getLaunchedAutoCloseKey(item) === key);
+            if (!target) {
+                launchedAutoCloseTabs.delete(key);
+                continue;
+            }
+
+            const status = getNormalizedTargetStatus(target);
+            if (status.status === 'success') {
+                closeLaunchedAutoCloseTab(key, entry, status.message || '已确认签到成功');
+            }
+        }
+
+        if (!launchedAutoCloseTabs.size) stopLaunchedAutoCloseMonitor();
+    }
+
+    function startLaunchedAutoCloseMonitor() {
+        if (launchedAutoCloseMonitorTimer) return;
+        launchedAutoCloseMonitorTimer = setInterval(() => {
+            syncLaunchedAutoCloseTabs();
+        }, 1000);
+    }
+
+    function trackLaunchedAutoCloseTab(target, tab, beforeStatus) {
+        if (isTargetDone(beforeStatus)) return;
+        if (!target?.siteKey || !tab || typeof tab.close !== 'function') return;
+        if (!TRACK_LAUNCHED_AUTO_CLOSE_SITE_KEYS.has(target.siteKey)) return;
+        const config = getDashboardConfig();
+        if (!config.preferences.autoClosePageAfterSign) return;
+
+        const key = getLaunchedAutoCloseKey(target);
+        if (!key) return;
+        launchedAutoCloseTabs.set(key, {
+            tab,
+            openedAt: Date.now(),
+            url: target.url
+        });
+        startLaunchedAutoCloseMonitor();
+    }
+
     function openUrl(url, openMode = 'background') {
         if (typeof GM_openInTab === 'function') {
-            GM_openInTab(url, {
+            return GM_openInTab(url, {
                 active: openMode === 'foreground',
                 insert: true,
                 setParent: true
             });
-            return;
         }
-        window.open(url, openMode === 'foreground' ? '_self' : '_blank', 'noopener');
+        return window.open(url, openMode === 'foreground' ? '_self' : '_blank', 'noopener');
     }
 
     function launchTarget(target) {
+        const beforeStatus = getNormalizedTargetStatus(target).status;
         markPendingAutoCloseAfterDashboardLaunch(target);
-        openUrl(target.url, target.openMode);
+        const tab = openUrl(target.url, target.openMode);
+        trackLaunchedAutoCloseTab(target, tab, beforeStatus);
         const message = target.resultMode === 'script'
             ? '已打开，等待站点脚本确认签到结果'
             : '已打开，等待手动确认签到结果';
@@ -3799,6 +3881,7 @@
 
     function renderDashboardView(body, rerender) {
         const targets = getAllTargets().filter(target => target.enabled);
+        syncLaunchedAutoCloseTabs(targets);
         const visibleTargets = targets.filter(target => targetMatchesSearch(target, dashboardSearchQuery));
         const summary = getDashboardSummary(targets);
         const launchableTargets = getLaunchableTargets();
