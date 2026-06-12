@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.11.1
+// @version      2.11.2
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -2135,14 +2135,14 @@
 
                     if (hasSignedToday) {
                         console.log('[签到助手] 评论区已检测到您今日的回帖，判定为签到成功。');
-                        return completeSign('sstm', '评论区已检测到今日回帖');
+                        return completeSign('sstm', '评论区已检测到今日回帖', CLOSE_PAGE_AFTER_SIGN_ACTION);
                     } else if (!currentUserLink) {
                         // 兼容极端情况：如果未能获取到当前用户信息，降级为检查严格的日期时间格式
                         const commentsArea = document.querySelector('[data-role="commentFeed"]');
                         const strictDateRegex = new RegExp(`${year}年${month}月${date}日\\s+\\d{2}:\\d{2}:\\d{2}`);
                         if (commentsArea && strictDateRegex.test(commentsArea.innerText)) {
                             console.log('[签到助手] 评论区检测到严格符合格式的回帖（防误判降级），判定为签到成功。');
-                            return completeSign('sstm', '评论区检测到今日回帖格式');
+                            return completeSign('sstm', '评论区检测到今日回帖格式', CLOSE_PAGE_AFTER_SIGN_ACTION);
                         }
                     }
 
