@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.11.3
+// @version      2.11.4
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -78,7 +78,7 @@
     const DIRECT_SIGN_RETRY_DELAY_MS = 3000;
     const AUTO_CLOSE_PENDING_TTL_MS = 10 * 60 * 1000;
     const CLOSE_PAGE_AFTER_SIGN_ACTION = { closePageAfterSignAction: true };
-    const AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS = new Set(['uugg', 'soushuba', 'ZodGame']);
+    const AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS = new Set(['uugg', 'soushuba', 'ZodGame', 'laowang']);
     const TRACK_LAUNCHED_AUTO_CLOSE_SITE_KEYS = new Set([...AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS, 'sstm']);
 
     const STATUS_META = {
