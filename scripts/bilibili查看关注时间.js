@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         bilibili查看关注时间
 // @namespace    http://tampermonkey.net/
-// @version      1.1.2
+// @version      1.1.3
 // @description  bilibili查看关注时间。
 // @author       Ice_wilderness
 // @match        https://space.bilibili.com/*
@@ -268,7 +268,40 @@
         }
     }
 
+    function findProfileNameElement(targetUserId) {
+        let selectors = [
+            '#h-name',
+            '.h-name',
+            '.base-info .name',
+            '.base-info .user-name',
+            '.m-space-info .name',
+            '.m-space-info .user-name',
+            '.upinfo-detail__top .nickname',
+            '.header-upinfo .nickname'
+        ];
+
+        return Array.from(document.querySelectorAll(selectors.join(', '))).find(el => {
+            if (!el.textContent.trim()) return false;
+
+            let nonProfileContainer = el.closest([
+                '.header-dynamic-list-item',
+                '.dynamic-name-line',
+                '.bili-dyn-item',
+                '.bili-dyn-card',
+                '.opus-module-author',
+                '.user-card-m-exp',
+                '.list-item',
+                '.relation-card'
+            ].join(', '));
+            if (nonProfileContainer) return false;
+
+            let linkMid = extractMid(el) || extractMid(el.closest('a[href*="space.bilibili.com"]'));
+            return !linkMid || String(linkMid) === String(targetUserId);
+        }) || null;
+    }
+
     function extractMid(element) {
+        if (!element) return null;
         let href = element.getAttribute('href');
         if (href) {
             let match = href.match(/space\.bilibili\.com\/(\d+)/);
@@ -295,7 +328,7 @@
         if (!match) return;
         const targetUserId = match[1];
 
-        let nameElement = document.querySelector('#h-name, .h-name, .base-info .name, .user-name, .m-space-info .name, .upinfo-detail__top .nickname, .header-upinfo .nickname');
+        let nameElement = findProfileNameElement(targetUserId);
 
         // 等待页面渲染出名字且没有处理过再执行
         if (!nameElement || !nameElement.textContent.trim() || nameElement.dataset.timeAdded === String(targetUserId)) return;
