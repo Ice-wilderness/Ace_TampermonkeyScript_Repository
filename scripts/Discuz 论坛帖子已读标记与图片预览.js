@@ -2,9 +2,9 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           4.6.3
-// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，支持列表页静默并发图片预览、可选后续分页抓取、已读样式配置和可拖动设置入口。
-// @description:en    Marks visited threads in Discuz! forum lists, with silent concurrent image previews, optional extra-page fetching, configurable visited styles, and a draggable settings entry.
+// @version           4.7.0
+// @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，支持列表页静默并发图片预览、可选后续分页抓取、已读样式配置、帖子列表宽度控制和可拖动设置入口。
+// @description:en    Marks visited threads in Discuz! forum lists, with silent concurrent image previews, optional extra-page fetching, configurable visited styles, thread list width control, and a draggable settings entry.
 // @author            Ice_wilderness
 // @match             *://*/*forum.php?mod=forumdisplay*
 // @match             *://*/*forum.php?mod=viewthread*
@@ -189,6 +189,7 @@
             font-size: 13px;
         }
         .settings-field input[type="number"],
+        .settings-field input[type="text"],
         .settings-field select {
             width: 120px;
             max-width: 48%;
@@ -498,6 +499,21 @@
     const DEFAULT_AUTO_PREVIEW_CONCURRENT = 1;
     const AUTO_PREVIEW_DELAY_MS = 300;
     const VISITED_STYLE_MODES = ['default', 'opacity', 'strike', 'opacity-strike', 'color', 'hidden'];
+    const DEFAULT_THREAD_LIST_WIDTH_SELECTOR = '.wp';
+    const DEFAULT_THREAD_LIST_WIDTH_MODE = 'percent';
+    const THREAD_LIST_WIDTH_SETTING_KEYS = {
+        enabled:  'thread_list_width_enabled',
+        selector: 'thread_list_width_selector',
+        mode:     'thread_list_width_mode',
+        value:    'thread_list_width_value',
+    };
+    const THREAD_LIST_WIDTH_MODES = ['percent', 'pixel'];
+    const DEFAULT_THREAD_LIST_WIDTH_SITE_POLICY = 'default';
+    const THREAD_LIST_WIDTH_SITE_POLICIES = ['default', 'site', 'disabled'];
+    const THREAD_LIST_WIDTH_VALUE_LIMITS = {
+        percent: { default: 80, min: 50,  max: 100 },
+        pixel:   { default: 1400, min: 800, max: 3840 },
+    };
     const RE_THREAD_PAGE_SHORT = /thread-(\d+)-(\d+)(-\d+)?\.html$/i;
     const RE_THREAD_PAGE_ARCHIVE = /thread-(\d+)-(\d+)-(\d+)\.html$/i;
 
@@ -520,6 +536,8 @@
     const hostName = window.location.hostname.replace(/[^a-zA-Z0-9]/g, '_');
     const STORAGE_KEY = `${BASE_STORAGE_KEY}_${forumName}_${hostName}`;
     const OLD_STORAGE_KEY = `${BASE_STORAGE_KEY}_${forumName}`;
+    const THREAD_LIST_WIDTH_SITE_POLICY_KEY = `thread_list_width_site_policy_${hostName}`;
+    const THREAD_LIST_WIDTH_LEGACY_SITE_OVERRIDE_KEY = `thread_list_width_site_override_${hostName}`;
 
     // 数据迁移逻辑 (针对旧版升级)
     function migrateStorageKey() {
@@ -674,6 +692,92 @@
         return VISITED_STYLE_MODES.includes(mode) ? mode : 'default';
     }
 
+    function getThreadListWidthSettingKey(name, scope = 'default') {
+        const key = THREAD_LIST_WIDTH_SETTING_KEYS[name];
+        return scope === 'site' ? `${key}_${hostName}` : key;
+    }
+
+    function getThreadListWidthSitePolicy() {
+        const policy = GM_getValue(THREAD_LIST_WIDTH_SITE_POLICY_KEY, null);
+        if (THREAD_LIST_WIDTH_SITE_POLICIES.includes(policy)) return policy;
+        return GM_getValue(THREAD_LIST_WIDTH_LEGACY_SITE_OVERRIDE_KEY, false) === true ? 'site' : DEFAULT_THREAD_LIST_WIDTH_SITE_POLICY;
+    }
+
+    function saveThreadListWidthSitePolicy(policy) {
+        GM_setValue(
+            THREAD_LIST_WIDTH_SITE_POLICY_KEY,
+            THREAD_LIST_WIDTH_SITE_POLICIES.includes(policy) ? policy : DEFAULT_THREAD_LIST_WIDTH_SITE_POLICY
+        );
+    }
+
+    function normalizeThreadListWidthMode(mode) {
+        return THREAD_LIST_WIDTH_MODES.includes(mode) ? mode : DEFAULT_THREAD_LIST_WIDTH_MODE;
+    }
+
+    function getThreadListWidthValueLimits(mode) {
+        return THREAD_LIST_WIDTH_VALUE_LIMITS[normalizeThreadListWidthMode(mode)] || THREAD_LIST_WIDTH_VALUE_LIMITS[DEFAULT_THREAD_LIST_WIDTH_MODE];
+    }
+
+    function normalizeThreadListWidthValue(value, mode) {
+        const limits = getThreadListWidthValueLimits(mode);
+        const numberValue = Number(value);
+        if (!Number.isFinite(numberValue)) return limits.default;
+        return Math.min(limits.max, Math.max(limits.min, Math.round(numberValue)));
+    }
+
+    function readThreadListWidthConfig(scope, fallback = {}) {
+        const fallbackMode = normalizeThreadListWidthMode(fallback.mode || DEFAULT_THREAD_LIST_WIDTH_MODE);
+        const mode = normalizeThreadListWidthMode(GM_getValue(getThreadListWidthSettingKey('mode', scope), fallbackMode));
+        const limits = getThreadListWidthValueLimits(mode);
+        const fallbackValue = fallback.value !== undefined ? fallback.value : limits.default;
+        const selector = String(GM_getValue(
+            getThreadListWidthSettingKey('selector', scope),
+            fallback.selector || DEFAULT_THREAD_LIST_WIDTH_SELECTOR
+        ) || '').trim();
+
+        return {
+            enabled: GM_getValue(getThreadListWidthSettingKey('enabled', scope), fallback.enabled === true) === true,
+            selector: selector || DEFAULT_THREAD_LIST_WIDTH_SELECTOR,
+            mode,
+            value: normalizeThreadListWidthValue(
+                GM_getValue(getThreadListWidthSettingKey('value', scope), fallbackValue),
+                mode
+            ),
+        };
+    }
+
+    function getThreadListWidthConfig(scope = 'effective') {
+        const defaultConfig = readThreadListWidthConfig('default');
+        if (scope === 'default') return defaultConfig;
+        const siteConfig = readThreadListWidthConfig('site', defaultConfig);
+        if (scope === 'site') return siteConfig;
+        const sitePolicy = getThreadListWidthSitePolicy();
+        if (sitePolicy === 'disabled') return { ...defaultConfig, enabled: false };
+        if (sitePolicy === 'site') return { ...siteConfig, enabled: true };
+        return defaultConfig;
+    }
+
+    function saveThreadListWidthConfig(scope, config) {
+        const mode = normalizeThreadListWidthMode(config.mode);
+        GM_setValue(getThreadListWidthSettingKey('enabled', scope), config.enabled === true);
+        GM_setValue(getThreadListWidthSettingKey('selector', scope), (config.selector || '').trim() || DEFAULT_THREAD_LIST_WIDTH_SELECTOR);
+        GM_setValue(getThreadListWidthSettingKey('mode', scope), mode);
+        GM_setValue(getThreadListWidthSettingKey('value', scope), normalizeThreadListWidthValue(config.value, mode));
+    }
+
+    function isThreadListWidthEnabled() {
+        return getThreadListWidthConfig().enabled;
+    }
+
+    function getThreadListWidthSelector() {
+        return getThreadListWidthConfig().selector;
+    }
+
+    function getThreadListWidthCssValue() {
+        const { mode, value } = getThreadListWidthConfig();
+        return mode === 'pixel' ? `${value}px` : `${value}%`;
+    }
+
     function applyVisitedStyleMode() {
         document.body.classList.remove(...VISITED_STYLE_MODES.map(mode => `thread-visited-mode-${mode}`));
         document.body.classList.add(`thread-visited-mode-${getVisitedStyleMode()}`);
@@ -695,8 +799,9 @@
         const input = document.createElement('input');
         input.type = 'checkbox';
         input.checked = checked;
-        label.append(input, document.createTextNode(' ' + labelText));
-        return { label, input };
+        const textNode = document.createTextNode(' ' + labelText);
+        label.append(input, textNode);
+        return { label, input, textNode };
     }
 
     function createNumberField(labelText, min, max, value) {
@@ -707,6 +812,16 @@
         input.min = String(min);
         input.max = String(max);
         input.value = String(value);
+        label.append(document.createTextNode(labelText), input);
+        return { label, input };
+    }
+
+    function createTextField(labelText, value) {
+        const label = document.createElement('label');
+        label.className = 'settings-field';
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.value = value;
         label.append(document.createTextNode(labelText), input);
         return { label, input };
     }
@@ -739,6 +854,43 @@
         return { label, select };
     }
 
+    function createThreadListWidthModeSelect(currentMode) {
+        const label = document.createElement('label');
+        label.className = 'settings-field';
+        const select = document.createElement('select');
+        [
+            ['percent', '百分比 (%)'],
+            ['pixel',   '固定像素 (px)'],
+        ].forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            if (value === currentMode) option.selected = true;
+            select.appendChild(option);
+        });
+        label.append(document.createTextNode('宽度类型'), select);
+        return { label, select };
+    }
+
+    function createThreadListWidthPolicySelect(currentPolicy) {
+        const label = document.createElement('label');
+        label.className = 'settings-field';
+        const select = document.createElement('select');
+        [
+            ['default',  '默认配置'],
+            ['site',     '独立配置'],
+            ['disabled', '不启用'],
+        ].forEach(([value, text]) => {
+            const option = document.createElement('option');
+            option.value = value;
+            option.textContent = text;
+            if (value === currentPolicy) option.selected = true;
+            select.appendChild(option);
+        });
+        label.append(document.createTextNode('当前站点策略'), select);
+        return { label, select };
+    }
+
     function showSettingsPanel() {
         createModalBase('discuz-helper-settings-modal', (content, closeFn) => {
             const data = getVisitedThreads();
@@ -767,6 +919,60 @@
             const styleTip = document.createElement('p');
             styleTip.textContent = '已读记录仍只在真实进入帖子详情页后产生；仅看图帖子不受“隐藏已读帖子”影响。';
             const styleSection = createSettingsSection('已读样式', [styleSelect, styleTip]);
+
+            // 帖子列表宽度 section
+            const widthPolicySelect = createThreadListWidthPolicySelect(getThreadListWidthSitePolicy());
+            const widthConfig = getThreadListWidthConfig(widthPolicySelect.select.value === 'default' ? 'default' : 'site');
+            const widthLimits = getThreadListWidthValueLimits(widthConfig.mode);
+            const widthCb = createLabeledCheckbox('默认启用帖子列表宽度控制', widthConfig.enabled);
+            const widthSelectorField = createTextField('目标选择器', widthConfig.selector);
+            const widthModeSelect = createThreadListWidthModeSelect(widthConfig.mode);
+            const widthValueField = createNumberField('宽度值', widthLimits.min, widthLimits.max, widthConfig.value);
+            const widthTip = document.createElement('p');
+            const syncWidthValueLimits = () => {
+                const limits = getThreadListWidthValueLimits(widthModeSelect.select.value);
+                widthValueField.input.min = String(limits.min);
+                widthValueField.input.max = String(limits.max);
+                const value = Number(widthValueField.input.value);
+                if (!Number.isFinite(value) || value < limits.min || value > limits.max) {
+                    widthValueField.input.value = String(limits.default);
+                }
+            };
+            const loadWidthConfigToFields = (config) => {
+                const mode = normalizeThreadListWidthMode(config.mode);
+                const limits = getThreadListWidthValueLimits(mode);
+                widthCb.input.checked = config.enabled === true;
+                widthSelectorField.input.value = config.selector || DEFAULT_THREAD_LIST_WIDTH_SELECTOR;
+                widthModeSelect.select.value = mode;
+                widthValueField.input.min = String(limits.min);
+                widthValueField.input.max = String(limits.max);
+                widthValueField.input.value = String(normalizeThreadListWidthValue(config.value, mode));
+            };
+            const syncWidthPolicyUI = () => {
+                const policy = widthPolicySelect.select.value;
+                const isDisabled = policy === 'disabled';
+                widthCb.label.style.display = policy === 'default' ? '' : 'none';
+                widthSelectorField.input.disabled = isDisabled;
+                widthModeSelect.select.disabled = isDisabled;
+                widthValueField.input.disabled = isDisabled;
+                if (policy === 'default') {
+                    widthCb.textNode.nodeValue = ' 默认启用帖子列表宽度控制';
+                    widthTip.textContent = '正在编辑默认配置；所有未开启独立设置的站点都会使用这组宽度配置。';
+                } else if (policy === 'site') {
+                    widthTip.textContent = `当前站点：${window.location.hostname}。使用当前站点独立配置并启用帖子列表宽度，不会覆盖默认配置。`;
+                } else {
+                    widthTip.textContent = `当前站点：${window.location.hostname}。当前站点强制不启用帖子列表宽度，即使默认配置开启也不生效。`;
+                }
+            };
+            widthModeSelect.select.addEventListener('change', syncWidthValueLimits);
+            widthPolicySelect.select.addEventListener('change', () => {
+                loadWidthConfigToFields(getThreadListWidthConfig(widthPolicySelect.select.value === 'default' ? 'default' : 'site'));
+                syncWidthPolicyUI();
+            });
+            syncWidthPolicyUI();
+            const widthSection = createSettingsSection('帖子列表宽度', [
+                widthPolicySelect, widthCb, widthSelectorField, widthModeSelect, widthValueField, widthTip,
+            ]);
 
             // 数据管理 section
             const dataSection = document.createElement('div');
@@ -858,7 +1064,7 @@
 
             const grid = document.createElement('div');
             grid.className = 'settings-grid';
-            grid.append(previewSection, styleSection, dataSection);
+            grid.append(previewSection, styleSection, widthSection, dataSection);
 
             const actions = document.createElement('div');
             actions.className = 'settings-actions';
@@ -873,6 +1079,19 @@
                 GM_setValue('auto_preview_concurrent', getNumberFromInput(concurrentField.input, DEFAULT_AUTO_PREVIEW_CONCURRENT, 1, 5));
                 GM_setValue('preview_min_dimension', getNumberFromInput(minField.input, DEFAULT_MIN_DIMENSION, 1, 2000));
                 GM_setValue('visited_style_mode', VISITED_STYLE_MODES.includes(styleSelect.select.value) ? styleSelect.select.value : 'default');
+                const nextWidthMode = THREAD_LIST_WIDTH_MODES.includes(widthModeSelect.select.value) ? widthModeSelect.select.value : DEFAULT_THREAD_LIST_WIDTH_MODE;
+                const nextWidthLimits = getThreadListWidthValueLimits(nextWidthMode);
+                const nextWidthPolicy = THREAD_LIST_WIDTH_SITE_POLICIES.includes(widthPolicySelect.select.value)
+                    ? widthPolicySelect.select.value : DEFAULT_THREAD_LIST_WIDTH_SITE_POLICY;
+                saveThreadListWidthSitePolicy(nextWidthPolicy);
+                if (nextWidthPolicy !== 'disabled') {
+                    saveThreadListWidthConfig(nextWidthPolicy === 'site' ? 'site' : 'default', {
+                        enabled: nextWidthPolicy === 'site' ? true : widthCb.input.checked,
+                        selector: widthSelectorField.input.value,
+                        mode: nextWidthMode,
+                        value: getNumberFromInput(widthValueField.input, nextWidthLimits.default, nextWidthLimits.min, nextWidthLimits.max),
+                    });
+                }
                 showTemporaryMessage('设置已保存，即将刷新页面。');
                 setTimeout(() => window.location.reload(), 1000);
             });
@@ -1114,6 +1333,27 @@
             } else if (isViewedImages) {
                 thread.classList.add('thread--viewed-images');
             }
+        });
+    }
+
+    function applyThreadListWidth() {
+        if (!isThreadListWidthEnabled()) return;
+
+        let targets;
+        try {
+            targets = document.querySelectorAll(getThreadListWidthSelector());
+        } catch (e) {
+            console.warn('[Discuz Marker] 帖子列表宽度选择器无效，已跳过应用。', e);
+            return;
+        }
+        if (!targets.length) return;
+
+        const width = getThreadListWidthCssValue();
+        targets.forEach(target => {
+            target.style.width = width;
+            target.style.maxWidth = 'none';
+            target.style.marginLeft = 'auto';
+            target.style.marginRight = 'auto';
         });
     }
 
@@ -1856,6 +2096,7 @@
     createFloatingSettingsButton();
 
     if (currentUrl.includes('mod=forumdisplay') || currentUrl.includes('forum-')) {
+        applyThreadListWidth();
         markThreadsOnListPage();
 
         document.addEventListener('visibilitychange', () => {
