@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.11.5
+// @version      2.12.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -18,7 +18,6 @@
 // @match        http*://vv9b.vbrwd4qd356.com/*
 // @match        http*://www.vikacg.com/*
 // @match        http*://feixueacg.org/*
-// @match        http*://www.galgamex.org/*
 // @match        http*://www.acgndog.com/*
 // @match        http*://www.galgamex.top/*
 // @match        http*://zodgame.xyz/*
@@ -1909,6 +1908,20 @@
         return false;
     }
 
+    function isGalgameXNewSignedText(text) {
+        return /今日已签到|今日已完成|今天已签到|已完成今日签到/.test(String(text || ''));
+    }
+
+    function getGalgameXNewSignedText() {
+        const bodyText = document.body?.innerText || '';
+        const taskButtonText = Array.from(document.querySelectorAll('button'))
+            .map(btn => (btn.innerText || btn.textContent || '').trim())
+            .find(text => isGalgameXNewSignedText(text));
+        if (taskButtonText) return taskButtonText;
+        const match = bodyText.match(/今日已签到|今日已完成|今天已签到|已完成今日签到/);
+        return match ? match[0] : '';
+    }
+
     async function runGalgameXNewApiSign(debugContext) {
         const res = await gmRequest({
             method: 'POST',
@@ -1916,6 +1929,16 @@
             debugContext
         });
         const text = res.responseText || '';
+
+        if (res.status === 401 || res.status === 403 || /无权限|未登录|请先登录|登录已过期/.test(text)) {
+            recordTargetStatus('galGameXNew', 'needs-login', {
+                stage: 'login',
+                message: 'GalgameX 新站需要先登录账号',
+                url: 'https://www.galgamex.top/'
+            });
+            return false;
+        }
+
         if (text.includes('randomMoemoepoints')) {
             const json = JSON.parse(text);
             return completeSign('galGameXNew', `签到成功，获得 ${json.randomMoemoepoints} 萌点`, CLOSE_PAGE_AFTER_SIGN_ACTION);
@@ -1923,6 +1946,35 @@
         if (text.includes('您今天已经签到过了')) {
             return completeSign('galGameXNew', '接口返回今日已经签到过了');
         }
+
+        try {
+            const json = JSON.parse(text);
+            const data = json?.data;
+            const pointResult = data?.pointResult || {};
+            const hasNewCheckinResult = data && (
+                Object.prototype.hasOwnProperty.call(data, 'granted') ||
+                Object.prototype.hasOwnProperty.call(data, 'exp') ||
+                Object.prototype.hasOwnProperty.call(data, 'totalExp') ||
+                Object.prototype.hasOwnProperty.call(pointResult, 'granted') ||
+                Object.prototype.hasOwnProperty.call(pointResult, 'points') ||
+                Object.prototype.hasOwnProperty.call(pointResult, 'totalPoints')
+            );
+
+            if (hasNewCheckinResult && res.status >= 200 && res.status < 300) {
+                const exp = Number(data.exp || 0);
+                const points = Number(pointResult.points || 0);
+                const gained = [];
+                if (data.granted === true && exp > 0) gained.push(`${exp} 经验`);
+                if (pointResult.granted === true && points > 0) gained.push(`${points} 积分`);
+                const message = gained.length
+                    ? `签到成功，获得 ${gained.join('、')}`
+                    : '新版接口确认今日已签到';
+                return completeSign('galGameXNew', message, CLOSE_PAGE_AFTER_SIGN_ACTION);
+            }
+        } catch (err) {
+            console.log('[GalgameX 新站] 接口响应不是 JSON:', text, err);
+        }
+
         console.log('[GalgameX 新站] API 返回异常:', text);
         return false;
     }
@@ -2467,34 +2519,6 @@
             }
         },
         {
-            name: "GalgameX",
-            matches: ["galgamex.org"],
-            key: "galgamex",
-            dashboard: {
-                url: "https://galgamex.org/circle",
-                openMode: "background",
-                resultMode: "script"
-            },
-            async run() {
-                if (!location.href.includes("circle")) {
-                    window.location.href = "circle";
-                    return false;
-                }
-                const btn = await waitForElement('.user-w-qd > div', 5000);
-                if (btn) {
-                    if (!btn.innerText.includes('恭喜')) {
-                        btn.click();
-                        console.log('执行签到点击');
-                        return completeSign('galgamex', '签到按钮状态已确认', CLOSE_PAGE_AFTER_SIGN_ACTION);
-                    } else {
-                        console.log('已签到');
-                        return completeSign('galgamex', '签到按钮状态已确认');
-                    }
-                }
-                return false;
-            }
-        },
-        {
             name: "次元狗",
             matches: ["www.acgndog.com"],
             key: "acgndog",
@@ -2640,11 +2664,23 @@
                 url: "https://www.galgamex.top/",
                 openMode: "background",
                 resultMode: "script",
-                note: "支持控制台 API 直签"
+                note: "新版站点登录后自动签到，脚本调用接口并复查状态"
             },
             directRun: runGalgameXNewApiSign,
             async run() {
-                return await runGalgameXNewApiSign();
+                await delay(1000);
+
+                const signedText = getGalgameXNewSignedText();
+                if (signedText) {
+                    return completeSign('galGameXNew', `页面显示${signedText}`, CLOSE_PAGE_AFTER_SIGN_ACTION);
+                }
+
+                try {
+                    return await runGalgameXNewApiSign();
+                } catch (err) {
+                    console.log('[GalgameX 新站] API 签到异常', err);
+                }
+                return false;
             }
         },
         {
