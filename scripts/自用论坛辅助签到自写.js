@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.12.0
+// @version      2.13.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -19,7 +19,7 @@
 // @match        http*://www.vikacg.com/*
 // @match        http*://feixueacg.org/*
 // @match        http*://www.acgndog.com/*
-// @match        http*://www.galgamex.top/*
+// @match        http*://www.galgamex.net/*
 // @match        http*://zodgame.xyz/*
 // @match        http*://www.uu-gg.one/*
 // @match        http*://www.fufugal.com/*
@@ -29,7 +29,7 @@
 // @connect      www.sl-asmr.com
 // @connect      bbs.kfpromax.com
 // @connect      sjs47.com
-// @connect      www.galgamex.top
+// @connect      www.galgamex.net
 // @grant        unsafeWindow
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -1925,7 +1925,7 @@
     async function runGalgameXNewApiSign(debugContext) {
         const res = await gmRequest({
             method: 'POST',
-            url: 'https://www.galgamex.top/api/user/checkin',
+            url: 'https://www.galgamex.net/api/user/checkin',
             debugContext
         });
         const text = res.responseText || '';
@@ -1934,7 +1934,7 @@
             recordTargetStatus('galGameXNew', 'needs-login', {
                 stage: 'login',
                 message: 'GalgameX 新站需要先登录账号',
-                url: 'https://www.galgamex.top/'
+                url: 'https://www.galgamex.net/'
             });
             return false;
         }
@@ -2658,10 +2658,10 @@
         },
         {
             name: "GalgameX 新站",
-            matches: ["www.galgamex.top"],
+            matches: ["www.galgamex.net"],
             key: "galGameXNew",
             dashboard: {
-                url: "https://www.galgamex.top/",
+                url: "https://www.galgamex.net/",
                 openMode: "background",
                 resultMode: "script",
                 note: "新版站点登录后自动签到，脚本调用接口并复查状态"

@@ -299,6 +299,10 @@
 
 文件：[自用论坛辅助签到自写.js](./scripts/自用论坛辅助签到自写.js)
 
+### 2.13.0
+
+- 将 GalgameX 新站适配域名从 `www.galgamex.top` 更新为 `www.galgamex.net`，同步调整页面匹配、跨域权限、签到接口和控制台入口。
+
 ### 2.12.0
 
 - 移除 GalgameX 旧站 `galgamex.org` 的适配范围和签到逻辑。
