@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.13.0
+// @version      2.14.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -130,6 +130,7 @@
     let dismissedPageSignToastSignature = '';
     let pageSignToastAutoCloseTimer = null;
     let uuGgPageSubmitAttempted = false;
+    const captchaAutoSubmitStates = new Map();
 
     // 获取格式化后的今天日期 (yyyy-MM-dd)
     function getToday() {
@@ -913,6 +914,50 @@
 
     // 延时函数
     const delay = (ms) => new Promise(res => setTimeout(res, ms));
+
+    function ensureCaptchaAutoSubmitMonitor(options) {
+        const existingState = captchaAutoSubmitStates.get(options.siteKey);
+        if (existingState) {
+            existingState.check();
+            return existingState;
+        }
+
+        const state = { submitted: false, finished: false, timer: null, timeout: null, check: null };
+        const stop = () => {
+            clearInterval(state.timer);
+            clearTimeout(state.timeout);
+        };
+        const check = () => {
+            if (state.finished) return;
+            if (options.isSigned()) {
+                state.finished = true;
+                stop();
+                options.onSuccess();
+                return;
+            }
+            if (state.submitted || !options.isVerified()) return;
+
+            const button = options.getSubmitButton();
+            if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return;
+
+            state.submitted = true;
+            markPendingAutoCloseAfterSignAction(options.siteKey, 'captcha-submit');
+            recordTargetStatus(options.siteKey, 'running', {
+                stage: 'submit',
+                message: `${options.siteName} 验证已通过，已自动点击${options.actionLabel}`,
+                url: location.href
+            });
+            console.log(`[${options.siteName}] 验证已通过，自动点击${options.actionLabel}...`);
+            button.click();
+        };
+
+        state.check = check;
+        captchaAutoSubmitStates.set(options.siteKey, state);
+        state.timer = setInterval(check, 500);
+        state.timeout = setTimeout(stop, 10 * 60 * 1000);
+        check();
+        return state;
+    }
 
     const SIGN_RECHECK_SCHEDULE = [
         { durationMs: 30000, intervalMs: 1000 },
@@ -2369,19 +2414,38 @@
                     return completeSign('laowang', '页面显示今日已签到');
                 }
 
-                const isCaptchaPage = () => Boolean(document.querySelector('#v2_captcha_form, #tncode, input[name="clicaptcha-submit-info"]')) ||
+                const isCaptchaVerified = () => {
+                    try {
+                        const captchaApi = unsafeWindow.TN || unsafeWindow.tncode;
+                        return typeof captchaApi?.result === 'function' && captchaApi.result() === true;
+                    } catch (err) {
+                        return false;
+                    }
+                };
+                const getSignButton = () => document.querySelector('a[href*="operation=qiandao"], #JD_sign, .qdleft a.btn');
+                const captchaMonitor = ensureCaptchaAutoSubmitMonitor({
+                    siteKey: 'laowang',
+                    siteName: '老王论坛',
+                    actionLabel: '签到',
+                    isSigned,
+                    isVerified: isCaptchaVerified,
+                    getSubmitButton: getSignButton,
+                    onSuccess: () => completeSign('laowang', '人工验证后已自动签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION)
+                });
+                const isCaptchaPage = () => Array.from(document.querySelectorAll('#v2_captcha_form, #tncode, #tncode_div, #tncode_div_bg'))
+                    .some(element => element.getClientRects().length > 0) ||
                     /请点击下面的按钮验证|点击进行验证/.test(document.body?.innerText || '');
-                if (isCaptchaPage()) {
+                if (isCaptchaPage() && !isCaptchaVerified()) {
                     recordTargetStatus('laowang', 'needs-foreground', {
                         stage: 'captcha',
-                        message: '老王论坛需要在前台完成点击验证后再确认',
+                        message: '老王论坛需要在前台完成点击验证，验证通过后将自动签到',
                         url: location.href
                     });
                     return false;
                 }
 
                 const btn = await waitForElement('a[href*="operation=qiandao"], #JD_sign, .qdleft a.btn', 5000);
-                if (btn) {
+                if (btn && !captchaMonitor.submitted) {
                     markPendingAutoCloseAfterSignAction('laowang', 'sign-click');
                     btn.click();
                     console.log('[老王论坛] 已点击签到按钮，等待验证和结果确认...');
@@ -2394,7 +2458,7 @@
                         if (isCaptchaPage()) {
                             recordTargetStatus('laowang', 'needs-foreground', {
                                 stage: 'captcha',
-                                message: '老王论坛需要在前台完成点击验证后再确认',
+                                message: '老王论坛需要在前台完成点击验证，验证通过后将自动签到',
                                 url: location.href
                             });
                             return false;
@@ -2450,7 +2514,7 @@
                 url: "https://2dfan.com/users/177256/recheckin",
                 openMode: "foreground",
                 resultMode: "script",
-                note: "签到提交需要阿里云验证码校验，需前台完成"
+                note: "签到提交需要验证码校验，需前台完成"
             },
             async run() {
                 if (location.href.includes('not_authenticated') || location.href.includes('sign_in')) {
@@ -2480,8 +2544,42 @@
                     return completeSign('2dfan', '页面显示今日已签到');
                 }
 
+                const isCaptchaVerified = () => {
+                    const turnstileToken = document.querySelector('input[name="cf-turnstile-response"], textarea[name="g-recaptcha-response"]');
+                    const aliyunToken = document.querySelector('#aliyun-captcha-param, input[name="aliyun_captcha_verify_param"]');
+                    return Boolean(turnstileToken?.value || aliyunToken?.value);
+                };
+                const getSignButton = () => {
+                    const captchaForm = document.querySelector('#captcha-wrapper')?.closest('form');
+                    return captchaForm?.querySelector('#do_checkin, #checkin, button[type="submit"], input[type="submit"]') ||
+                        document.querySelector('#do_checkin, #checkin');
+                };
                 const btn = await waitForElement('#do_checkin, #checkin', 5000);
-                if (btn && /签到|今日签到/.test(btn.innerText || '')) {
+                const hasCaptcha = Boolean(document.querySelector('#captcha-wrapper, #turnstile-container, #aliyun-captcha-container'));
+                if (btn && /签到|今日签到/.test(btn.innerText || btn.value || '')) {
+                    if (hasCaptcha) {
+                        ensureCaptchaAutoSubmitMonitor({
+                            siteKey: '2dfan',
+                            siteName: '2dfan',
+                            actionLabel: '提交签到',
+                            isSigned,
+                            isVerified: isCaptchaVerified,
+                            getSubmitButton: getSignButton,
+                            onSuccess: () => completeSign('2dfan', '人工验证后已自动签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION)
+                        });
+
+                        if (!isCaptchaVerified()) {
+                            recordTargetStatus('2dfan', 'needs-foreground', {
+                                stage: 'captcha',
+                                message: '2dfan 需要在前台完成验证码，验证通过后将自动提交签到',
+                                url: location.href
+                            });
+                            return false;
+                        }
+                        return false;
+                    }
+
+                    markPendingAutoCloseAfterSignAction('2dfan', 'sign-click');
                     btn.click();
                     console.log('[2dfan] 已点击签到按钮，等待页面验证和结果确认...');
 
@@ -2494,7 +2592,7 @@
 
                     recordTargetStatus('2dfan', 'needs-foreground', {
                         stage: 'captcha',
-                        message: '2dfan 可能需要在前台完成阿里云验证码后再确认',
+                        message: '2dfan 可能需要在前台完成验证码，验证通过后将自动提交签到',
                         url: location.href
                     });
                     return false;
