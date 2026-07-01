@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.14.0
+// @version      2.14.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -2415,6 +2415,9 @@
                 }
 
                 const isCaptchaVerified = () => {
+                    const captchaResult = document.querySelector('#clicaptcha-submit-info')?.value?.trim() || '';
+                    if (captchaResult.endsWith('_ok')) return true;
+
                     try {
                         const captchaApi = unsafeWindow.TN || unsafeWindow.tncode;
                         return typeof captchaApi?.result === 'function' && captchaApi.result() === true;
@@ -2422,7 +2425,11 @@
                         return false;
                     }
                 };
-                const getSignButton = () => document.querySelector('a[href*="operation=qiandao"], #JD_sign, .qdleft a.btn');
+                const getSignButton = () => {
+                    const captchaForm = document.querySelector('#v2_captcha_form');
+                    return captchaForm?.querySelector('#submit-btn, button[type="submit"], input[type="submit"]') ||
+                        document.querySelector('a[href*="operation=qiandao"], #JD_sign, .qdleft a.btn');
+                };
                 const captchaMonitor = ensureCaptchaAutoSubmitMonitor({
                     siteKey: 'laowang',
                     siteName: '老王论坛',
