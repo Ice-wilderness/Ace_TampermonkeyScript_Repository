@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.14.1
+// @version      2.15.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -13,7 +13,7 @@
 // @match        http*://2dfan.org/*
 // @match        http*://www.sl-asmr.com/*
 // @match        http*://bbs.kfpromax.com/*
-// @match        http*://sjs47.com/*
+// @match        http*://sjs96.com/*
 // @match        http*://laowang.vip/*
 // @match        http*://vv9b.vbrwd4qd356.com/*
 // @match        http*://www.vikacg.com/*
@@ -28,7 +28,7 @@
 // @connect      www.south-plus.net
 // @connect      www.sl-asmr.com
 // @connect      bbs.kfpromax.com
-// @connect      sjs47.com
+// @connect      sjs96.com
 // @connect      www.galgamex.net
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -1340,7 +1340,7 @@
     async function runSijisheApiSign(debugContext) {
         const requestText = async (url) => {
             const response = await gmRequest({
-                url: new URL(url, 'https://sjs47.com/').href,
+                url: new URL(url, 'https://sjs96.com/').href,
                 headers: {
                     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
                 },
@@ -1349,14 +1349,14 @@
             return response.responseText || '';
         };
 
-        const pageText = await requestText('https://sjs47.com/k_misign-sign.html');
+        const pageText = await requestText('https://sjs96.com/k_misign-sign.html');
         const uid = pageText.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '';
         const hasLogoutLink = /member\.php\?mod=logging(?:&amp;|&)action=logout/i.test(pageText);
         if ((!uid || uid === '0') && !hasLogoutLink) {
             recordTargetStatus('sijishe', 'needs-login', {
                 stage: 'login',
                 message: '司机社需要先登录账号',
-                url: 'https://sjs47.com/k_misign-sign.html'
+                url: 'https://sjs96.com/k_misign-sign.html'
             });
             return false;
         }
@@ -1373,18 +1373,18 @@
             return false;
         }
 
-        const signUrl = new URL(signPath, 'https://sjs47.com/');
+        const signUrl = new URL(signPath, 'https://sjs96.com/');
         signUrl.searchParams.set('inajax', '1');
         signUrl.searchParams.set('ajaxtarget', 'JD_sign');
         await requestText(signUrl.href);
 
-        const rankText = await requestText('https://sjs47.com/plugin.php?id=k_misign:sign&operation=list&inajax=1&ajaxtarget=ranklist');
+        const rankText = await requestText('https://sjs96.com/plugin.php?id=k_misign:sign&operation=list&inajax=1&ajaxtarget=ranklist');
         const uidPattern = new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,500}${getToday()}`);
         if (uidPattern.test(rankText)) {
             return completeSign('sijishe', '今日排行已确认签到记录', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
-        const verifyText = await requestText('https://sjs47.com/k_misign-sign.html');
+        const verifyText = await requestText('https://sjs96.com/k_misign-sign.html');
         if (/btnvisted|今日已签到|已经签到|您今日已经签到|已签到/.test(verifyText)) {
             return completeSign('sijishe', '页面复查确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
@@ -2688,10 +2688,10 @@
         },
         {
             name: "司机社",
-            matches: ["sjs47.com"],
+            matches: ["sjs96.com"],
             key: "sijishe",
             dashboard: {
-                url: "https://sjs47.com/k_misign-sign.html",
+                url: "https://sjs96.com/k_misign-sign.html",
                 openMode: "background",
                 resultMode: "script",
                 note: "支持控制台 API 直签"

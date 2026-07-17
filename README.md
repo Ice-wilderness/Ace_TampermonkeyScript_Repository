@@ -229,6 +229,7 @@
 
 - 控制台入口：`https://limestart.cn/*`、`https://www.limestart.cn/*`。
 - 自动签到站点：脚本头部 `@match` 中列出的论坛与资源站页面。
+- 司机社：`https://sjs96.com/*`。
 - GalgameX 新站：`https://www.galgamex.net/*`。
 - 2dfan `https://2dfan.com/*` / `https://2dfan.org/*` 采用前台签到流程，人工完成 Cloudflare Turnstile 或阿里云验证码后会自动提交签到。
 - 老王论坛 `https://laowang.vip/*` 采用前台签到流程，人工完成站点点击验证后会自动点击签到并确认状态。
