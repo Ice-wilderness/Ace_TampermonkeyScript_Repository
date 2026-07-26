@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.5.0
+// @version      3.5.1
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -3178,6 +3178,8 @@
             this.title = '';
             this.hasPlayed = false;
             this.stateInterval = null;
+            this.videoWatchInterval = null;
+            this.destroyed = false;
             this._lastKnownState = null; // 缓存最近一次有效进度，供 destroy 安全使用
 
             // 绑定 this 用于事件注册与移除
@@ -3271,8 +3273,9 @@
             }
 
             this.waitForVideo().then(video => {
-                this.videoEl = video;
-                this.bindEvents();
+                if (this.destroyed) return;
+                this.bindVideo(video);
+                this.startVideoWatch();
                 UIComponent.applyPendingSeek(this.bvId, video);
                 Utils.log('Video element bound');
                 done(`key=${this.bvId} videoReadyState=${video.readyState}`);
@@ -3285,7 +3288,7 @@
         waitForVideo(timeout = 10000) {
             const done = Utils.debugTime('VideoPlayerObserver.waitForVideo');
             return new Promise((resolve, reject) => {
-                const getVid = () => document.querySelector("#bilibili-player video, bwp-video");
+                const getVid = () => this.getCurrentVideo();
                 let video = getVid();
                 if (video) {
                     done('found immediately');
@@ -3310,6 +3313,44 @@
                     reject(new Error("Timeout waiting for video element"));
                 }, timeout);
             });
+        }
+
+        getCurrentVideo() {
+            return document.querySelector('#bilibili-player video') || document.querySelector('bwp-video');
+        }
+
+        bindVideo(video) {
+            if (!video || video === this.videoEl) return;
+            if (this.videoEl) {
+                this.saveProgress(true);
+                this.unbindVideoEvents(this.videoEl);
+            }
+            this.videoEl = video;
+            if (video.currentTime > 0) this.hasPlayed = true;
+            this.bindEvents();
+        }
+
+        startVideoWatch() {
+            if (this.videoWatchInterval) return;
+            this.videoWatchInterval = setInterval(() => {
+                if (this.destroyed) return;
+                const currentVideo = this.getCurrentVideo();
+                if (currentVideo && currentVideo !== this.videoEl) {
+                    Utils.warn('VideoPlayerObserver detected replaced video element, rebinding');
+                    this.bindVideo(currentVideo);
+                } else if (currentVideo && !currentVideo.paused && currentVideo.currentTime > 0) {
+                    // timeupdate 在后台节流或播放器异常时可能不再触发，轮询作为低频兜底。
+                    this.hasPlayed = true;
+                    this.saveProgressDebounced();
+                }
+            }, 5000);
+        }
+
+        unbindVideoEvents(video) {
+            if (!video) return;
+            video.removeEventListener('play', this._onPlay);
+            video.removeEventListener('timeupdate', this._onTimeUpdate);
+            video.removeEventListener('pause', this._onPause);
         }
 
         bindEvents() {
@@ -3389,19 +3430,19 @@
 
         destroy() {
             Utils.log('VideoPlayerObserver.destroy', `key=${this.bvId}`, `hasLastState=${!!this._lastKnownState}`);
+            this.destroyed = true;
             // 使用缓存的进度数据保存，不再读取 video 元素（SPA 切换时 video 可能已加载新视频）
             if (this._lastKnownState?.key && this._lastKnownState?.value) {
                 StorageManager.saveRecord(this._lastKnownState.key, this._lastKnownState.value);
             }
 
             window.removeEventListener('beforeunload', this._onBeforeUnload);
-            if (this.videoEl) {
-                this.videoEl.removeEventListener('play', this._onPlay);
-                this.videoEl.removeEventListener('timeupdate', this._onTimeUpdate);
-                this.videoEl.removeEventListener('pause', this._onPause);
-            }
+            this.unbindVideoEvents(this.videoEl);
             if (this.stateInterval) {
                 clearInterval(this.stateInterval);
+            }
+            if (this.videoWatchInterval) {
+                clearInterval(this.videoWatchInterval);
             }
         }
     }
