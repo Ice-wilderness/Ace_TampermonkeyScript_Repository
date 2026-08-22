@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.16.0
+// @version      2.17.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -23,6 +23,7 @@
 // @match        http*://zodgame.xyz/*
 // @match        http*://www.uu-gg.one/*
 // @match        http*://www.fufugal.com/*
+// @match        https://www.sehuatang.org/*
 // @match        *://sstm.moe/*
 // @connect      feixueacg.org
 // @connect      www.south-plus.net
@@ -2114,6 +2115,86 @@
         return completeSign('fufugal', '寻宝按钮状态已确认', CLOSE_PAGE_AFTER_SIGN_ACTION);
     }
 
+    function isSehuatangSignPage() {
+        const pluginId = new URLSearchParams(location.search).get('id') || '';
+        return location.pathname.endsWith('/plugin.php') && /^dd_sign(?::index)?$/i.test(pluginId);
+    }
+
+    function getSehuatangSignControlState() {
+        const control = document.querySelector('.ddpc_sign_btna .ddpc_sign_btn_grey') ||
+            document.querySelector('.ddpc_sign_btna #signin-btn, .ddpc_sign_btna > a');
+        const text = (control?.innerText || control?.textContent || '').trim();
+        return {
+            isSigned: control?.classList.contains('ddpc_sign_btn_grey') || text === '今日已签到',
+            canSign: control?.id === 'signin-btn' || text.includes('今日未签到')
+        };
+    }
+
+    function monitorSehuatangManualSign() {
+        const container = document.querySelector('.ddpc_sign_btna');
+        if (!container || container.dataset.bbsSignMonitor === '1') return;
+
+        container.dataset.bbsSignMonitor = '1';
+        const observer = new MutationObserver(() => {
+            if (!getSehuatangSignControlState().isSigned) return;
+            observer.disconnect();
+            completeSign('sehuatang', '页面显示今日已签到');
+        });
+        observer.observe(container, {
+            attributes: true,
+            attributeFilter: ['class', 'id'],
+            childList: true,
+            characterData: true,
+            subtree: true
+        });
+    }
+
+    async function runSehuatangPageSign() {
+        if (!isSehuatangSignPage()) {
+            recordTargetStatus('sehuatang', 'opened', {
+                stage: 'navigate',
+                message: '正在打开 98堂 签到页，请手动完成验证码签到',
+                url: location.href
+            });
+            window.location.href = 'https://www.sehuatang.org/plugin.php?id=dd_sign';
+            return false;
+        }
+
+        await delay(500);
+        const signState = getSehuatangSignControlState();
+        if (signState.isSigned) {
+            return completeSign('sehuatang', '页面显示今日已签到');
+        }
+        if (signState.canSign) {
+            monitorSehuatangManualSign();
+            recordTargetStatus('sehuatang', 'needs-foreground', {
+                stage: 'captcha',
+                message: '请手动点击签到并完成验证码，成功后脚本会自动识别',
+                url: location.href
+            });
+            return false;
+        }
+
+        const bodyText = document.body?.innerText || '';
+        const hasLoginForm = Boolean(document.querySelector('#lsform, #ls_username, input[name="username"], input[name="password"]'));
+        const hasLogoutLink = Boolean(document.querySelector('a[href*="member.php?mod=logging"][href*="action=logout"]'));
+        if (hasLoginForm || (!hasLogoutLink && /请先登录|登录后|您需要先登录/.test(bodyText))) {
+            recordTargetStatus('sehuatang', 'needs-login', {
+                stage: 'login',
+                message: '98堂需要先登录账号',
+                url: location.href
+            });
+            return false;
+        }
+
+        recordTargetStatus('sehuatang', 'opened', {
+            stage: 'detect',
+            message: '未识别到签到控件，请刷新签到页后重试',
+            url: location.href
+        });
+        return false;
+    }
+
     // ================== 各站点签到策略配置 ==================
 
     const siteConfigs = [
@@ -2848,6 +2929,20 @@
                     console.log('[初音的青葱] 页面寻宝异常', err);
                 }
                 return false;
+            }
+        },
+        {
+            name: "98堂",
+            matches: ["www.sehuatang.org"],
+            key: "sehuatang",
+            dashboard: {
+                url: "https://www.sehuatang.org/plugin.php?id=dd_sign",
+                openMode: "foreground",
+                resultMode: "script",
+                note: "需手动完成点选验证码，脚本只检测签到结果"
+            },
+            async run() {
+                return await runSehuatangPageSign();
             }
         }
     ];
