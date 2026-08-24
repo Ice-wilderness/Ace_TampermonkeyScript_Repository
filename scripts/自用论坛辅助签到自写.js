@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.17.0
+// @version      2.17.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -2151,12 +2151,11 @@
 
     async function runSehuatangPageSign() {
         if (!isSehuatangSignPage()) {
-            recordTargetStatus('sehuatang', 'opened', {
-                stage: 'navigate',
-                message: '正在打开 98堂 签到页，请手动完成验证码签到',
+            recordTargetStatus('sehuatang', 'needs-foreground', {
+                stage: 'prerequisite',
+                message: '请先在 98堂 回复 1 次，再手动进入签到页完成验证码',
                 url: location.href
             });
-            window.location.href = 'https://www.sehuatang.org/plugin.php?id=dd_sign';
             return false;
         }
 
@@ -2936,10 +2935,10 @@
             matches: ["www.sehuatang.org"],
             key: "sehuatang",
             dashboard: {
-                url: "https://www.sehuatang.org/plugin.php?id=dd_sign",
+                url: "https://www.sehuatang.org/forum.php",
                 openMode: "foreground",
                 resultMode: "script",
-                note: "需手动完成点选验证码，脚本只检测签到结果"
+                note: "需先回复 1 次，再手动进入签到页完成点选验证码；脚本只检测结果"
             },
             async run() {
                 return await runSehuatangPageSign();
