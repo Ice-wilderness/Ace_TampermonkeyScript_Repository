@@ -36,7 +36,14 @@ test('3 新增记录不把完整索引覆盖成局部索引', async () => {
     const b = instance(a.shared); await b.StorageManager.initialize?.();
     await b.StorageManager.saveRecord(key(9000000001), record());
     const index = a.shared.data.get('bvh_base_index').index;
-    assert.equal(Object.keys(index).length, baseline ? 7 : 81);
+    assert.equal(Object.keys(index).length, baseline ? 7 : 80);
+    if (!baseline) {
+        const fresh = instance(a.shared);
+        await fresh.StorageManager.initializeForKeys([key(9000000001)]);
+        assert.equal(fresh.StorageManager.getRelatedKeys(key(9000000001)).length, 1);
+        await fresh.StorageManager.initialize();
+        assert.equal(fresh.StorageManager.getAllKeys().length, 81);
+    }
 });
 test('4 完整索引下五次未知查询不写入', async () => {
     const w = instance(); seed(w, records(80)); await w.StorageManager.initialize?.(); await w.StorageManager._rebuildBaseIndex();

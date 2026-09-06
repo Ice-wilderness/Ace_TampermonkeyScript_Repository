@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.0.0
+// @version      4.0.1
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -1492,14 +1492,14 @@
         migrateIfNeeded() { return StorageManager.initialize(); },
         _accept(changed) {
             const s = StorageManager;
-            if (!changed.size && s._allKeysCache) return;
+            if (!changed.size) return;
             for (const key of changed) {
                 const base = VideoKey.base(key), entry = s._store.entries.get(key);
                 const keys = s._bvBaseIndex.get(base) || new Set();
+                if (keys.has(key) !== !!(entry && !entry.deleted)) s._allKeysCache = null;
                 if (!entry || entry.deleted) keys.delete(key); else keys.add(key);
                 if (keys.size) s._bvBaseIndex.set(base, keys); else s._bvBaseIndex.delete(base);
             }
-            s._allKeysCache = [...s._store.entries].filter(([, e]) => !e.deleted).map(([key]) => key);
             HistoryQueries.invalidate(changed);
             s._dataVersion++; s._notifyChange({ changedKeys: changed });
         },
@@ -1536,7 +1536,7 @@
             const entry = StorageManager._store.entries.get(VideoKey.normalize(id));
             return entry && !entry.deleted ? StorageManager._expand(entry.record) : null;
         },
-        getAllKeys() { return StorageManager._allKeysCache || []; },
+        getAllKeys() { return StorageManager._allKeysCache ||= [...StorageManager._bvBaseIndex.values()].flatMap(keys => [...keys]); },
         getRelatedKeys(base) {
             StorageManager._requestBase(base);
             return [...(StorageManager._bvBaseIndex.get(VideoKey.base(base)) || [])].sort((a, b) => VideoKey.page(a) - VideoKey.page(b));
@@ -1620,8 +1620,8 @@
                     });
                 } catch (error) { if (error.code === 'BVH_RETRY') continue; throw error; }
                 s._accept(new Set([...changed, ...entries.map(e => e.key)]));
-                // 派生索引或清理失败不会使已经提交的数据被报告为失败。
-                try { await s._persistBaseIndex(); } catch (error) { Utils.warn('历史已保存，索引可重新生成', error); }
+                // 新提交自带 bases；旧索引 coverage 之外的提交会独立读取，无需每次保存重写全量索引。
+                // 完整派生索引由显式全量初始化、重建或后台整理维护。
                 s._scheduleCompaction();
                 return options.details ? { count: entries.length, created, updated: entries.length - created } : entries.length;
                 }
