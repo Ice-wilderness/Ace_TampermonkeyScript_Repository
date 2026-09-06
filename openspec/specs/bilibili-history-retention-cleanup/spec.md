@@ -1,3 +1,9 @@
+# bilibili-history-retention-cleanup Specification
+
+## Purpose
+
+规定 Bilibili 观看历史按保留周期清理的输入、截止时间、全量候选范围和确认流程，确保搜索筛选不改变清理范围，保留无有效时间的记录，并提供明确的删除结果反馈。
+
 ## Requirements
 
 ### Requirement: Retention cleanup controls

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      3.5.1
+// @version      4.0.0
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -20,6 +20,12 @@
 // @grant        GM_getValue
 // @grant        GM_deleteValue
 // @grant        GM_listValues
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.deleteValue
+// @grant        GM.listValues
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @grant        GM_info
@@ -233,6 +239,9 @@
         .bvh-toast-progress-text { margin-bottom: 8px; font-weight: 700; }
         .bvh-toast-progress-track { height: 8px; border-radius: 999px; background: rgba(255,255,255,.28); overflow: hidden; }
         .bvh-toast-progress-fill { width: 0; height: 100%; border-radius: 999px; background: #00aeec; transition: width .18s ease; }
+        .bvh-progress-toast.is-pending .bvh-toast-progress-fill { width: 35%; animation: bvh-undo-pending 1.2s ease-in-out infinite alternate; }
+        @keyframes bvh-undo-pending { from { transform: translateX(0); } to { transform: translateX(185%); } }
+        @media (prefers-reduced-motion: reduce) { .bvh-progress-toast.is-pending .bvh-toast-progress-fill { animation: none; } }
         .bvh-view-panel { position: fixed; text-align: center; border-left: 6px solid #2196F3; background-color: #aeffff; font-family: 'Segoe UI', sans-serif; font-weight: 600; padding: 5px; z-index: 9999; cursor: move; color: #000; box-shadow: 0 2px 8px rgba(0,0,0,0.2); border-radius: 0 4px 4px 0; user-select: none; }
         .bvh-quick-entry { position: fixed; left: 15px; bottom: 15px; z-index: 9998; border: 1px solid #00aeec; background: #fff; color: #00aeec; border-radius: 6px; padding: 7px 10px; cursor: pointer; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,.16); }
         .bvh-history-sync-float { position: fixed; right: 22px; bottom: 86px; z-index: 9998; border: 1px solid #00aeec; background: #00aeec; color: #fff; border-radius: 6px; padding: 9px 13px; cursor: pointer; font-weight: 800; font-size: 13px; line-height: 1.2; box-shadow: 0 4px 16px rgba(0,174,236,.28); transition: opacity .18s ease, transform .18s ease, background .18s ease; }
@@ -804,13 +813,14 @@
     ]);
 
     const SettingsManager = {
-        save: (patch = {}) => {
-            Object.assign(CONFIG, patch);
-            GM_setValue('bvh_settings', Object.assign({}, CONFIG));
+        save: async (patch = {}) => {
+            const next = Object.assign({}, CONFIG, patch);
+            await HistoryStoreIO.set('bvh_settings', next);
+            Object.assign(CONFIG, next);
             if (patch.debug) Utils.installIssueHooks();
             const needsDomRefresh = Object.keys(patch).some(key => DISPLAY_SETTINGS.has(key));
             if (needsDomRefresh) {
-                StorageManager._notifyChange();
+                StorageManager._notifyChange({ settingsChanged: true });
             }
         },
         reset: () => {
@@ -1030,103 +1040,352 @@
         }
     };
 
-    // --- 数据层 (v3 分片存储架构) ---
+    // --- 不可变提交协议；旧分片仅作为兼容读取基线 ---
+    const HistoryStoreIO = {
+        async call(name, ...args) {
+            const modern = typeof GM !== 'undefined' && GM[name];
+            if (typeof modern === 'function') return await modern.apply(GM, args);
+            const legacy = { getValue: typeof GM_getValue === 'function' && GM_getValue,
+                setValue: typeof GM_setValue === 'function' && GM_setValue,
+                deleteValue: typeof GM_deleteValue === 'function' && GM_deleteValue,
+                listValues: typeof GM_listValues === 'function' && GM_listValues }[name];
+            if (!legacy) throw new Error(`当前脚本环境缺少存储能力：${name}`);
+            return await legacy(...args);
+        },
+        get(key, fallback) { return this.call('getValue', key, fallback); },
+        set(key, value) { return this.call('setValue', key, value); },
+        list() { return this.call('listValues'); },
+        delete(key) { return this.call('deleteValue', key); }
+    };
+
+    // 只读请求有限并发；所有写入仍沿用原事务顺序。
+    async function readHistoryBatch(items, read) {
+        const results = [];
+        for (let offset = 0; offset < items.length; offset += 4) {
+            const batch = await Promise.allSettled(items.slice(offset, offset + 4).map(read));
+            const failure = batch.find(result => result.status === 'rejected');
+            if (failure) throw failure.reason;
+            results.push(...batch.map(result => result.value));
+        }
+        return results;
+    }
+
+    class HistoryCommitStore {
+        constructor(io = HistoryStoreIO) {
+            this.io = io;
+            this.writer = crypto.randomUUID();
+            this.sequence = 0;
+            this.clock = 0;
+            this.entries = new Map();
+            this.commits = new Map();
+            this.baseline = new Map();
+            this.initialized = false;
+            this.syncing = null;
+            this.scope = null;
+            this.headers = new Map();
+        }
+        version(time = Date.now()) {
+            this.clock = Math.max(this.clock + 1, time);
+            return [this.clock, this.writer, ++this.sequence];
+        }
+        static compare(a, b) {
+            return a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) || a[2] - b[2];
+        }
+        static checksum(value) {
+            const text = JSON.stringify(value);
+            let hash = 2166136261;
+            for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+            return `${text.length}:${hash >>> 0}`;
+        }
+        async readCommit(key, knownManifest) {
+            const manifest = knownManifest || await this.io.get(key);
+            if (!manifest || manifest.protocol !== 1 || !Array.isArray(manifest.blocks) || !manifest.blocks.length) return null;
+            const entries = [];
+            const blocks = await readHistoryBatch(manifest.blocks, ref => this.io.get(ref.key));
+            for (let index = 0; index < manifest.blocks.length; index++) {
+                const ref = manifest.blocks[index];
+                if (typeof ref.key !== 'string' || !ref.key.startsWith(manifest.kind === 'checkpoint' ? 'bvh_checkpoint_' : 'bvh_tx_')) return null;
+                const block = blocks[index];
+                const segmentStart = performance.now();
+                if (!block || block.id !== manifest.id || !Array.isArray(block.entries)
+                    || block.entries.length !== ref.count || HistoryCommitStore.checksum(block) !== ref.checksum) return null;
+                for (const entry of block.entries) {
+                    if (!entry || !VideoKey.isValid(entry.key) || !Array.isArray(entry.version)
+                        || !Number.isFinite(entry.version[0]) || typeof entry.version[1] !== 'string'
+                        || !Number.isFinite(entry.version[2]) || (!entry.deleted && !entry.record)) return null;
+                    entries.push(entry);
+                }
+                HistoryQueries.recordSegment(performance.now() - segmentStart);
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            return entries.length === manifest.count ? { manifest, entries } : null;
+        }
+        async sync() {
+            if (this.syncing) return this.syncing;
+            this.syncing = this._sync();
+            try { return await this.syncing; } finally { this.syncing = null; }
+        }
+        async _sync() {
+            const keys = await this.io.list();
+            const commitKeys = keys.filter(key => key.startsWith('bvh_commit_'));
+            if (this._hasView && !this._incomplete && this.seenKeys && commitKeys.length === this.seenKeys.size && commitKeys.every(key => this.seenKeys.has(key))) return new Set();
+            const index = this.scope ? await this.io.get(StorageManager._BASE_INDEX_KEY) : null;
+            const covered = new Set(index?.complete ? index.coverage || [] : []);
+            const targetShards = new Set();
+            if (this.scope) for (const base of this.scope) {
+                for (const shard of index?.index?.[base] || []) targetShards.add(shard);
+                for (const key of this.requestedKeys || []) if (VideoKey.base(key) === base) targetShards.add(StorageManager._getShardId(key));
+            }
+            let segmentStart = performance.now();
+            const yieldIfNeeded = async () => {
+                if (performance.now() - segmentStart < 8) return;
+                await new Promise(resolve => setTimeout(resolve, 0)); segmentStart = performance.now();
+            };
+            if (!this.initialized) {
+                const shardKeys = Array.from({ length: SHARD_COUNT }, (_, shard) => shard)
+                    .filter(shard => !this.scope || !index?.complete || targetShards.has(shard))
+                    .map(shard => `bvh_shard_${shard}`).filter(key => keys.includes(key));
+                const shards = await readHistoryBatch(shardKeys, key => this.io.get(key, {}));
+                for (const data of shards) {
+                    for (const [key, record] of Object.entries(data || {})) this.addBaseline(key, record);
+                    await yieldIfNeeded();
+                }
+                // 旧版独立 key 直接参与兼容视图，不删除升级前的唯一副本。
+                const legacyKeys = keys.filter(key => /^(?:BV[a-zA-Z0-9]{10}|av\d+)(?:\?p=\d+)?$/.test(key) && (!this.scope || this.scope.has(VideoKey.base(key))));
+                const legacyValues = await readHistoryBatch(legacyKeys, key => this.io.get(key));
+                for (let index = 0; index < legacyKeys.length; index++) {
+                    const key = legacyKeys[index], value = legacyValues[index];
+                    if (value) this.addBaseline(key, value);
+                }
+                this.initialized = true;
+            }
+            const commits = new Map();
+            this._incomplete = false;
+            const skippedLegacy = new Map();
+            const intersectsShards = header => header.blocks.some(ref => {
+                const shard = header.kind === 'checkpoint' ? Number(ref.key.split('_')[2]) : Number(ref.key.split('_').at(-1));
+                return targetShards.has(shard);
+            });
+            const loadedCommits = await readHistoryBatch(commitKeys, async key => {
+                if (this.commits.has(key)) return this.commits.get(key);
+                if (!this.scope) { const commit = await this.readCommit(key); if (!commit) this._incomplete = true; return commit; }
+                if (!this.scope.size) return null;
+                const route = covered.has(key) && index.routes?.[key];
+                if (Array.isArray(route) && !route.some(base => this.scope.has(base))) return null;
+                const header = this.headers.get(key) || await this.io.get(key);
+                if (!header) { this._incomplete = true; return null; }
+                this.headers.set(key, header);
+                if (Array.isArray(header.bases)) {
+                    if (!header.bases.some(base => this.scope.has(base))) return null;
+                } else if (covered.has(key) && Array.isArray(header.blocks) && !intersectsShards(header)) { skippedLegacy.set(key, header); return null; }
+                // 命中一个视频也校验整个事务，缺失其他块的批次仍然不可见。
+                const commit = await this.readCommit(key, header);
+                if (!commit) this._incomplete = true;
+                return commit;
+            });
+            for (let index = 0; index < commitKeys.length; index++) {
+                const key = commitKeys[index], commit = loadedCommits[index];
+                if (commit) commits.set(key, commit);
+                await yieldIfNeeded();
+            }
+            // 旧索引不包含已删除的 P。批次带出的其他 P 必须追查其分片里的删除标记。
+            if (this.scope) for (;;) {
+                for (const commit of commits.values()) for (const entry of commit.entries) {
+                    if (this.scope.has(VideoKey.base(entry.key))) targetShards.add(StorageManager._getShardId(entry.key));
+                }
+                const extra = [...skippedLegacy].filter(([, header]) => intersectsShards(header));
+                if (!extra.length) break;
+                const loaded = await readHistoryBatch(extra, ([key, header]) => this.readCommit(key, header));
+                extra.forEach(([key], index) => {
+                    skippedLegacy.delete(key);
+                    if (loaded[index]) commits.set(key, loaded[index]); else this._incomplete = true;
+                });
+            }
+            const afterKeys = (await this.io.list()).filter(k => k.startsWith('bvh_commit_')).sort();
+            if (JSON.stringify(afterKeys) !== JSON.stringify(keys.filter(k => k.startsWith('bvh_commit_')).sort())) return this._sync();
+            const removed = [...this.commits.keys()].some(key => !commits.has(key));
+            const rebuild = !this._hasView || removed;
+            const entries = new Map(rebuild ? this.baseline : this.entries), candidates = new Set(rebuild ? entries.keys() : []);
+            let processed = 0;
+            for (const [container, commit] of commits) if (rebuild || !this.commits.has(container)) for (const entry of commit.entries) {
+                if (this.scope && !this.scope.has(VideoKey.base(entry.key))) continue;
+                candidates.add(entry.key);
+                const previous = entries.get(entry.key);
+                this.clock = Math.max(this.clock, entry.version[0]);
+                const cmp = previous ? HistoryCommitStore.compare(entry.version, previous.version) : 1;
+                if (cmp > 0 || (cmp === 0 && container > (previous.container || ''))) entries.set(entry.key, { ...entry, container });
+                if (++processed % 128 === 0) await yieldIfNeeded();
+            }
+            const changed = new Set();
+            for (const key of candidates) {
+                const entry = entries.get(key);
+                const old = this.entries.get(key);
+                if (!old || HistoryCommitStore.compare(old.version, entry.version) !== 0 || old.deleted !== entry.deleted) changed.add(key);
+            }
+            if (rebuild) for (const key of this.entries.keys()) if (!entries.has(key)) changed.add(key);
+            this.entries = entries;
+            this.commits = commits;
+            this._hasView = true;
+            this.seenKeys = new Set(commitKeys);
+            for (const key of this.headers.keys()) if (!this.seenKeys.has(key)) this.headers.delete(key);
+            return changed;
+        }
+        addBaseline(rawKey, value) {
+            const key = VideoKey.normalize(rawKey);
+            if (!key || !value) return;
+            if (this.scope && !this.scope.has(VideoKey.base(key))) return;
+            let record = StorageManager._compact(value);
+            const time = Array.isArray(value) ? Date.parse(value[3]) : value.a !== undefined ? value.a * 1000 : Date.parse(value.savedAt);
+            if (!Number.isFinite(time)) record = { ...record, a: null };
+            const entry = { key, record, deleted: false, source: 'legacy', version: [Number.isFinite(time) ? time : 0, '', 0] };
+            const old = this.baseline.get(key);
+            if (!old || HistoryCommitStore.compare(entry.version, old.version) > 0) this.baseline.set(key, entry);
+        }
+        transactionId() { return `${String(Date.now()).padStart(16, '0')}_${this.writer}_${String(++this.sequence).padStart(12, '0')}`; }
+        async prepare(entries, kind = 'tx', identity, createdAt = Date.now()) {
+            const id = identity || this.transactionId();
+            const grouped = new Map();
+            await HistoryQueries.each(entries, entry => {
+                const shard = StorageManager._getShardId(entry.key);
+                if (!grouped.has(shard)) grouped.set(shard, []);
+                // 深拷贝后重试沿用原采样版本，外部修改不会改变不可变块。
+                const copy = JSON.parse(JSON.stringify(entry)); delete copy.container;
+                grouped.get(shard).push(copy);
+            });
+            const blocks = [...grouped].map(([shard, entries]) => ({
+                key: kind === 'checkpoint' ? `bvh_checkpoint_${shard}_${id}` : `bvh_tx_${id}_${shard}`,
+                value: { id, createdAt, entries }
+            }));
+            const manifest = { protocol: 1, kind, id, createdAt, count: entries.length,
+                bases: [...new Set(entries.map(entry => VideoKey.base(entry.key)))].sort(),
+                blocks: blocks.map(block => ({ key: block.key, count: block.value.entries.length, checksum: HistoryCommitStore.checksum(block.value) })) };
+            return { key: `bvh_commit_${id}`, blocks, manifest };
+        }
+        async publish(transaction, guard, deferSync = false) {
+            if (!transaction.blocks.length) return new Set();
+            // 重试前检查并补齐块，沿用原事务身份。
+            for (const block of transaction.blocks) {
+                const current = await this.io.get(block.key);
+                if (!current) await this.io.set(block.key, block.value);
+                else if (HistoryCommitStore.checksum(current) !== HistoryCommitStore.checksum(block.value)) throw new Error('提交身份冲突，已保留原数据');
+                const confirmed = await this.io.get(block.key);
+                const segmentStart = performance.now();
+                if (HistoryCommitStore.checksum(confirmed) !== HistoryCommitStore.checksum(block.value)) throw new Error('历史数据块写入未确认，请重试');
+                HistoryQueries.recordSegment(performance.now() - segmentStart);
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            if (guard && !await guard()) { const error = new Error('准备期间记录发生变化，重新评估'); error.code = 'BVH_RETRY'; throw error; }
+            const prior = await this.io.get(transaction.key);
+            const comparable = prior && !prior.bases ? { ...transaction.manifest, bases: undefined } : transaction.manifest;
+            if (prior && HistoryCommitStore.checksum(prior) !== HistoryCommitStore.checksum(comparable)) throw new Error('提交清单身份冲突');
+            if (!prior) await this.io.set(transaction.key, transaction.manifest);
+            if (!await this.readCommit(transaction.key)) throw new Error('历史提交未确认，请保留备份并重试');
+            if (deferSync) return new Set();
+            const changed = await this.sync();
+            // 提示失败不把已经完整发布的事务伪报为失败；枚举会补齐丢失信号。
+            try { await this.io.set('bvh_change_signal', { id: transaction.manifest.id, keys: [...changed] }); }
+            catch (error) { Utils.warn('历史已提交，跨页提示稍后通过枚举补齐', error); }
+            return changed;
+        }
+        async compact({ resume = false } = {}) {
+            if (this.scope) throw new Error('内部整理需要先加载完整历史');
+            await this.sync();
+            if (!this.entries.size) return { before: this.commits.size, after: this.commits.size };
+            const before = this.commits.size;
+            // 每个 base 固定进入一个整理组，避免一个全量检查点迫使视频页读取全部历史。
+            const groups = new Map();
+            for (const entry of this.entries.values()) {
+                const group = StorageManager._getShardId(VideoKey.base(entry.key));
+                if (!groups.has(group)) groups.set(group, []);
+                groups.get(group).push(entry);
+            }
+            const replacements = [];
+            const checkpointTime = [...this.commits.values()].reduce((time, commit) => Math.max(time, Number(commit.manifest.id.split('_')[0]) || 0), Date.now()) + 1;
+            for (const entries of groups.values()) {
+                // 已完成的组本身就是持久进度；中断重启后验证并复用，不依赖易失游标。
+                const groupKeys = new Set(entries.map(entry => entry.key));
+                const matching = resume && [...this.commits].find(([key, commit]) =>
+                    commit.manifest.kind === 'checkpoint' && commit.entries.length === entries.length
+                    && commit.entries.every(entry => {
+                        const current = this.entries.get(entry.key);
+                        return groupKeys.has(entry.key) && current?.container === key && HistoryCommitStore.compare(current.version, entry.version) === 0;
+                    }));
+                if (matching) { replacements.push(matching[0]); continue; }
+                // 同毫秒的跨页提交也必须能被严格更新的物理副本覆盖，业务版本保持不变。
+                const identity = `${String(checkpointTime).padStart(16, '0')}_${this.writer}_${String(++this.sequence).padStart(12, '0')}`;
+                const transaction = await this.prepare(entries, 'checkpoint', identity);
+                await this.publish(transaction, null, true); replacements.push(transaction.key);
+            }
+            await this.sync();
+            const byKey = new Map(), retained = new Set(replacements);
+            for (const key of replacements) {
+                const replacement = await this.readCommit(key);
+                for (const entry of replacement?.entries || []) byKey.set(entry.key, { ...entry, container: key });
+            }
+            // 每个旧清单整体判断，禁止先删多分片事务的一部分数据块。
+            // 替代副本若被其他整理回收，其严格更高的替代链仍完整保留这些版本。
+            for (const [key, commit] of [...this.commits]) {
+                if (retained.has(key)) continue;
+                const covered = commit.entries.every(entry => {
+                    const next = byKey.get(entry.key);
+                    if (!next) return false;
+                    const cmp = HistoryCommitStore.compare(next.version, entry.version);
+                    return cmp > 0 || (cmp === 0 && next.container > key);
+                });
+                if (!covered) continue;
+                await this.io.delete(key);
+                for (const ref of commit.manifest.blocks) await this.io.delete(ref.key);
+            }
+            await this.sync();
+            return { before, after: this.commits.size };
+        }
+        async stagingInfo() {
+            const keys = await this.io.list(), referenced = new Set();
+            for (const key of keys.filter(k => k.startsWith('bvh_commit_'))) {
+                const manifest = await this.io.get(key);
+                for (const ref of manifest?.blocks || []) referenced.add(ref.key);
+            }
+            let count = 0, bytes = 0;
+            for (const key of keys.filter(k => /^(bvh_tx_|bvh_checkpoint_)/.test(k) && !referenced.has(k))) {
+                const value = await this.io.get(key); count++; bytes += new TextEncoder().encode(JSON.stringify(value)).length;
+            }
+            return { count, bytes };
+        }
+        async cleanupStaging({ writersStopped = false } = {}) {
+            if (!writersStopped) throw new Error('请先停止所有写入页面，再执行离线清理');
+            const keys = await this.io.list();
+            const protectedBlocks = new Set();
+            for (const key of keys.filter(key => key.startsWith('bvh_commit_'))) {
+                const manifest = await this.io.get(key);
+                for (const ref of manifest?.blocks || []) protectedBlocks.add(ref.key);
+            }
+            let removed = 0;
+            for (const key of keys.filter(key => key.startsWith('bvh_tx_') || key.startsWith('bvh_checkpoint_'))) {
+                if (protectedBlocks.has(key)) continue;
+                const block = await this.io.get(key);
+                if (!block || Date.now() - block.createdAt <= 86400000) continue;
+                // 清单可能在枚举之后发布；删除前再次检查该事务身份。
+                if (await this.io.get(`bvh_commit_${block.id}`)) continue;
+                await this.io.delete(key); removed++;
+            }
+            return removed;
+        }
+    }
+
     const SHARD_COUNT = 64;
     const STATUS_MAP = { 0: '已访问', 1: '已观看', 2: '已删除' };
     const STATUS_REVERSE = { '已访问': 0, '已观看': 1, '已删除': 2 };
-
     const StorageManager = {
-        _shardCache: new Map(),       // shardId → { data: {...}, dirty: false }
-        _bvBaseIndex: new Map(),      // bvBase → Set<fullKey>
-        _shardForBase: new Map(),     // bvBase → Set<shardId>  二级索引（按需加载用）
-        _allKeysCache: null,
-        _changeCallbacks: [],
-        _migrationCount: 0,
-        _lastKnownRevision: 0,       // 多标签页同步：记录本地已知的存储版本号
-
-        onDataChange: (cb) => {
-            StorageManager._changeCallbacks.push(cb);
-            Utils.log('Storage data-change listener registered:', StorageManager._changeCallbacks.length);
-        },
-        _notifyChange: Utils.debounce(() => {
-            const start = performance.now();
-            Utils.log('Storage notify change start, callbacks:', StorageManager._changeCallbacks.length);
-            StorageManager._changeCallbacks.forEach(cb => cb());
-            Utils.logSlow('StorageManager._notifyChange callbacks', start, `callbacks=${StorageManager._changeCallbacks.length}`, 20);
-        }, 500),
-
-        // --- 哈希函数 (FNV-1a) ---
-        _getShardId: (bvId) => {
+        _store: new HistoryCommitStore(),
+        _ready: null, _queue: Promise.resolve(), _dataVersion: 0, _migrationCount: 0,
+        _shardCache: new Map(), _bvBaseIndex: new Map(), _shardForBase: new Map(),
+        _allKeysCache: null, _changeCallbacks: new Set(), _pendingChange: null, _changeTimer: null,
+        _BASE_INDEX_KEY: 'bvh_base_index',
+        _getShardId(id) {
             let hash = 0x811c9dc5;
-            for (let i = 0; i < bvId.length; i++) {
-                hash ^= bvId.charCodeAt(i);
-                hash = (hash * 0x01000193) | 0;
-            }
+            for (let i = 0; i < id.length; i++) { hash ^= id.charCodeAt(i); hash = (hash * 0x01000193) | 0; }
             return Math.abs(hash) % SHARD_COUNT;
         },
-
-        // --- 分片加载/保存 ---
-        _loadShard: (shardId) => {
-            if (StorageManager._shardCache.has(shardId)) {
-                return StorageManager._shardCache.get(shardId);
-            }
-            const start = performance.now();
-            const data = GM_getValue(`bvh_shard_${shardId}`, {});
-            const shard = { data, dirty: false };
-            StorageManager._shardCache.set(shardId, shard);
-            const keys = Object.keys(data);
-            // 加载时增量构建 BV 基础 ID 索引
-            for (const key of keys) {
-                StorageManager._indexKey(key, shardId);
-            }
-            Utils.logSlow('StorageManager._loadShard', start, `shard=${shardId} records=${keys.length}`, 30);
-            return shard;
-        },
-
-        _flushShard: (shardId) => {
-            const shard = StorageManager._shardCache.get(shardId);
-            if (shard && shard.dirty) {
-                const start = performance.now();
-                GM_setValue(`bvh_shard_${shardId}`, shard.data);
-                shard.dirty = false;
-                Utils.logSlow('StorageManager._flushShard', start, `shard=${shardId} records=${Object.keys(shard.data).length}`, 30);
-            }
-        },
-
-        _ensureAllShardsLoaded: () => {
-            const start = performance.now();
-            const before = StorageManager._shardCache.size;
-            for (let i = 0; i < SHARD_COUNT; i++) {
-                StorageManager._loadShard(i);
-            }
-            Utils.logSlow('StorageManager._ensureAllShardsLoaded', start, `loaded=${StorageManager._shardCache.size - before}/${SHARD_COUNT} cached=${StorageManager._shardCache.size}`, 50);
-        },
-
-        // --- 索引管理 ---
-        _indexKey: (key, shardId) => {
-            const base = VideoKey.base(key);
-            if (base) {
-                let set = StorageManager._bvBaseIndex.get(base);
-                if (!set) { set = new Set(); StorageManager._bvBaseIndex.set(base, set); }
-                set.add(key);
-                // 二级索引：base → shards
-                const sid = shardId !== undefined ? shardId : StorageManager._getShardId(key);
-                let shardSet = StorageManager._shardForBase.get(base);
-                if (!shardSet) { shardSet = new Set(); StorageManager._shardForBase.set(base, shardSet); }
-                shardSet.add(sid);
-            }
-        },
-
-        _removeFromIndex: (key) => {
-            const base = VideoKey.base(key);
-            if (base) {
-                const set = StorageManager._bvBaseIndex.get(base);
-                if (set) { set.delete(key); if (set.size === 0) StorageManager._bvBaseIndex.delete(base); }
-                // 仅清除内存中的 keys，不清除 base→shard 映射（因为同一个 base 可能还有其他 key 在同一 shard 中）
-            }
-        },
-
-        // --- 格式转换 ---
         _compact: (record) => {
             // 已经是 v3 紧凑格式
             if (typeof record.s === 'number') return record;
@@ -1158,7 +1417,7 @@
         _expand: (compact) => {
             const d = new Date(compact.a * 1000);
             const pad = n => String(n).padStart(2, '0');
-            const savedAt = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+            const savedAt = Number.isFinite(compact.a) ? `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}` : '';
             return {
                 v: 3,
                 status: STATUS_MAP[compact.s] || '已访问',
@@ -1169,339 +1428,318 @@
             };
         },
 
-        // --- 核心 API（对外接口与 v2 完全兼容）---
-        getRecord: (id) => {
-            if (!id) return null;
-            id = VideoKey.normalize(id) || id;
-            const shardId = StorageManager._getShardId(id);
-            const shard = StorageManager._loadShard(shardId);
-            const compact = shard.data[id];
-            if (!compact) return null;
-            return StorageManager._expand(compact);
+
+        onDataChange(cb) {
+            StorageManager._changeCallbacks.add(cb);
+            return () => StorageManager._changeCallbacks.delete(cb);
         },
-
-        saveRecord: (id, record, notify = true) => {
-            if (!id) return;
-            id = VideoKey.normalize(id) || id;
-            const shardId = StorageManager._getShardId(id);
-            const start = performance.now();
-            const shard = StorageManager._loadShard(shardId);
-            const base = VideoKey.base(id);
-            // 检测 base→shard 映射是否变化（仅在新 base 出现或新增 shard 时才持久化索引）
-            const shardSetBefore = base ? StorageManager._shardForBase.get(base) : null;
-            const isNewShardForBase = base && (!shardSetBefore || !shardSetBefore.has(shardId));
-            shard.data[id] = StorageManager._compact(record);
-            shard.dirty = true;
-            StorageManager._flushShard(shardId);
-            StorageManager._indexKey(id, shardId);
-            StorageManager._allKeysCache = null;
-            StorageManager._incrementRevision();
-            if (isNewShardForBase) {
-                StorageManager._persistBaseIndex();
-            }
-            if (notify) StorageManager._notifyChange();
-            Utils.logSlow('StorageManager.saveRecord', start, `key=${id} shard=${shardId} notify=${notify}`, 30);
+        _notifyChange(event = { fullReset: true }) {
+            const s = StorageManager;
+            const pending = s._pendingChange ||= { changedKeys: new Set(), changedBases: new Set(), settingsChanged: false, fullReset: false };
+            for (const key of event.changedKeys || []) { pending.changedKeys.add(key); pending.changedBases.add(VideoKey.base(key)); }
+            for (const base of event.changedBases || []) pending.changedBases.add(base);
+            pending.settingsChanged ||= !!event.settingsChanged; pending.fullReset ||= !!event.fullReset;
+            if (s._changeTimer) clearTimeout(s._changeTimer);
+            s._changeTimer = setTimeout(() => {
+                const change = s._pendingChange; s._pendingChange = null; s._changeTimer = null;
+                change.dataVersion = s._dataVersion;
+                for (const cb of [...s._changeCallbacks]) { try { cb(change); } catch (error) { Utils.error('历史更新回调失败', error); } }
+            }, 150);
         },
-
-        deleteRecord: (id, notify = true) => {
-            if (!id) return;
-            id = VideoKey.normalize(id) || id;
-            const shardId = StorageManager._getShardId(id);
-            const start = performance.now();
-            const shard = StorageManager._loadShard(shardId);
-            const base = VideoKey.base(id);
-
-            delete shard.data[id];
-            shard.dirty = true;
-            StorageManager._flushShard(shardId);
-            StorageManager._removeFromIndex(id);
-            StorageManager._allKeysCache = null;
-            StorageManager._incrementRevision();
-
-            if (base) {
-                const hasSameBaseInThisShard = Object.keys(shard.data).some(k => VideoKey.base(k) === base);
-                const shardSet = StorageManager._shardForBase.get(base);
-
-                if (shardSet && !hasSameBaseInThisShard) {
-                    shardSet.delete(shardId);
-                    if (shardSet.size === 0) {
-                        StorageManager._shardForBase.delete(base);
-                    }
-                    StorageManager._persistBaseIndex();
-                }
-            }
-
-            if (notify) StorageManager._notifyChange();
-            Utils.logSlow('StorageManager.deleteRecord', start, `key=${id} shard=${shardId} notify=${notify}`, 30);
-        },
-
-        saveRecords: (records, notify = true) => {
-            const start = performance.now();
-            const touchedShards = new Set();
-            let count = 0;
-
-            (Array.isArray(records) ? records : []).forEach(({ key, record }) => {
-                if (!key || !record) return;
-                const id = VideoKey.normalize(key) || key;
-                if (!id) return;
-                const shardId = StorageManager._getShardId(id);
-                const shard = StorageManager._loadShard(shardId);
-                shard.data[id] = StorageManager._compact(record);
-                shard.dirty = true;
-                StorageManager._indexKey(id, shardId);
-                touchedShards.add(shardId);
-                count++;
-            });
-
-            if (count === 0) return 0;
-
-            for (const shardId of touchedShards) {
-                StorageManager._flushShard(shardId);
-            }
-            StorageManager._allKeysCache = null;
-            StorageManager._incrementRevision();
-            StorageManager._persistBaseIndex();
-            if (notify) StorageManager._notifyChange();
-            Utils.logSlow('StorageManager.saveRecords', start, `records=${count} shards=${touchedShards.size} notify=${notify}`, 80);
-            return count;
-        },
-
-        deleteRecords: (ids, notify = true) => {
-            const start = performance.now();
-            const normalizedIds = Array.from(new Set((Array.isArray(ids) ? ids : [])
-                .map(id => VideoKey.normalize(id) || id)
-                .filter(Boolean)));
-            const touched = new Map();
-            let count = 0;
-
-            normalizedIds.forEach(id => {
-                const shardId = StorageManager._getShardId(id);
-                const shard = StorageManager._loadShard(shardId);
-                if (!Object.prototype.hasOwnProperty.call(shard.data, id)) return;
-                const base = VideoKey.base(id);
-                delete shard.data[id];
-                shard.dirty = true;
-                StorageManager._removeFromIndex(id);
-                if (!touched.has(shardId)) touched.set(shardId, new Set());
-                if (base) touched.get(shardId).add(base);
-                count++;
-            });
-
-            if (count === 0) return 0;
-
-            touched.forEach((bases, shardId) => {
-                const shard = StorageManager._loadShard(shardId);
-                StorageManager._flushShard(shardId);
-                if (bases.size === 0) return;
-                const remainingBases = new Set();
-                Object.keys(shard.data).forEach(key => {
-                    const base = VideoKey.base(key);
-                    if (base) remainingBases.add(base);
+        initialize() {
+            const s = StorageManager;
+            if (!s._ready) s._ready = (async () => {
+                await s._loadScope(null);
+                await s._persistBaseIndex();
+                await HistoryStoreIO.set('bvh_protocol', { version: 1, legacyRetained: true });
+                s._scheduleCompaction();
+                if (s._listener === undefined && typeof GM_addValueChangeListener === 'function') s._listener = GM_addValueChangeListener('bvh_change_signal', (_key, _old, _next, remote) => {
+                    if (remote) s._syncIfStale().catch(error => Utils.error('跨页历史同步失败', error));
                 });
-                bases.forEach(base => {
-                    if (remainingBases.has(base)) return;
-                    const shardSet = StorageManager._shardForBase.get(base);
-                    if (!shardSet) return;
-                    shardSet.delete(shardId);
-                    if (shardSet.size === 0) {
-                        StorageManager._shardForBase.delete(base);
-                    }
+            })().catch(error => { s._ready = null; throw error; });
+            return s._ready;
+        },
+        _loadScope(keys) {
+            const s = StorageManager;
+            const pending = (s._viewQueue || Promise.resolve()).then(async () => {
+                if (s._store.syncing) await s._store.syncing;
+                const full = keys === null || s._fullRequested;
+                if (full) s._fullRequested = true;
+                const scope = full ? null : new Set([...(s._store.scope || []), ...keys.map(VideoKey.base)]);
+                const requested = new Set([...(s._store.requestedKeys || []), ...(keys || []).map(VideoKey.normalize)]);
+                const changedScope = full ? s._store.scope !== null : s._store.scope === null || scope.size !== s._store.scope.size || requested.size !== (s._store.requestedKeys?.size || 0);
+                if (changedScope) { s._store.initialized = false; s._store.baseline.clear(); s._store._hasView = false; }
+                s._store.scope = scope; s._store.requestedKeys = requested;
+                const changed = await s._store.sync(); s._accept(changed);
+                s._scheduleCompaction();
+                if (s._listener === undefined && typeof GM_addValueChangeListener === 'function') s._listener = GM_addValueChangeListener('bvh_change_signal', (_key, _old, _next, remote) => {
+                    if (remote) s._syncIfStale().catch(error => Utils.warn('跨页同步失败', error));
                 });
             });
-
-            StorageManager._allKeysCache = null;
-            StorageManager._incrementRevision();
-            StorageManager._persistBaseIndex();
-            if (notify) StorageManager._notifyChange();
-            Utils.logSlow('StorageManager.deleteRecords', start, `records=${count} shards=${touched.size} notify=${notify}`, 80);
-            return count;
+            s._viewQueue = pending.catch(() => {}); return pending;
         },
-
-        deleteRecordsWithProgress: (ids, onProgress, notify = true) => {
-            const start = performance.now();
-            const normalizedIds = Array.from(new Set((Array.isArray(ids) ? ids : [])
-                .map(id => VideoKey.normalize(id) || id)
-                .filter(Boolean)));
-            const byShard = new Map();
-            normalizedIds.forEach(id => {
-                const shardId = StorageManager._getShardId(id);
-                if (!byShard.has(shardId)) byShard.set(shardId, []);
-                byShard.get(shardId).push(id);
-            });
-            const shards = Array.from(byShard.entries());
-            const total = normalizedIds.length;
-            let processed = 0;
-            let count = 0;
-
-            const report = (doneShards) => {
-                if (typeof onProgress === 'function') {
-                    onProgress({
-                        processed,
-                        total,
-                        deleted: count,
-                        shardsDone: doneShards,
-                        shardsTotal: shards.length
-                    });
+        initializeForKeys(keys) { return StorageManager._ready || StorageManager._loadScope(keys); },
+        _requestBase(key) {
+            const s = StorageManager;
+            if (!s._store.scope || s._store.scope.has(VideoKey.base(key))) return;
+            (s._pendingBases ||= new Set()).add(key);
+            if (s._baseTimer) return;
+            s._baseTimer = setTimeout(() => {
+                s._baseTimer = null; const keys = [...s._pendingBases]; s._pendingBases.clear();
+                s.initializeForKeys(keys).catch(error => Utils.warn('视频历史读取失败', error));
+            }, 80);
+        },
+        migrateIfNeeded() { return StorageManager.initialize(); },
+        _accept(changed) {
+            const s = StorageManager;
+            if (!changed.size && s._allKeysCache) return;
+            for (const key of changed) {
+                const base = VideoKey.base(key), entry = s._store.entries.get(key);
+                const keys = s._bvBaseIndex.get(base) || new Set();
+                if (!entry || entry.deleted) keys.delete(key); else keys.add(key);
+                if (keys.size) s._bvBaseIndex.set(base, keys); else s._bvBaseIndex.delete(base);
+            }
+            s._allKeysCache = [...s._store.entries].filter(([, e]) => !e.deleted).map(([key]) => key);
+            HistoryQueries.invalidate(changed);
+            s._dataVersion++; s._notifyChange({ changedKeys: changed });
+        },
+        async _syncIfStale() {
+            if (!StorageManager._ready && StorageManager._store.scope) {
+                const before = StorageManager._dataVersion;
+                await StorageManager._loadScope([]); return StorageManager._dataVersion !== before;
+            }
+            await StorageManager.initialize();
+            const changed = await StorageManager._store.sync();
+            StorageManager._accept(changed); return changed.size > 0;
+        },
+        async _persistBaseIndex(store = StorageManager._store) {
+            const s = StorageManager, index = {};
+            if (store.scope) return;
+            for (const [key, entry] of store.entries) if (!entry.deleted) {
+                const base = VideoKey.base(key), shard = s._getShardId(key);
+                if (!index[base]) index[base] = [];
+                if (!index[base].includes(shard)) index[base].push(shard);
+            }
+            await HistoryStoreIO.set(s._BASE_INDEX_KEY, { version: 2, complete: true,
+                coverage: [...store.commits.keys()].sort(), index,
+                routes: Object.fromEntries([...store.commits].map(([key, commit]) => [key, [...new Set(commit.entries.map(entry => VideoKey.base(entry.key)))]])) });
+        },
+        async _rebuildBaseIndex() {
+            await StorageManager.initialize();
+            StorageManager._bvBaseIndex.clear();
+            StorageManager._accept(new Set(StorageManager._store.entries.keys()));
+            await StorageManager._persistBaseIndex();
+        },
+        invalidateCache() { return StorageManager._syncIfStale(); },
+        getRecord(id) {
+            StorageManager._requestBase(id);
+            const entry = StorageManager._store.entries.get(VideoKey.normalize(id));
+            return entry && !entry.deleted ? StorageManager._expand(entry.record) : null;
+        },
+        getAllKeys() { return StorageManager._allKeysCache || []; },
+        getRelatedKeys(base) {
+            StorageManager._requestBase(base);
+            return [...(StorageManager._bvBaseIndex.get(VideoKey.base(base)) || [])].sort((a, b) => VideoKey.page(a) - VideoKey.page(b));
+        },
+        getAllRecords() { return StorageManager.getAllKeys().map(key => ({ key, record: StorageManager.getRecord(key) })); },
+        validateImport(data) {
+            if (!data || Array.isArray(data) || typeof data !== 'object') throw new Error('文件必须是视频 key 对应记录的对象');
+            const result = [], seen = new Set();
+            for (const [rawKey, input] of Object.entries(data)) {
+                const fail = field => { throw new Error(rawKey + '：' + field + ' 无效'); };
+                if (!/^(?:[Bb][Vv][A-Za-z0-9]{10}|av[0-9]+)(?:\?p=[1-9][0-9]*)?$/.test(rawKey)) fail('视频 key');
+                const key = VideoKey.normalize(rawKey);
+                if (seen.has(key)) fail('规范化后的视频 key 重复'); seen.add(key);
+                if (!input || typeof input !== 'object') fail('记录');
+                const v = Array.isArray(input) ? { status: input[0], currentTime: input[1], percent: input[2], savedAt: input[3], title: input[4] } : input;
+                const compact = v.s !== undefined;
+                const status = compact ? v.s : v.status;
+                if (status !== undefined && !(compact ? [0, 1, 2].includes(status) : Object.values(RECORD_STATUS).includes(status))) fail('状态');
+                const percent = compact ? v.p : v.percent;
+                if (percent !== undefined && percent !== '' && !(typeof percent === 'number' && Number.isFinite(percent) || typeof percent === 'string' && /^\d+(?:\.\d+)?%?$/.test(percent))) fail('百分比');
+                const numeric = parseFloat(percent || 0);
+                if (numeric < 0 || numeric > 100) fail('百分比范围');
+                const time = compact ? v.a : v.savedAt;
+                if (time !== undefined && time !== '' && !(compact ? typeof time === 'number' && Number.isFinite(time) && Number.isFinite(new Date(time * 1000).getTime()) : typeof time === 'string' && Number.isFinite(Date.parse(time)))) fail('保存时间');
+                for (const field of compact ? ['t', 'n'] : ['currentTime', 'title']) if (v[field] !== undefined && typeof v[field] !== 'string') fail(field);
+                result.push({ key, record: StorageManager._compact(v) });
+            }
+            return result;
+        },
+        sampleVersion() { return StorageManager._store.version(); },
+        dispose() {
+            StorageManager._disposed = true;
+            clearTimeout(StorageManager._compactionTimer); StorageManager._compactionTimer = null;
+            if (StorageManager._listener !== undefined && typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(StorageManager._listener);
+            StorageManager._listener = undefined;
+            clearTimeout(StorageManager._baseTimer); StorageManager._baseTimer = null; StorageManager._pendingBases?.clear();
+        },
+        _enqueue(operation) {
+            const s = StorageManager;
+            const promise = s._queue.then(operation); s._queue = promise.catch(() => {}); return promise;
+        },
+        saveRecord(key, record, notify = true, options = {}) {
+            return StorageManager.saveRecords([{ key, record }], notify, options);
+        },
+        saveRecords(records, notify = true, options = {}) {
+            const s = StorageManager;
+            // 采样身份在入队前确定；等待或重试不把旧采样变成新采样。
+            const version = options.version || s.sampleVersion();
+            return s._enqueue(async () => {
+                for (;;) {
+                await s.initializeForKeys(records.map(item => item.key)); await s._syncIfStale();
+                const entries = [], source = options.source || 'playback';
+                const observed = new Map(records.map(item => { const key = VideoKey.normalize(item.key); return [key, JSON.stringify(s._store.entries.get(key)?.version)]; }));
+                for (const item of records) {
+                    const key = VideoKey.normalize(item.key); if (!key) throw new Error('视频 key 无效');
+                    const current = s._store.entries.get(key), record = s._compact(item.record);
+                    if ((source === 'import' || source === 'visit') && current && !current.deleted) continue;
+                    if (source === 'visit' && current && HistoryCommitStore.compare(version, current.version) <= 0) continue;
+                    if (source === 'title') {
+                        if (!current || current.deleted || current.record.n || !record.n?.trim()) continue;
+                        const title = record.n.trim();
+                        Object.assign(record, current.record, { n: title });
+                    }
+                    if (source === 'history' && current && !current.deleted) {
+                        if (record.p - current.record.p <= 5) continue;
+                        if (!record.t) record.t = current.record.t;
+                        if (!record.n) record.n = current.record.n;
+                    }
+                    if (source === 'backup' && current && HistoryCommitStore.compare(version, current.version) <= 0) continue;
+                    if (source === 'undo' && (!current?.deleted || current.deleteId !== options.deleteId)) continue;
+                    entries.push({ key, record, deleted: false, source: options.transactionId ? 'playback' : source, version: ['playback', 'backup', 'visit'].includes(source) ? version : s.sampleVersion() });
                 }
-            };
-
-            return new Promise(resolve => {
-                const finish = () => {
-                    if (count > 0) {
-                        StorageManager._allKeysCache = null;
-                        StorageManager._incrementRevision();
-                        StorageManager._persistBaseIndex();
-                        if (notify) StorageManager._notifyChange();
-                    }
-                    report(shards.length);
-                    Utils.logSlow('StorageManager.deleteRecordsWithProgress', start, `records=${count} shards=${shards.length} notify=${notify}`, 80);
-                    resolve(count);
-                };
-
-                const step = (index) => {
-                    if (index >= shards.length) {
-                        finish();
-                        return;
-                    }
-
-                    const [shardId, shardIds] = shards[index];
-                    const shard = StorageManager._loadShard(shardId);
-                    const bases = new Set();
-
-                    shardIds.forEach(id => {
-                        if (!Object.prototype.hasOwnProperty.call(shard.data, id)) return;
-                        const base = VideoKey.base(id);
-                        delete shard.data[id];
-                        shard.dirty = true;
-                        StorageManager._removeFromIndex(id);
-                        if (base) bases.add(base);
-                        count++;
+                if (!entries.length) return options.details ? { count: 0, created: 0, updated: 0 } : 0;
+                const created = entries.filter(entry => !s.getRecord(entry.key)).length;
+                const transaction = await s._store.prepare(entries, 'tx', options.transactionId, options.transactionId ? version[0] : Date.now());
+                let changed;
+                try {
+                    changed = await s._store.publish(transaction, source === 'playback' ? null : async () => {
+                        const changes = await s._store.sync(); s._accept(changes);
+                        return [...observed].every(([key, version]) => JSON.stringify(s._store.entries.get(key)?.version) === version);
                     });
-
-                    if (bases.size > 0) {
-                        StorageManager._flushShard(shardId);
-                        const remainingBases = new Set();
-                        Object.keys(shard.data).forEach(key => {
-                            const base = VideoKey.base(key);
-                            if (base) remainingBases.add(base);
-                        });
-                        bases.forEach(base => {
-                            if (remainingBases.has(base)) return;
-                            const shardSet = StorageManager._shardForBase.get(base);
-                            if (!shardSet) return;
-                            shardSet.delete(shardId);
-                            if (shardSet.size === 0) {
-                                StorageManager._shardForBase.delete(base);
-                            }
-                        });
-                    }
-
-                    processed += shardIds.length;
-                    report(index + 1);
-                    setTimeout(() => step(index + 1), 0);
-                };
-
-                report(0);
-                step(0);
-            });
-        },
-
-        // 批量导入：defer flush / revision / index persist，最后一次性提交
-        importRecords: (data) => {
-            const start = performance.now();
-            let count = 0;
-            let skipCount = 0;
-            for (const k in data) {
-                if (!(typeof data[k] === 'object' || Array.isArray(data[k]))) continue;
-                const id = VideoKey.normalize(k) || k;
-                if (!id) continue;
-                if (StorageManager.getRecord(id)) { skipCount++; continue; }
-                const shardId = StorageManager._getShardId(id);
-                const shard = StorageManager._loadShard(shardId);
-                shard.data[id] = StorageManager._compact(data[k]);
-                shard.dirty = true;
-                StorageManager._indexKey(id, shardId);
-                StorageManager._allKeysCache = null;
-                count++;
-            }
-            // 批量 flush 所有脏分片
-            for (const [shardId, shard] of StorageManager._shardCache) {
-                if (shard.dirty) StorageManager._flushShard(shardId);
-            }
-            // 重建索引并写入版本号
-            StorageManager._rebuildBaseIndex();
-            StorageManager._incrementRevision();
-            StorageManager._notifyChange();
-            Utils.logSlow('StorageManager.importRecords', start, `imported=${count} skipped=${skipCount}`, 80);
-            return { count, skipCount };
-        },
-
-        getAllKeys: () => {
-            if (StorageManager._allKeysCache) {
-                Utils.log('StorageManager.getAllKeys cache hit:', StorageManager._allKeysCache.length);
-                return StorageManager._allKeysCache;
-            }
-            const start = performance.now();
-            StorageManager._ensureAllShardsLoaded();
-            const keys = [];
-            for (const [, shard] of StorageManager._shardCache) {
-                keys.push(...Object.keys(shard.data));
-            }
-            StorageManager._allKeysCache = keys;
-            Utils.logSlow('StorageManager.getAllKeys', start, `keys=${keys.length}`, 50);
-            return keys;
-        },
-
-        getRelatedKeys: (bvBase, options = {}) => {
-            const start = performance.now();
-            const shouldLoadAll = options.loadAll !== false;
-
-            // 1. 已加载分片命中（内存 _bvBaseIndex）
-            if (StorageManager._bvBaseIndex.has(bvBase)) {
-                const keys = Array.from(StorageManager._bvBaseIndex.get(bvBase));
-                Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=memory keys=${keys.length}`, 30);
-                return keys;
-            }
-
-            // 2. 从持久化索引或内存 _shardForBase 获取目标分片，按需加载
-            if (!StorageManager._shardForBase.has(bvBase)) {
-                StorageManager._loadPersistedBaseIndex();
-            }
-            const targetShards = StorageManager._shardForBase.get(bvBase);
-            if (targetShards && targetShards.size > 0) {
-                targetShards.forEach(sid => StorageManager._loadShard(sid));
-                if (StorageManager._bvBaseIndex.has(bvBase)) {
-                    const keys = Array.from(StorageManager._bvBaseIndex.get(bvBase));
-                    Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=on-demand shards=${targetShards.size} keys=${keys.length}`, 50);
-                    return keys;
+                } catch (error) { if (error.code === 'BVH_RETRY') continue; throw error; }
+                s._accept(new Set([...changed, ...entries.map(e => e.key)]));
+                // 派生索引或清理失败不会使已经提交的数据被报告为失败。
+                try { await s._persistBaseIndex(); } catch (error) { Utils.warn('历史已保存，索引可重新生成', error); }
+                s._scheduleCompaction();
+                return options.details ? { count: entries.length, created, updated: entries.length - created } : entries.length;
                 }
-            }
-
-            // 3. 安全降级：全量加载并重建索引
-            if (shouldLoadAll) {
-                StorageManager._ensureAllShardsLoaded();
-                StorageManager._rebuildBaseIndex();
-                const set = StorageManager._bvBaseIndex.get(bvBase);
-                const keys = set ? Array.from(set) : [];
-                Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=fallback keys=${keys.length}`, 80);
-                return keys;
-            }
-
-            Utils.logSlow('StorageManager.getRelatedKeys', start, `base=${bvBase} hit=miss`, 30);
-            return [];
-        },
-
-        getAllRecords: () => {
-            const start = performance.now();
-            const data = [];
-            StorageManager.getAllKeys().forEach(k => {
-                const record = StorageManager.getRecord(k);
-                if (record) data.push({ key: k, record });
             });
-            Utils.logSlow('StorageManager.getAllRecords', start, `records=${data.length}`, 80);
-            return data;
         },
-
+        async importRecords(data) {
+            const rows = StorageManager.validateImport(data);
+            const count = await StorageManager.saveRecords(rows, true, { source: 'import' });
+            return { count, skipCount: rows.length - count };
+        },
+        deleteRecord(key, notify = true) { return StorageManager.deleteRecords([key], notify); },
+        deleteRecords(keys, notify = true, options = {}) {
+            const s = StorageManager;
+            return s._enqueue(async () => {
+                await s.initialize(); await s._syncIfStale();
+                const deleteId = crypto.randomUUID(), backups = [], entries = [];
+                for (const rawKey of new Set(keys)) {
+                    const key = VideoKey.normalize(rawKey), record = s.getRecord(key);
+                    if (!record) continue;
+                    backups.push({ key, record }); entries.push({ key, deleted: true, version: s.sampleVersion(), source: 'delete', deleteId });
+                }
+                if (entries.length) {
+                    const changed = await s._store.publish(await s._store.prepare(entries)); s._accept(new Set([...changed, ...entries.map(e => e.key)]));
+                    for (const { key } of entries) { try { localStorage.removeItem(BACKUP_PREFIX + key); } catch {} }
+                    try { await s._persistBaseIndex(); } catch (error) { Utils.warn('删除已提交，索引可重建', error); }
+                }
+                const result = { count: entries.length, deleteId, backups };
+                return options.details ? result : result.count;
+            });
+        },
+        async deleteRecordsWithProgress(keys, callback, notify = true) {
+            callback?.({ processed: 0, total: keys.length, deleted: 0, shardsDone: 0, shardsTotal: 1 });
+            const count = await StorageManager.deleteRecords(keys, notify);
+            callback?.({ processed: keys.length, total: keys.length, deleted: count, shardsDone: 1, shardsTotal: 1 }); return count;
+        },
+        undoDelete(result) { return StorageManager.saveRecords(result.backups, true, { source: 'undo', deleteId: result.deleteId }); },
+        _scheduleCompaction() {
+            const s = StorageManager;
+            if (s._disposed || s._compactionTimer || s._maintenance) return;
+            s._compactionTimer = setTimeout(() => {
+                s._compactionTimer = null;
+                s._maintenance = s._maintainHistory().catch(error => Utils.warn('后台整理未完成，下次访问自动继续', error))
+                    .finally(() => { s._maintenance = null; });
+            }, 2000);
+        },
+        async _maintainHistory() {
+            const s = StorageManager;
+            // 独立实例且每次存储操作让出事件循环，不占用前台保存队列或升级局部缓存。
+            const io = Object.fromEntries(['get', 'set', 'list', 'delete'].map(name => [name, async (...args) => {
+                await new Promise(resolve => setTimeout(resolve, 0));
+                if (s._disposed) throw new Error('页面已关闭');
+                return HistoryStoreIO[name](...args);
+            }]));
+            const keys = (await io.list()).filter(key => key.startsWith('bvh_commit_'));
+            const done = await io.get('bvh_grouping_complete_v1');
+            const covered = new Set(done?.coverage || []), pending = keys.filter(key => !covered.has(key));
+            if (done && pending.length < 128) {
+                let wide = false;
+                for (const key of pending) {
+                    const manifest = await io.get(key);
+                    if (!Array.isArray(manifest?.bases) || new Set(manifest.bases.map(s._getShardId)).size > 1) { wide = true; break; }
+                }
+                if (!wide) return;
+            }
+            const worker = new HistoryCommitStore(io);
+            await worker.sync();
+            if (worker._incomplete) throw new Error('存在未通过完整性校验的提交');
+            const result = await worker.compact({ resume: true });
+            if (worker._incomplete) throw new Error('整理期间存在未通过完整性校验的提交');
+            await s._persistBaseIndex(worker);
+            // 只覆盖实际整理过的清单，并发产生的新提交仍会在后续检查中被识别。
+            const coverage = [...worker.commits].filter(([, commit]) => commit.manifest.kind === 'checkpoint'
+                && new Set(commit.entries.map(entry => s._getShardId(VideoKey.base(entry.key)))).size <= 1).map(([key]) => key);
+            await io.set('bvh_grouping_complete_v1', { coverage });
+            await io.set('bvh_change_signal', { writer: worker.writer, time: Date.now() });
+            await s._syncIfStale();
+            Utils.log('历史后台分组整理完成', `提交数=${result.before}→${result.after}`);
+        },
+        async createLegacySnapshot({ writersStopped = false } = {}) {
+            if (!writersStopped) throw new Error('请先停止所有其他页面写入');
+            await StorageManager.initialize();
+            await StorageManager._syncIfStale();
+            const shards = Array.from({ length: SHARD_COUNT }, () => ({}));
+            for (const [key, entry] of StorageManager._store.entries) if (!entry.deleted) shards[StorageManager._getShardId(key)][key] = entry.record;
+            for (let i = 0; i < SHARD_COUNT; i++) {
+                await HistoryStoreIO.set('bvh_shard_' + i, shards[i]);
+                if (HistoryCommitStore.checksum(await HistoryStoreIO.get('bvh_shard_' + i)) !== HistoryCommitStore.checksum(shards[i])) throw new Error('兼容快照写入未确认');
+            }
+            await HistoryStoreIO.set('bvh_meta', { version: 3, shardCount: SHARD_COUNT });
+            return StorageManager.getAllKeys().length;
+        },
+        writeBackup(snapshot) {
+            try { localStorage.setItem(BACKUP_PREFIX + snapshot.key, JSON.stringify({ ...snapshot, savedAt: snapshot.version?.[0] || Date.now() })); }
+            catch (error) { Utils.error('临时备份无法写入', error); }
+        },
+        async restoreFromLocalStorage() {
+            let keys;
+            try { keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)).filter(k => k?.startsWith(BACKUP_PREFIX)); }
+            catch (error) { Utils.warn('无法读取临时备份', error); return; }
+            for (const key of keys) {
+                try {
+                    const backup = JSON.parse(localStorage.getItem(key));
+                    const time = backup?.savedAt || Date.parse(backup?.value?.savedAt);
+                    if (!Number.isFinite(time) || Date.now() - time > BACKUP_MAX_AGE) { localStorage.removeItem(key); continue; }
+                    const rows = StorageManager.validateImport({ [backup.key]: backup.value });
+                    const version = backup.version || [Date.parse(backup.value.savedAt) || 0, '', 0];
+                    await StorageManager.saveRecords(rows, true, { source: 'backup', version, transactionId: backup.transactionId });
+                    localStorage.removeItem(key);
+                } catch (error) { Utils.warn('备份未恢复，保留以便重试', error); }
+            }
+        },
+        cleanupLocalStorageBackups() {
+            try {
+                const keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)).filter(k => k?.startsWith(BACKUP_PREFIX));
+                for (const key of keys) { const value = JSON.parse(localStorage.getItem(key)); const time = value?.savedAt || Date.parse(value?.value?.savedAt); if (time && Date.now() - time > BACKUP_MAX_AGE) localStorage.removeItem(key); }
+            } catch (error) { Utils.warn('备份清理未完成', error); }
+        },
+        cleanupLocalStorageBackupsThrottled: null,
         getStatsBundle: (days = 30) => {
             const start = performance.now();
             const now = Date.now();
@@ -1567,210 +1805,7 @@
             };
         },
 
-        // --- localStorage 备份恢复 ---
-        restoreFromLocalStorage: () => {
-            const start = performance.now();
-            const keysToRemove = [];
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                if (key && key.startsWith(BACKUP_PREFIX)) {
-                    try {
-                        const tempValue = JSON.parse(localStorage.getItem(key));
-                        if (tempValue && tempValue.key && tempValue.value) {
-                            StorageManager.saveRecord(tempValue.key, tempValue.value, false);
-                        }
-                    } catch (e) { }
-                    keysToRemove.push(key);
-                }
-            }
-            keysToRemove.forEach(k => localStorage.removeItem(k));
-            Utils.log('StorageManager.restoreFromLocalStorage done:', keysToRemove.length, `cost=${(performance.now() - start).toFixed(1)}ms`);
-        },
 
-        cleanupLocalStorageBackups: () => {
-            const start = performance.now();
-            const backups = [];
-            for (let i = 0; i < localStorage.length; i++) {
-                const key = localStorage.key(i);
-                if (!key || !key.startsWith(BACKUP_PREFIX)) continue;
-                let savedAt = 0;
-                try {
-                    const value = JSON.parse(localStorage.getItem(key));
-                    savedAt = value?.savedAt || value?.ts || 0;
-                    if (!savedAt && value?.value?.savedAt) savedAt = new Date(value.value.savedAt).getTime();
-                } catch (e) { }
-                backups.push({ key, savedAt: savedAt || 0 });
-            }
-            const now = Date.now();
-            backups
-                .filter(item => !item.savedAt || now - item.savedAt > BACKUP_MAX_AGE)
-                .forEach(item => localStorage.removeItem(item.key));
-            const remaining = backups
-                .filter(item => localStorage.getItem(item.key) !== null)
-                .sort((a, b) => b.savedAt - a.savedAt);
-            remaining.slice(BACKUP_MAX_COUNT).forEach(item => localStorage.removeItem(item.key));
-            Utils.logSlow('StorageManager.cleanupLocalStorageBackups', start, `found=${backups.length} remaining=${remaining.length}`, 50);
-        },
-
-        cleanupLocalStorageBackupsThrottled: null,
-
-        // --- 数据迁移 (v1/v2 → v3 分片) ---
-        migrateIfNeeded: () => {
-            const done = Utils.debugTime('StorageManager.migrateIfNeeded');
-            const meta = GM_getValue('bvh_meta');
-            if (meta && meta.version === 3) {
-                // 初始化版本号，避免首次 visibilitychange 误判 stale
-                StorageManager._lastKnownRevision = GM_getValue(StorageManager._REVISION_KEY, 0) || 0;
-                // 已有 v3 用户首次升级到含 base 索引的版本：检查并重建持久化索引
-                if (!GM_getValue(StorageManager._BASE_INDEX_KEY)) {
-                    Utils.log('migrateIfNeeded: v3 user upgrading to base-index, rebuilding...');
-                    StorageManager._rebuildBaseIndex();
-                    StorageManager._lastKnownRevision = GM_getValue(StorageManager._REVISION_KEY, 0) || 0;
-                }
-                done('already v3');
-                return; // 已完成迁移
-            }
-
-            const allKeys = GM_listValues();
-            const bvKeys = allKeys.filter(k => VideoKey.isValid(k));
-
-            if (bvKeys.length === 0) {
-                // 全新安装，直接标记为 v3
-                GM_setValue('bvh_meta', { version: 3, shardCount: SHARD_COUNT, totalRecords: 0, migratedAt: Date.now() });
-                StorageManager._lastKnownRevision = StorageManager._incrementRevision();
-                StorageManager._persistBaseIndex();
-                done('new install');
-                return;
-            }
-
-            Utils.log(`开始迁移 ${bvKeys.length} 条记录到分片存储...`);
-
-            // 初始化空分片
-            const shards = new Array(SHARD_COUNT).fill(null).map(() => ({}));
-            let migratedCount = 0;
-
-            for (const key of bvKeys) {
-                const oldRecord = GM_getValue(key);
-                if (!oldRecord) continue;
-
-                const normalizedKey = VideoKey.normalize(key) || key;
-                const compact = StorageManager._compact(oldRecord);
-                const shardId = StorageManager._getShardId(normalizedKey);
-                shards[shardId][normalizedKey] = compact;
-                migratedCount++;
-            }
-
-            // 批量写入分片（合并已有分片数据，防止覆盖其他来源的分片数据）
-            for (let i = 0; i < SHARD_COUNT; i++) {
-                if (Object.keys(shards[i]).length > 0) {
-                    const existing = GM_getValue(`bvh_shard_${i}`, {});
-                    GM_setValue(`bvh_shard_${i}`, Object.assign(existing, shards[i]));
-                }
-            }
-
-            // 写入元数据标记
-            GM_setValue('bvh_meta', {
-                version: 3,
-                shardCount: SHARD_COUNT,
-                totalRecords: migratedCount,
-                migratedAt: Date.now()
-            });
-
-            // 删除旧键（最后执行，崩溃安全：即使失败，重启后会重新迁移）
-            for (const key of bvKeys) {
-                GM_deleteValue(key);
-            }
-
-            Utils.log(`迁移完成：${migratedCount} 条记录`);
-            StorageManager._migrationCount = migratedCount;
-            // 重建持久化 base 索引
-            StorageManager._rebuildBaseIndex();
-            StorageManager._lastKnownRevision = StorageManager._incrementRevision();
-            done(`migrated=${migratedCount}`);
-        },
-
-        // --- 持久化 base→shard 索引 + 存储版本号 ---
-        _BASE_INDEX_KEY: 'bvh_base_index',
-        _REVISION_KEY: 'bvh_storage_revision',
-        _BASE_INDEX_VERSION: 1,
-
-        _incrementRevision: () => {
-            const rev = (GM_getValue(StorageManager._REVISION_KEY, 0) || 0) + 1;
-            GM_setValue(StorageManager._REVISION_KEY, rev);
-            StorageManager._lastKnownRevision = rev;
-            return rev;
-        },
-
-        _persistBaseIndex: () => {
-            const index = {};
-            StorageManager._shardForBase.forEach((shardIds, base) => {
-                index[base] = Array.from(shardIds);
-            });
-            GM_setValue(StorageManager._BASE_INDEX_KEY, {
-                version: StorageManager._BASE_INDEX_VERSION,
-                revision: GM_getValue(StorageManager._REVISION_KEY, 0) || 0,
-                index
-            });
-        },
-
-        _loadPersistedBaseIndex: () => {
-            const persisted = GM_getValue(StorageManager._BASE_INDEX_KEY);
-            if (!persisted || persisted.version !== StorageManager._BASE_INDEX_VERSION) return false;
-            const index = persisted.index;
-            if (!index || typeof index !== 'object') return false;
-            let loaded = 0;
-            for (const base of Object.keys(index)) {
-                const shardIds = index[base];
-                if (Array.isArray(shardIds) && shardIds.length > 0) {
-                    const shardSet = new Set(shardIds);
-                    StorageManager._shardForBase.set(base, shardSet);
-                    loaded++;
-                }
-            }
-            Utils.log('StorageManager._loadPersistedBaseIndex', `loaded=${loaded} bases`);
-            return loaded > 0;
-        },
-
-        _rebuildBaseIndex: () => {
-            const start = performance.now();
-            StorageManager._bvBaseIndex.clear();
-            StorageManager._shardForBase.clear();
-            for (let i = 0; i < SHARD_COUNT; i++) {
-                StorageManager._loadShard(i);
-            }
-            // 对已缓存的分片确保全部键被重新索引（_loadShard 对已缓存分片不会重复索引）
-            for (const [shardId, shard] of StorageManager._shardCache) {
-                for (const key of Object.keys(shard.data)) {
-                    StorageManager._indexKey(key, shardId);
-                }
-            }
-            StorageManager._persistBaseIndex();
-            Utils.logSlow('StorageManager._rebuildBaseIndex', start, `bases=${StorageManager._shardForBase.size} shards=${StorageManager._shardCache.size}`, 80);
-        },
-
-        // --- 多标签页切换时同步（基于版本号） ---
-        _syncIfStale: () => {
-            const remoteRev = GM_getValue(StorageManager._REVISION_KEY, 0) || 0;
-            if (remoteRev > StorageManager._lastKnownRevision) {
-                Utils.log('StorageManager._syncIfStale: stale detected', `local=${StorageManager._lastKnownRevision}`, `remote=${remoteRev}`);
-                StorageManager._shardCache.clear();
-                StorageManager._bvBaseIndex.clear();
-                StorageManager._shardForBase.clear();
-                StorageManager._allKeysCache = null;
-                StorageManager._lastKnownRevision = remoteRev;
-                StorageManager._loadPersistedBaseIndex();
-                return true;
-            }
-            return false;
-        },
-
-        invalidateCache: () => {
-            Utils.log('StorageManager.invalidateCache', `cachedShards=${StorageManager._shardCache.size}`, `indexedBases=${StorageManager._bvBaseIndex.size}`);
-            StorageManager._shardCache.clear();
-            StorageManager._bvBaseIndex.clear();
-            StorageManager._shardForBase.clear();
-            StorageManager._allKeysCache = null;
-        }
     };
     StorageManager.cleanupLocalStorageBackupsThrottled = Utils.throttle(StorageManager.cleanupLocalStorageBackups, 30000);
     VideoKey.latestRelatedRecord = (base) => EpisodeResolver.getLatestRecord(base);
@@ -1782,6 +1817,8 @@
             if (!UIComponent.toastContainer) {
                 UIComponent.toastContainer = document.createElement('div');
                 UIComponent.toastContainer.className = 'bvh-toast-container';
+                UIComponent.toastContainer.setAttribute('aria-live', 'polite');
+                injectWorkbenchStyles();
                 document.body.appendChild(UIComponent.toastContainer);
             }
         },
@@ -1800,17 +1837,26 @@
         },
         toastUndo: (msg, duration = 5000, onUndo) => {
             const el = UIComponent.toast(msg, 'success', duration);
-            el.style.cursor = 'pointer';
-            el.addEventListener('click', () => {
-                onUndo();
-                el.classList.remove('show');
-                setTimeout(() => el.remove(), 300);
+            const button = document.createElement('button'); button.textContent = '撤销'; el.appendChild(button);
+            button.addEventListener('click', async () => {
+                if (button.disabled) return; button.disabled = true; button.textContent = '正在撤销…';
+                const progress = UIComponent.progressToast('正在撤销，恢复记录中…', { indeterminate: true });
+                try { const message = await onUndo(); progress.close(message || '撤销完成', 'success'); el.remove(); }
+                catch (error) {
+                    progress.close('撤销失败：' + error.message, 'error', 5000);
+                    button.disabled = false; button.textContent = '重试撤销';
+                    if (!el.isConnected || !el.classList.contains('show')) {
+                        el.remove(); UIComponent.toastUndo('记录恢复失败，可以重试', 5000, onUndo);
+                    }
+                }
             });
+            return el;
         },
-        progressToast: (msg) => {
+        progressToast: (msg, { indeterminate = false } = {}) => {
             UIComponent.initToastContainer();
             const el = document.createElement('div');
             el.className = 'bvh-toast success bvh-progress-toast';
+            if (indeterminate) el.classList.add('is-pending', 'show');
 
             const text = document.createElement('div');
             text.className = 'bvh-toast-progress-text';
@@ -1818,6 +1864,9 @@
 
             const track = document.createElement('div');
             track.className = 'bvh-toast-progress-track';
+            track.setAttribute('role', 'progressbar');
+            track.setAttribute('aria-label', msg);
+            if (!indeterminate) track.setAttribute('aria-valuenow', '0');
             const fill = document.createElement('div');
             fill.className = 'bvh-toast-progress-fill';
             track.appendChild(fill);
@@ -1828,6 +1877,10 @@
             setTimeout(() => el.classList.add('show'), 10);
 
             const close = (message, type = 'success', duration = 2500) => {
+                el.classList.remove('is-pending');
+                track.setAttribute('aria-label', message);
+                if (type === 'error') track.removeAttribute('aria-valuenow');
+                else track.setAttribute('aria-valuenow', '100');
                 text.innerText = message;
                 fill.style.width = '100%';
                 el.classList.toggle('error', type === 'error');
@@ -1840,7 +1893,9 @@
 
             return {
                 update: (percent, message) => {
+                    el.classList.remove('is-pending');
                     const safePercent = Math.max(0, Math.min(100, Math.round(percent) || 0));
+                    track.setAttribute('aria-valuenow', String(safePercent));
                     fill.style.width = `${safePercent}%`;
                     if (message) text.innerText = message;
                 },
@@ -2060,7 +2115,7 @@
             }));
             location.href = targetUrl;
         },
-        applyPendingSeek: (currentKey, video) => {
+        applyPendingSeek: (currentKey, video, isValid = () => EpisodeResolver.getCurrentKey() === currentKey) => {
             if (!currentKey || !video) return;
             let pending = null;
             try {
@@ -2076,6 +2131,7 @@
                 return;
             }
             const seek = () => {
+                if (!isValid()) return;
                 Utils.log('UIComponent.applyPendingSeek seek', `key=${currentKey}`, `time=${pending.currentTime}`);
                 video.currentTime = Utils.timeToSeconds(pending.currentTime);
                 video.play();
@@ -2084,8 +2140,9 @@
             };
             if (video.readyState >= 1) seek();
             else video.addEventListener('loadedmetadata', seek, { once: true });
+            return () => video.removeEventListener('loadedmetadata', seek);
         },
-        showResumePrompt: (target, onStartFresh) => {
+        showResumePrompt: (target, onStartFresh, isValid = () => true) => {
             const record = target?.record || target;
             const resumeSeconds = Utils.timeToSeconds(record?.currentTime);
             if (!CONFIG.autoResumePrompt || !record?.currentTime || resumeSeconds < MIN_RESUME_SECONDS) {
@@ -2108,667 +2165,410 @@
             el.addEventListener('click', (e) => {
                 const action = e.target?.dataset?.action;
                 if (!action) return;
+                if (!isValid()) { el.remove(); return; }
                 if (action === 'resume') UIComponent.resumeToRecord(target?.record ? target : { record });
                 if (action === 'fresh' && onStartFresh) onStartFresh();
                 el.remove();
             });
             document.body.appendChild(el);
-            setTimeout(() => el.remove(), 15000);
+            const timer = setTimeout(() => el.remove(), 15000);
+            return () => { clearTimeout(timer); el.remove(); };
         },
-        showManagerPanel: (options = {}) => {
-            const old = document.getElementById('bvh-modal-mask');
-            if (old) old.remove();
+        showManagerPanel: (options = {}) => HistoryManagerPanel.show(options)
+    };
 
-            const activeTab = options.activeTab || 'settings';
-            const mask = document.createElement('div');
-            mask.id = 'bvh-modal-mask';
-            mask.className = 'bvh-modal-mask';
-            mask.innerHTML = `
-                <div class="bvh-modal" role="dialog" aria-modal="true">
-                    <div class="bvh-modal-header">
-                        <div class="bvh-modal-title">Bilibili 观看历史记录</div>
-                        <button class="bvh-modal-close" data-action="close">×</button>
-                    </div>
-                    <div class="bvh-tabs">
-                        <button class="bvh-tab" data-tab="settings">设置</button>
-                        <button class="bvh-tab" data-tab="history">历史管理</button>
-                        <button class="bvh-tab" data-tab="stats">统计</button>
-                    </div>
-                    <div class="bvh-modal-body">
-                        <section class="bvh-pane" data-pane="settings"></section>
-                        <section class="bvh-pane" data-pane="history"></section>
-                        <section class="bvh-pane" data-pane="stats"></section>
-                    </div>
-                </div>`;
-            document.body.appendChild(mask);
-
-            const state = {
-                tab: activeTab,
-                query: '',
-                status: 'all',
-                sort: 'savedAt-desc',
-                page: 1,
-                pageSize: 20,
-                selected: new Set(),
-                statsRange: 30,
-                _dataReady: false,
-                _cachedRows: null
-            };
-
-            const renderTabs = () => {
-                mask.querySelectorAll('.bvh-tab').forEach(tab => tab.classList.toggle('active', tab.dataset.tab === state.tab));
-                mask.querySelectorAll('.bvh-pane').forEach(pane => pane.classList.toggle('active', pane.dataset.pane === state.tab));
-            };
-
-            const renderSettings = () => {
-                const pane = mask.querySelector('[data-pane="settings"]');
-                const currentRecord = options.currentKey ? StorageManager.getRecord(options.currentKey) : null;
-                const floatingButtonVisibility = getFloatingButtonVisibility();
-                pane.innerHTML = `
-                    <div class="bvh-settings-card">
-                        <p class="bvh-section-title">显示与提示</p>
-                        <div class="bvh-grid">
-                            <div class="bvh-field"><label>显示进度条</label><input type="checkbox" data-setting="showProgressBar" ${CONFIG.showProgressBar ? 'checked' : ''}></div>
-                            <div class="bvh-field"><label>显示已访问标记</label><input type="checkbox" data-setting="showVisitedTag" ${CONFIG.showVisitedTag ? 'checked' : ''}></div>
-                            <div class="bvh-field"><label>自动续播提示</label><input type="checkbox" data-setting="autoResumePrompt" ${CONFIG.autoResumePrompt ? 'checked' : ''}></div>
-                            <div class="bvh-field"><label>悬浮按钮隐藏规则</label><select data-setting="floatingButtonVisibility">
-                                <option value="${FLOATING_BUTTON_VISIBILITY.SHOW_ALL}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.SHOW_ALL ? 'selected' : ''}>不隐藏（默认选项）</option>
-                                <option value="${FLOATING_BUTTON_VISIBILITY.HIDE_VIDEO}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.HIDE_VIDEO ? 'selected' : ''}>隐藏视频页悬浮按钮</option>
-                                <option value="${FLOATING_BUTTON_VISIBILITY.HIDE_NON_VIDEO}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.HIDE_NON_VIDEO ? 'selected' : ''}>隐藏非视频页悬浮按钮</option>
-                                <option value="${FLOATING_BUTTON_VISIBILITY.HIDE_ALL}" ${floatingButtonVisibility === FLOATING_BUTTON_VISIBILITY.HIDE_ALL ? 'selected' : ''}>全部隐藏</option>
-                            </select></div>
-                            <div class="bvh-field"><label>调试日志</label><input type="checkbox" data-setting="debug" ${CONFIG.debug ? 'checked' : ''}></div>
-                        </div>
-                    </div>
-                    <div class="bvh-settings-card">
-                        <p class="bvh-section-title">标签样式</p>
-                        <div class="bvh-grid">
-                            <div class="bvh-field"><label>标签透明度</label><div class="bvh-opacity-control">
-                                <input type="range" min="40" max="100" data-setting="tagOpacity" data-opacity-range value="${CONFIG.tagOpacity}">
-                                <input type="number" min="40" max="100" data-setting="tagOpacity" data-opacity-input value="${CONFIG.tagOpacity}">
-                            </div></div>
-                            <div class="bvh-field"><label>标签位置</label><select data-setting="tagPosition">
-                                <option value="top-left" ${CONFIG.tagPosition === 'top-left' ? 'selected' : ''}>左上</option>
-                                <option value="top-right" ${CONFIG.tagPosition === 'top-right' ? 'selected' : ''}>右上</option>
-                                <option value="bottom-left" ${CONFIG.tagPosition === 'bottom-left' ? 'selected' : ''}>左下</option>
-                                <option value="bottom-right" ${CONFIG.tagPosition === 'bottom-right' ? 'selected' : ''}>右下</option>
-                            </select></div>
-                            <div class="bvh-field"><label>低进度阈值</label><input type="number" min="1" max="99" data-setting="lowThreshold" value="${CONFIG.lowThreshold}"></div>
-                            <div class="bvh-field"><label>高进度阈值</label><input type="number" min="1" max="99" data-setting="highThreshold" value="${CONFIG.highThreshold}"></div>
-                        </div>
-                    </div>
-                    <div class="bvh-actions">
-                        <button class="bvh-btn primary" data-action="save-settings">保存设置</button>
-                        <button class="bvh-btn" data-action="reset-settings">恢复默认设置</button>
-                        <button class="bvh-btn" data-action="download-debug-log">下载调试日志</button>
-                        <button class="bvh-btn" data-action="clear-debug-log">清空调试日志</button>
-                        <button class="bvh-btn" data-action="reset-panel">恢复左下角面板位置</button>
-                        ${currentRecord?.currentTime ? '<button class="bvh-btn primary" data-action="jump-current">跳转当前视频进度</button>' : ''}
-                    </div>`;
-            };
-
-            const getFilteredRows = () => {
-                if (state._cachedRows) return state._cachedRows;
-                const query = state.query.trim().toLowerCase();
-                let rows = StorageManager.getAllRecords();
-                if (query) {
-                    rows = rows.filter(({ key, record }) => key.toLowerCase().includes(query) || (record.title || '').toLowerCase().includes(query));
+    // 数据模型与查询任务独立于面板，翻页不重新读取或排序。
+    const HistoryQueries = {
+        version: -1, rows: [], building: null, results: new Map(), statsCache: new Map(),
+        rowMap: new Map(), dirtyKeys: new Set(),
+        invalidate(keys) { for (const key of keys) this.dirtyKeys.add(key); },
+        metrics: { builds: 0, sorts: 0, segments: [] },
+        recordSegment(ms) {
+            this.metrics.maxSegment = Math.max(this.metrics.maxSegment || 0, ms);
+            if (this.metrics.segments.length >= 512) this.metrics.segments.shift();
+            this.metrics.segments.push(ms);
+        },
+        async each(items, fn, cancelled = () => false) {
+            let start = performance.now();
+            for (let i = 0; i < items.length; i++) {
+                if (cancelled()) { const error = new Error('查询已取消'); error.name = 'AbortError'; throw error; }
+                fn(items[i], i);
+                if (performance.now() - start >= 8) {
+                    this.recordSegment(performance.now() - start);
+                    await new Promise(resolve => setTimeout(resolve, 0)); start = performance.now();
                 }
-                if (state.status !== 'all') {
-                    rows = rows.filter(({ record }) => record.status === state.status);
-                }
-                rows.sort((a, b) => {
-                    if (state.sort === 'percent-desc') return (parseInt(b.record.percent) || 0) - (parseInt(a.record.percent) || 0);
-                    if (state.sort === 'percent-asc') return (parseInt(a.record.percent) || 0) - (parseInt(b.record.percent) || 0);
-                    if (state.sort === 'title-asc') return (a.record.title || '').localeCompare(b.record.title || '');
-                    const at = new Date(a.record.savedAt || 0).getTime();
-                    const bt = new Date(b.record.savedAt || 0).getTime();
-                    return state.sort === 'savedAt-asc' ? at - bt : bt - at;
+            }
+            this.recordSegment(performance.now() - start);
+        },
+        async model() {
+            await StorageManager.initialize();
+            const version = StorageManager._dataVersion;
+            if (this.version === version) return this.rows;
+            if (this.building?.version === version) return this.building.promise;
+            const promise = (async () => {
+                const rowMap = new Map(this.rowMap); this.metrics.builds++;
+                const keys = this.version < 0 ? StorageManager.getAllKeys().slice() : [...this.dirtyKeys];
+                await this.each(keys, key => {
+                    const record = StorageManager.getRecord(key);
+                    if (record) rowMap.set(key, { key, record, search: (key + ' ' + record.title).toLowerCase(), percent: parseInt(record.percent) || 0, time: Date.parse(record.savedAt) });
+                    else rowMap.delete(key);
                 });
-                state._cachedRows = rows;
-                return rows;
-            };
-
-            const renderHistoryShell = () => {
-                const pane = mask.querySelector('[data-pane="history"]');
-                const existingToolbar = pane.querySelector('.bvh-history-toolbar');
-                if (!existingToolbar) {
-                    pane.innerHTML = `
-                        <div class="bvh-history-toolbar">
-                            <div class="bvh-actions bvh-actions-search">
-                                <input class="bvh-search" data-action="search" placeholder="搜索标题 / BV / av" value="${Utils.escapeHTML(state.query)}">
-                                <button class="bvh-btn" data-action="clear-search" title="清空搜索">✕</button>
-                            </div>
-                            <div class="bvh-actions bvh-actions-bar">
-                                <select data-action="status-filter">
-                                    <option value="all" ${state.status === 'all' ? 'selected' : ''}>全部状态</option>
-                                    <option value="${RECORD_STATUS.WATCHED}" ${state.status === RECORD_STATUS.WATCHED ? 'selected' : ''}>已观看</option>
-                                    <option value="${RECORD_STATUS.VISITED}" ${state.status === RECORD_STATUS.VISITED ? 'selected' : ''}>已访问</option>
-                                </select>
-                                <select data-action="sort">
-                                    <option value="savedAt-desc" ${state.sort === 'savedAt-desc' ? 'selected' : ''}>最近优先</option>
-                                    <option value="savedAt-asc" ${state.sort === 'savedAt-asc' ? 'selected' : ''}>最早优先</option>
-                                    <option value="percent-desc" ${state.sort === 'percent-desc' ? 'selected' : ''}>进度高优先</option>
-                                    <option value="percent-asc" ${state.sort === 'percent-asc' ? 'selected' : ''}>进度低优先</option>
-                                    <option value="title-asc" ${state.sort === 'title-asc' ? 'selected' : ''}>标题排序</option>
-                                </select>
-                                <span class="bvh-actions-spacer"></span>
-                                <div class="bvh-retention-cleanup">
-                                    <span class="bvh-retention-label">保留</span>
-                                    <input type="text" inputmode="numeric" pattern="[0-9]*" data-action="retention-value" placeholder="N" aria-label="保留数量">
-                                    <select data-action="retention-unit" aria-label="保留单位">
-                                        <option value="days">天</option>
-                                        <option value="months">月</option>
-                                        <option value="years">年</option>
-                                    </select>
-                                    <button class="bvh-btn danger" data-action="cleanup-retention">清理久远记录</button>
-                                </div>
-                                <button class="bvh-btn" data-action="export">导出</button>
-                                <button class="bvh-btn" data-action="import">导入</button>
-                                <button class="bvh-btn danger" data-action="delete-selected">删除选中</button>
-                            </div>
-                        </div>
-                        <div class="bvh-history-results"></div>`;
-                } else {
-                    existingToolbar.querySelector('[data-action="status-filter"]').value = state.status;
-                    existingToolbar.querySelector('[data-action="sort"]').value = state.sort;
-                    const searchInput = existingToolbar.querySelector('[data-action="search"]');
-                    if (searchInput && searchInput !== document.activeElement) {
-                        searchInput.value = state.query;
-                    }
+                if (version !== StorageManager._dataVersion) return this.model();
+                const rows = [...rowMap.values()]; this.rowMap = rowMap; this.dirtyKeys.clear();
+                this.rows = rows; this.version = version; this.results.clear(); this.statsCache.clear(); return rows;
+            })();
+            this.building = { version, promise }; return promise;
+        },
+        async query({ query = '', status = 'all', sort = 'savedAt-desc' } = {}, { cancelled = () => false } = {}) {
+            const rows = await this.model(), version = this.version;
+            const text = query.trim().toLowerCase(), cacheKey = JSON.stringify([version, text, status, sort]);
+            if (this.results.has(cacheKey)) return this.results.get(cacheKey);
+            const promise = (async () => {
+                const selected = [];
+                await this.each(rows, row => { if ((!text || row.search.includes(text)) && (status === 'all' || row.record.status === status)) selected.push(row); }, cancelled);
+                const compare = (a, b) => (sort === 'percent-desc' ? b.percent - a.percent : sort === 'percent-asc' ? a.percent - b.percent : sort === 'title-asc' ? a.record.title.localeCompare(b.record.title) : sort === 'savedAt-asc' ? a.time - b.time : b.time - a.time) || a.key.localeCompare(b.key);
+                this.metrics.sorts++;
+                let runs = [];
+                for (let i = 0; i < selected.length; i += 256) {
+                    runs.push(selected.slice(i, i + 256).sort(compare));
+                    if (i % 1024 === 0) await new Promise(resolve => setTimeout(resolve, 0));
                 }
-            };
-
-            const renderHistoryResults = () => {
-                const resultsContainer = mask.querySelector('.bvh-history-results');
-                if (!resultsContainer) return;
-                const rows = getFilteredRows();
-                const pageCount = Math.max(1, Math.ceil(rows.length / state.pageSize));
-                if (state.page > pageCount) state.page = pageCount;
-                if (state.page < 1) state.page = 1;
-                const start = (state.page - 1) * state.pageSize;
-                const visibleRows = rows.slice(start, start + state.pageSize);
-                const displayStart = rows.length ? start + 1 : 0;
-                const displayEnd = start + visibleRows.length;
-                const pageKeys = visibleRows.map(({ key }) => key);
-                const selectedOnPage = pageKeys.filter(key => state.selected.has(key)).length;
-                const allSelected = pageKeys.length > 0 && selectedOnPage === pageKeys.length;
-                const partialSelected = selectedOnPage > 0 && !allSelected;
-                resultsContainer.innerHTML = `
-                    <p class="bvh-history-summary">共 ${rows.length} 条，当前显示 ${displayStart}-${displayEnd} 条</p>
-                    <table class="bvh-table">
-                        <thead><tr><th><input type="checkbox" data-action="select-all" ${allSelected ? 'checked' : ''}></th><th>标题</th><th>Key</th><th>状态</th><th>进度</th><th>时间</th><th>操作</th></tr></thead>
-                        <tbody>${visibleRows.map(({ key, record }) => `
-                            <tr>
-                                <td><input type="checkbox" data-key="${Utils.escapeHTML(key)}" ${state.selected.has(key) ? 'checked' : ''}></td>
-                                <td title="${Utils.escapeHTML(record.title || '')}">${Utils.escapeHTML(record.title || '(无标题)')}</td>
-                                <td>${Utils.escapeHTML(key)}</td>
-                                <td>${Utils.escapeHTML(record.status)}</td>
-                                <td>${Utils.escapeHTML(record.percent || '')}</td>
-                                <td>${Utils.escapeHTML(record.savedAt || '')}</td>
-                                <td><button class="bvh-btn danger" data-action="delete-one" data-key="${Utils.escapeHTML(key)}">删除</button></td>
-                            </tr>`).join('')}</tbody>
-                    </table>
-                    ${rows.length === 0 && state.query ? '<p class="bvh-chart-empty">没有找到匹配的历史记录</p>' : ''}
-                    <div class="bvh-pagination">
-                        <button class="bvh-btn" data-action="page-first" ${state.page <= 1 ? 'disabled' : ''}>首页</button>
-                        <button class="bvh-btn" data-action="page-prev" ${state.page <= 1 ? 'disabled' : ''}>上一页</button>
-                        <span>第 ${state.page} / ${pageCount} 页</span>
-                        <button class="bvh-btn" data-action="page-next" ${state.page >= pageCount ? 'disabled' : ''}>下一页</button>
-                        <button class="bvh-btn" data-action="page-last" ${state.page >= pageCount ? 'disabled' : ''}>末页</button>
-                        <span>每页</span>
-                        <select data-action="page-size">
-                            <option value="20" ${state.pageSize === 20 ? 'selected' : ''}>20</option>
-                            <option value="30" ${state.pageSize === 30 ? 'selected' : ''}>30</option>
-                            <option value="50" ${state.pageSize === 50 ? 'selected' : ''}>50</option>
-                            <option value="100" ${state.pageSize === 100 ? 'selected' : ''}>100</option>
-                        </select>
-                    </div>`;
-                if (partialSelected) {
-                    const selectAllCb = resultsContainer.querySelector('[data-action="select-all"]');
-                    if (selectAllCb) selectAllCb.indeterminate = true;
-                }
-            };
-
-            const renderHistory = () => {
-                renderHistoryShell();
-                if (!state._dataReady) {
-                    const resultsContainer = mask.querySelector('.bvh-history-results');
-                    if (resultsContainer) {
-                        resultsContainer.innerHTML = '<p class="bvh-history-loading">加载中...</p>';
-                    }
-                }
-                setTimeout(() => {
-                    state._cachedRows = null;
-                    state._dataReady = true;
-                    renderHistoryResults();
-                }, 0);
-            };
-
-            const renderMiniBarChart = (items) => {
-                const max = Math.max(1, ...items.map(item => item.value));
-                if (!items.some(item => item.value > 0)) {
-                    return '<div class="bvh-chart-empty">暂无数据</div>';
-                }
-                return items.map(item => {
-                    const percent = Math.round((item.value / max) * 100);
-                    const fillColor = item.color || '#00aeec';
-                    return `
-                        <div class="bvh-chart-row">
-                            <span class="bvh-chart-label">${Utils.escapeHTML(item.label)}</span>
-                            <div class="bvh-chart-bar-track">
-                                <div class="bvh-chart-bar-fill" style="width:${percent}%;background:${fillColor}"></div>
-                            </div>
-                            <strong class="bvh-chart-value">${item.value}</strong>
-                        </div>`;
-                }).join('');
-            };
-
-            const renderDailySvgChart = (items) => {
-                if (!items.length || !items.some(item => item.value > 0)) {
-                    return '<div class="bvh-chart-empty">暂无数据</div>';
-                }
-                const max = Math.max(1, ...items.map(item => item.value));
-                const chartHeight = 120;
-                const paddingX = 10;
-                const paddingTop = 16;
-                const paddingBottom = 30;
-                const barAreaWidth = items.length * 24;
-                const totalWidth = barAreaWidth + paddingX * 2;
-                const totalHeight = chartHeight + paddingTop + paddingBottom;
-                const barBottom = chartHeight + paddingTop;
-                const gap = barAreaWidth / items.length;
-                const barWidth = Math.max(4, Math.min(20, gap - 4));
-                const labelStep = Math.max(1, Math.ceil(items.length / 7));
-                return `
-                    <svg viewBox="0 0 ${totalWidth} ${totalHeight}" class="bvh-svg-chart" aria-label="近期记录趋势图">
-                        ${items.map((item, i) => {
-                            const h = Math.max(0.5, max > 0 ? (item.value / max) * chartHeight : 0);
-                            const x = paddingX + i * gap + (gap - barWidth) / 2;
-                            const barY = barBottom - h;
-                            return [
-                                `<rect x="${x.toFixed(1)}" y="${barY.toFixed(1)}" width="${barWidth.toFixed(1)}" height="${h.toFixed(1)}" fill="#00aeec" rx="2"><title>${item.date}: ${item.value} 条</title></rect>`,
-                                item.value > 0 ? `<text x="${(x + barWidth / 2).toFixed(1)}" y="${(barY - 3).toFixed(1)}" text-anchor="middle" font-size="9" fill="#61666d" font-weight="600">${item.value}</text>` : ''
-                            ].join('');
-                        }).join('')}
-                        ${items.map((item, i) => {
-                            if (i % labelStep !== 0 && i !== items.length - 1) return '';
-                            const x = paddingX + i * gap + gap / 2;
-                            return `<text x="${x.toFixed(1)}" y="${barBottom + 18}" text-anchor="middle" font-size="10" fill="#9499a0">${item.date}</text>`;
-                        }).join('')}
-                    </svg>`;
-            };
-
-            const renderStats = () => {
-                const bundle = StorageManager.getStatsBundle(state.statsRange);
-                const stats = bundle.cards;
-                const chartData = bundle.charts;
-                const pane = mask.querySelector('[data-pane="stats"]');
-                const completionPercent = chartData.completion.total > 0 ? Math.round((chartData.completion.finished / chartData.completion.total) * 100) : 0;
-
-                pane.innerHTML = `
-                    <div class="bvh-stats">
-                        <div class="bvh-stat">总记录<strong>${stats.total}</strong></div>
-                        <div class="bvh-stat">已观看<strong>${stats.watched}</strong></div>
-                        <div class="bvh-stat">已访问<strong>${stats.visited}</strong></div>
-                        <div class="bvh-stat">近 7 天<strong>${stats.recent7Days}</strong></div>
-                        <div class="bvh-stat">低进度<strong>${stats.low}</strong></div>
-                        <div class="bvh-stat">中进度<strong>${stats.mid}</strong></div>
-                        <div class="bvh-stat">高进度<strong>${stats.high}</strong></div>
-                        <div class="bvh-stat">未看完<strong>${stats.unfinished}</strong></div>
-                    </div>
-                    <div class="bvh-chart-toolbar">
-                        <select data-action="stats-range">
-                            <option value="7" ${state.statsRange === 7 ? 'selected' : ''}>近 7 天</option>
-                            <option value="30" ${state.statsRange === 30 ? 'selected' : ''}>近 30 天</option>
-                            <option value="90" ${state.statsRange === 90 ? 'selected' : ''}>近 90 天</option>
-                        </select>
-                    </div>
-                    <div class="bvh-chart-grid">
-                        <div class="bvh-chart-card">
-                            <p class="bvh-chart-title">观看完成度</p>
-                            <div class="bvh-completion-ring">
-                                <svg viewBox="0 0 120 120" class="bvh-ring-svg">
-                                    <circle cx="60" cy="60" r="50" fill="none" stroke="#edf0f2" stroke-width="10"/>
-                                    <circle cx="60" cy="60" r="50" fill="none" stroke="#00aeec" stroke-width="10"
-                                        stroke-dasharray="${completionPercent * 3.14} 314" stroke-linecap="round"
-                                        transform="rotate(-90 60 60)"/>
-                                </svg>
-                                <div class="bvh-ring-text">
-                                    <strong>${completionPercent}%</strong>
-                                    <span>高进度 / 总数量</span>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="bvh-chart-card">
-                            <p class="bvh-chart-title">观看状态分布</p>
-                            ${renderMiniBarChart([
-                                { label: '已观看', value: chartData.status[0].value, color: '#4CAF50' },
-                                { label: '已访问', value: chartData.status[1].value, color: '#9E9E9E' }
-                            ])}
-                        </div>
-                        <div class="bvh-chart-card">
-                            <p class="bvh-chart-title">观看进度分布</p>
-                            ${renderMiniBarChart([
-                                { label: '低进度', value: chartData.progress[0].value, color: '#FF9800' },
-                                { label: '中进度', value: chartData.progress[1].value, color: '#4285F4' },
-                                { label: '高进度', value: chartData.progress[2].value, color: '#4CAF50' }
-                            ])}
-                        </div>
-                        <div class="bvh-chart-card bvh-chart-card-wide">
-                            <p class="bvh-chart-title">近期记录趋势 (${state.statsRange} 天)</p>
-                            <div class="bvh-chart-scroll">${renderDailySvgChart(chartData.recentDays)}</div>
-                        </div>
-                    </div>
-`;
-            };
-
-            const render = () => {
-                state._cachedRows = null;
-                renderTabs();
-                if (state.tab === 'settings') renderSettings();
-                if (state.tab === 'history') renderHistory();
-                if (state.tab === 'stats') renderStats();
-            };
-
-            const syncOpacityControls = (value) => {
-                const next = Math.max(40, Math.min(100, parseInt(value, 10) || DEFAULT_CONFIG.tagOpacity));
-                mask.querySelectorAll('[data-setting="tagOpacity"]').forEach(input => input.value = String(next));
-            };
-
-            const exportHistory = () => {
-                const data = {};
-                StorageManager.getAllRecords().forEach(({ key, record }) => data[key] = record);
-                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = `bilibili-history-${new Date().toISOString().slice(0, 10)}.json`;
-                a.click();
-                URL.revokeObjectURL(url);
-            };
-
-            const importHistory = () => {
-                const input = document.createElement('input');
-                input.type = 'file';
-                input.accept = '.json';
-                input.onchange = e => {
-                    const file = e.target.files[0];
-                    if (!file) return;
-                    const reader = new FileReader();
-                    reader.onload = ev => {
-                        try {
-                            const data = JSON.parse(ev.target.result);
-                            const result = StorageManager.importRecords(data);
-                            UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有记录)`, 'success', 4000);
-                            render();
-                        } catch (err) {
-                            UIComponent.toast('导入失败：文件格式错误', 'error');
+                while (runs.length > 1) {
+                    if (cancelled()) { const error = new Error('查询已取消'); error.name = 'AbortError'; throw error; }
+                    const next = [];
+                    for (let r = 0; r < runs.length; r += 2) {
+                        const a = runs[r], b = runs[r + 1] || [], merged = []; let i = 0, j = 0, start = performance.now();
+                        while (i < a.length || j < b.length) {
+                            merged.push(j >= b.length || i < a.length && compare(a[i], b[j]) <= 0 ? a[i++] : b[j++]);
+                            if (performance.now() - start >= 8) { this.recordSegment(performance.now() - start); await new Promise(resolve => setTimeout(resolve, 0)); start = performance.now(); }
                         }
-                    };
-                    reader.readAsText(file);
-                };
-                input.click();
-            };
-
-            const formatDateTime = (date) => {
-                const pad = n => String(n).padStart(2, '0');
-                return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
-            };
-
-            const getRetentionCutoff = (amount, unit) => {
-                const cutoff = new Date();
-                if (unit === 'months') cutoff.setMonth(cutoff.getMonth() - amount);
-                else if (unit === 'years') cutoff.setFullYear(cutoff.getFullYear() - amount);
-                else cutoff.setDate(cutoff.getDate() - amount);
-                return cutoff;
-            };
-
-            const getRetentionCleanupRequest = () => {
-                const amountInput = mask.querySelector('[data-action="retention-value"]');
-                const unitInput = mask.querySelector('[data-action="retention-unit"]');
-                const rawAmount = (amountInput?.value || '').trim();
-                if (!/^[0-9]+$/.test(rawAmount) || parseInt(rawAmount, 10) < 1) {
-                    UIComponent.toast('保留数量必须为正整数数字', 'error', 2500);
-                    if (amountInput) amountInput.focus();
-                    return null;
-                }
-                const unit = unitInput?.value || 'days';
-                return { amount: parseInt(rawAmount, 10), unit };
-            };
-
-            const getRetentionCandidates = (cutoff) => {
-                const cutoffTime = cutoff.getTime();
-                return StorageManager.getAllRecords()
-                    .filter(({ record }) => {
-                        const savedTime = record?.savedAt ? new Date(record.savedAt).getTime() : NaN;
-                        return Number.isFinite(savedTime) && savedTime < cutoffTime;
-                    })
-                    .map(({ key }) => key);
-            };
-
-            const deleteRecords = (keys) => {
-                const backups = keys.map(key => ({ key, record: StorageManager.getRecord(key) })).filter(item => item.record);
-                if (backups.length === 0) {
-                    UIComponent.toast('没有可删除的记录', 'error', 2000);
-                    return;
-                }
-
-                const runDelete = async () => {
-                    const keysToDelete = backups.map(({ key }) => key);
-                    const progress = backups.length > 1
-                        ? UIComponent.progressToast(`准备删除 ${backups.length} 条记录...`)
-                        : null;
-                    const deletedCount = progress
-                        ? await StorageManager.deleteRecordsWithProgress(keysToDelete, ({ processed, total, deleted, shardsDone, shardsTotal }) => {
-                            const percent = total > 0 ? (processed / total) * 100 : 100;
-                            progress.update(percent, `正在删除 ${processed}/${total} 条记录（${shardsDone}/${shardsTotal} 分片，已删 ${deleted} 条）`);
-                        }, false)
-                        : StorageManager.deleteRecords(keysToDelete, false);
-                    if (deletedCount === 0) {
-                        if (progress) progress.close('没有可删除的记录', 'error', 2000);
-                        else UIComponent.toast('没有可删除的记录', 'error', 2000);
-                        return;
+                        next.push(merged);
                     }
-                    StorageManager._notifyChange();
-                    if (progress) progress.close(`删除完成：${deletedCount} 条记录`, 'success', 1200);
-                    UIComponent.toastUndo(`已删除 ${deletedCount} 条记录，点击撤销`, 5000, () => {
-                        StorageManager.saveRecords(backups, false);
-                        StorageManager._notifyChange();
-                        render();
-                    });
-                    state.selected.clear();
-                    render();
-                };
-
-                if (backups.length > 1) {
-                    setTimeout(runDelete, 30);
-                } else {
-                    runDelete();
+                    runs = next;
                 }
-            };
-
-            const cleanupByRetention = () => {
-                const request = getRetentionCleanupRequest();
-                if (!request) return;
-
-                const unitLabels = { days: '天', months: '个月', years: '年' };
-                const cutoff = getRetentionCutoff(request.amount, request.unit);
-                const cutoffTime = cutoff.getTime();
-                if (!Number.isFinite(cutoffTime)) {
-                    UIComponent.toast('保留范围过大，无法计算清理时间', 'error', 2500);
-                    return;
+                if (version !== StorageManager._dataVersion) return this.query({ query, status, sort }, { cancelled });
+                return runs[0] || [];
+            })();
+            const result = await promise;
+            if (!cancelled() && version === StorageManager._dataVersion) this.results.set(cacheKey, result);
+            if (this.results.size > 24) this.results.delete(this.results.keys().next().value);
+            return result;
+        },
+        async stats(days) {
+            const rows = await this.model(), version = this.version;
+            const cacheKey = JSON.stringify([version, days, CONFIG.lowThreshold, CONFIG.highThreshold, Math.floor(Date.now() / 60000)]);
+            if (this.statsCache.has(cacheKey)) return this.statsCache.get(cacheKey);
+            const now = Date.now(), counts = { total: rows.length, watched: 0, visited: 0, recent7Days: 0, low: 0, mid: 0, high: 0, unfinished: 0 }, daily = new Map();
+            const md = ts => { const d = new Date(ts); return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+            await this.each(rows, row => {
+                if (row.record.status === RECORD_STATUS.WATCHED) counts.watched++;
+                if (row.record.status === RECORD_STATUS.VISITED) counts.visited++;
+                if (row.record.percent !== '') {
+                    counts[row.percent < CONFIG.lowThreshold ? 'low' : row.percent <= CONFIG.highThreshold ? 'mid' : 'high']++;
+                    if (row.percent < CONFIG.highThreshold) counts.unfinished++;
                 }
-
-                const keys = getRetentionCandidates(cutoff);
-                const cutoffText = formatDateTime(cutoff);
-                if (keys.length === 0) {
-                    UIComponent.toast(`没有早于 ${cutoffText} 的历史记录需要删除`, 'success', 3000);
-                    return;
-                }
-
-                const periodText = `${request.amount}${unitLabels[request.unit] || '天'}`;
-                const confirmed = window.confirm([
-                    `将保留最近 ${periodText} 的历史记录。`,
-                    `删除范围：保存时间早于 ${cutoffText} 的记录。`,
-                    `预计删除：${keys.length} 条。`,
-                    '',
-                    '确认删除这些久远历史记录？'
-                ].join('\n'));
-                if (!confirmed) return;
-
-                deleteRecords(keys);
-            };
-
-            mask.addEventListener('click', (e) => {
-                const target = e.target;
-                if (target === mask || target.dataset.action === 'close') mask.remove();
-                if (target.dataset.tab) {
-                    state.tab = target.dataset.tab;
-                    render();
-                }
-                if (target.dataset.action === 'page-first') {
-                    state.page = 1;
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'page-prev') {
-                    state.page = Math.max(1, state.page - 1);
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'page-next') {
-                    state.page++;
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'page-last') {
-                    state.page = Math.max(1, Math.ceil(getFilteredRows().length / state.pageSize));
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'save-settings') {
-                    const patch = {};
-                    mask.querySelectorAll('[data-setting]').forEach(input => {
-                        const key = input.dataset.setting;
-                        if (key in patch) return;
-                        if (input.type === 'checkbox') patch[key] = input.checked;
-                        else if (input.type === 'number' || input.type === 'range') patch[key] = parseInt(input.value, 10);
-                        else patch[key] = input.value;
-                    });
-                    if (patch.lowThreshold >= patch.highThreshold) {
-                        UIComponent.toast('低进度阈值必须小于高进度阈值', 'error');
-                        return;
-                    }
-                    SettingsManager.save(patch);
-                    UIComponent.refreshFloatingButtons();
-                    Utils.log('Settings saved', patch);
-                    UIComponent.toast('设置已保存', 'success', 2000);
-                    render();
-                }
-                if (target.dataset.action === 'reset-settings') {
-                    SettingsManager.reset();
-                    UIComponent.refreshFloatingButtons();
-                    Utils.log('Settings reset to default');
-                    UIComponent.toast('设置已恢复默认', 'success', 2000);
-                    render();
-                }
-                if (target.dataset.action === 'download-debug-log') {
-                    Utils.downloadDebugLog();
-                    UIComponent.toast('调试日志已下载', 'success', 2000);
-                }
-                if (target.dataset.action === 'clear-debug-log') {
-                    Utils.clearDebugLogs();
-                    UIComponent.toast('调试日志已清空', 'success', 2000);
-                }
-                if (target.dataset.action === 'reset-panel') {
-                    GM_deleteValue('bvh_panel_position');
-                    const panel = document.getElementById('bvh-view-panel');
-                    if (panel) {
-                        panel.style.left = '15px';
-                        panel.style.bottom = '15px';
-                        panel.style.top = 'auto';
-                    }
-                    UIComponent.toast('面板位置已恢复默认', 'success', 2000);
-                }
-                if (target.dataset.action === 'jump-current' && options.currentKey) {
-                    UIComponent.jumpToProgress(StorageManager.getRecord(options.currentKey));
-                }
-                if (target.dataset.action === 'export') exportHistory();
-                if (target.dataset.action === 'import') importHistory();
-                if (target.dataset.action === 'cleanup-retention') cleanupByRetention();
-                if (target.dataset.action === 'delete-one') deleteRecords([target.dataset.key]);
-                if (target.dataset.action === 'delete-selected') deleteRecords(Array.from(state.selected));
-                if (target.dataset.action === 'select-all') {
-                    const start = (state.page - 1) * state.pageSize;
-                    const rows = getFilteredRows().slice(start, start + state.pageSize);
-                    if (target.checked) rows.forEach(({ key }) => state.selected.add(key));
-                    else rows.forEach(({ key }) => state.selected.delete(key));
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'clear-search') {
-                    state.query = '';
-                    state.page = 1;
-                    state._cachedRows = null;
-                    const searchInput = mask.querySelector('[data-action="search"]');
-                    if (searchInput) searchInput.value = '';
-                    renderHistoryResults();
-                }
+                if (row.time >= now - 7 * 86400000) counts.recent7Days++;
+                if (row.time >= now - days * 86400000) daily.set(md(row.time), (daily.get(md(row.time)) || 0) + 1);
             });
-
-            mask.addEventListener('change', (e) => {
-                const target = e.target;
-                if (target.dataset.action === 'status-filter') {
-                    state.status = target.value;
-                    state.page = 1;
-                    state._cachedRows = null;
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'sort') {
-                    state.sort = target.value;
-                    state.page = 1;
-                    state._cachedRows = null;
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'page-size') {
-                    state.pageSize = parseInt(target.value, 10) || 50;
-                    state.page = 1;
-                    renderHistoryResults();
-                }
-                if (target.dataset.action === 'stats-range') {
-                    state.statsRange = parseInt(target.value, 10) || 30;
-                    renderStats();
-                }
-                if (target.dataset.key) {
-                    if (target.checked) state.selected.add(target.dataset.key);
-                    else state.selected.delete(target.dataset.key);
-                }
-            });
-
-            const updateSearchResults = Utils.debounce((value) => {
-                state.query = value;
-                state.page = 1;
-                state._cachedRows = null;
-                renderHistoryResults();
-            }, 300);
-
-            mask.addEventListener('input', (e) => {
-                const target = e.target;
-                if (target.dataset.setting === 'tagOpacity') {
-                    syncOpacityControls(target.value);
-                    return;
-                }
-                if (target.dataset.action === 'search') {
-                    updateSearchResults(target.value);
-                }
-            });
-
-            StorageManager.onDataChange(() => {
-                if (!document.contains(mask)) return;
-                state._cachedRows = null;
-                if (state.tab === 'history' && state._dataReady) renderHistoryResults();
-                if (state.tab === 'stats') renderStats();
-            });
-
-            render();
+            const result = { counts, days: Array.from({ length: days }, (_, i) => { const date = md(now - (days - 1 - i) * 86400000); return { date, value: daily.get(date) || 0 }; }) };
+            if (version !== StorageManager._dataVersion) return this.stats(days);
+            this.statsCache.set(cacheKey, result); return result;
         }
     };
+
+    const WorkbenchLayers = {
+        stack: [],
+        open(root, onEscape) {
+            const trigger = document.activeElement;
+            if (!this.stack.length) { this.overflow = document.body.style.overflow; document.body.style.overflow = 'hidden'; document.addEventListener('keydown', this.keydown, true); }
+            const previous = this.stack.at(-1);
+            if (previous) previous.root.inert = true;
+            const layer = { root, trigger, onEscape }; this.stack.push(layer);
+            const first = root.querySelector('[autofocus],button,input,select,[tabindex="-1"]'); first?.focus();
+            return () => {
+                const index = this.stack.indexOf(layer); if (index < 0) return;
+                this.stack.splice(index, 1); root.remove();
+                const top = this.stack.at(-1); if (top) top.root.inert = false;
+                if (!this.stack.length) { document.body.style.overflow = this.overflow; document.removeEventListener('keydown', this.keydown, true); }
+                if (trigger?.isConnected) trigger.focus();
+            };
+        },
+        keydown(event) {
+            const top = WorkbenchLayers.stack.at(-1); if (!top) return;
+            if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); top.onEscape(); }
+            if (event.key === 'Tab') {
+                const feedback = top.root.classList.contains('bvh-manager-mask') ? [...document.querySelectorAll('.bvh-toast button:not(:disabled)')] : [];
+                const items = [...top.root.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),a[href],[tabindex="0"]'), ...feedback].filter(el => el.getClientRects().length && !el.closest('[hidden]'));
+                if (!items.length) { event.preventDefault(); return; }
+                const index = items.indexOf(document.activeElement);
+                event.preventDefault();
+                items[index < 0 ? (event.shiftKey ? items.length - 1 : 0) : (index + (event.shiftKey ? -1 : 1) + items.length) % items.length].focus();
+            }
+        },
+        confirm(title, message, choices = [{ value: 'cancel', label: '取消' }, { value: 'confirm', label: '确认删除', danger: true }]) {
+            return new Promise(resolve => {
+                const root = document.createElement('div'); root.className = 'bvh-workbench bvh-dialog-mask';
+                root.innerHTML = `<section class="bvh-confirm" role="dialog" aria-modal="true" aria-labelledby="bvh-confirm-title"><div class="bvh-eyebrow">操作确认</div><h2 id="bvh-confirm-title">${Utils.escapeHTML(title)}</h2><p class="bvh-confirm-message">${Utils.escapeHTML(message)}</p><div class="bvh-dialog-actions">${choices.map(c => `<button data-choice="${c.value}" class="${c.danger ? 'danger' : c.primary ? 'primary' : ''}">${c.label}</button>`).join('')}</div></section>`;
+                document.body.append(root);
+                const finish = value => { close(); resolve(value); };
+                const close = this.open(root, () => finish('cancel'));
+                root.addEventListener('click', event => { const button = event.target.closest('[data-choice]'); if (button) finish(button.dataset.choice); else if (event.target === root) finish('cancel'); });
+            });
+        }
+    };
+
+    const workbenchIcon = name => {
+        const paths = { settings: '<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/>', history: '<path d="M4 4v5h5M4 9a8 8 0 1 1 0 7M12 7v5l3 2"/>', stats: '<path d="M4 20h16M7 16V9M12 16V4M17 16v-5"/>', close: '<path d="m6 6 12 12M18 6 6 18"/>', mark: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3Z"/>' };
+        return `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.mark}</svg>`;
+    };
+
+    class HistoryManagerPanel {
+        static active = null;
+        static show(options = {}) {
+            if (this.active && !this.active.disposed) { this.active.root.querySelector('[data-close]').focus(); return this.active; }
+            this.active = new this(options); return this.active;
+        }
+        constructor(options) {
+            this.options = options; this.draft = { ...CONFIG }; this.saved = { ...CONFIG }; this.tab = options.activeTab || 'settings';
+            this.state = { query: '', status: 'all', sort: 'savedAt-desc', page: 1, pageSize: 20, range: 30 };
+            this.selected = new Set(); this.generation = 0; this.previewState = 'mid'; this.busy = false; this.disposed = false;
+            this.root = document.createElement('div'); this.root.id = 'bvh-modal-mask'; this.root.className = 'bvh-workbench bvh-manager-mask';
+            this.root.innerHTML = `<section class="bvh-shell" role="dialog" aria-modal="true" aria-labelledby="bvh-page-title">
+                <aside class="bvh-nav"><div class="bvh-brand">${workbenchIcon('mark')}<span>观看记录<small>YOUR WATCH ARCHIVE</small></span></div><div class="bvh-nav-label">我的工作台</div><nav aria-label="管理面板">${[['settings', '偏好设置'], ['history', '历史管理'], ['stats', '数据统计']].map(([key, label]) => `<button data-tab="${key}">${workbenchIcon(key)}<span>${label}</span></button>`).join('')}</nav><div class="bvh-nav-note"><span class="bvh-dot"></span>记录每一次观看<small>数据保存在当前浏览器</small></div></aside>
+                <div class="bvh-main"><header class="bvh-page-header"><div><div class="bvh-eyebrow">BILIBILI · WATCH HISTORY</div><h1 id="bvh-page-title"></h1><p data-subtitle></p></div><button data-close class="bvh-close" aria-label="关闭管理面板">${workbenchIcon('close')}</button></header><main class="bvh-content"><section data-pane="settings"></section><section data-pane="history" hidden></section><section data-pane="stats" hidden></section></main><footer class="bvh-footer"></footer></div></section>`;
+            injectWorkbenchStyles(); document.body.append(this.root);
+            this.renderSettings(); this.historyShell(); this.renderTab();
+            this.closeLayer = WorkbenchLayers.open(this.root, () => this.requestClose());
+            this.root.addEventListener('click', event => this.click(event));
+            this.root.addEventListener('input', event => this.input(event));
+            this.root.addEventListener('change', event => this.change(event));
+            this.unsubscribe = StorageManager.onDataChange(change => {
+                if (this.disposed) return;
+                for (const key of this.selected) if (!StorageManager.getRecord(key)) this.selected.delete(key);
+                if (this.tab !== 'settings') this.refresh();
+            });
+        }
+        q(selector) { return this.root.querySelector(selector); }
+        get dirty() { return JSON.stringify(this.draft) !== JSON.stringify(this.saved); }
+        renderTab() {
+            const meta = { settings: ['偏好设置', '让观看记录，按照你的习惯呈现。'], history: ['历史管理', '找回看过的视频，继续尚未完成的内容。'], stats: ['数据统计', '从最近保存的记录，了解你的观看概况。'] }[this.tab];
+            this.q('#bvh-page-title').textContent = meta[0]; this.q('[data-subtitle]').textContent = meta[1];
+            this.root.querySelectorAll('[data-tab]').forEach(el => { el.setAttribute('aria-current', el.dataset.tab === this.tab ? 'page' : 'false'); });
+            this.root.querySelectorAll('[data-pane]').forEach(el => el.hidden = el.dataset.pane !== this.tab);
+            this.renderFooter(); this.refresh();
+        }
+        renderFooter(message = '') {
+            const settingsNav = this.q('[data-tab="settings"]');
+            settingsNav.dataset.dirty = String(this.dirty); settingsNav.title = this.dirty ? '偏好设置：有未保存的修改' : '偏好设置';
+            const footer = this.q('.bvh-footer');
+            if (this.tab === 'settings') footer.innerHTML = `<button data-action="defaults">恢复默认</button><span class="bvh-save-status" role="status">${Utils.escapeHTML(message || (this.dirty ? '有未保存的修改' : '设置已同步'))}</span><button class="primary" data-action="save" ${this.saving ? 'disabled' : ''}>${this.saving ? '正在保存…' : '保存设置'}</button>`;
+            else if (this.tab === 'history') footer.innerHTML = `<span data-page-info>正在准备记录…</span><label class="bvh-page-size">每页 <select data-page-size aria-label="每页记录数量">${[20, 30, 50, 100].map(n => `<option ${n === this.state.pageSize ? 'selected' : ''}>${n}</option>`).join('')}</select> 条</label><button data-action="prev" aria-label="上一页">上一页</button><button data-action="next" aria-label="下一页">下一页</button>`;
+            else footer.innerHTML = '<span>统计依据：每个视频 / 分 P 的最近保存记录，不代表累计观看时长。</span>';
+        }
+        renderSettings() {
+            const d = this.draft, esc = Utils.escapeHTML;
+            const toggle = (key, label, note) => `<div class="bvh-setting-row"><label for="bvh-setting-${key}">${label}<small>${note}</small></label><input class="bvh-switch" id="bvh-setting-${key}" data-setting="${key}" type="checkbox" ${d[key] ? 'checked' : ''}></div>`;
+            const threshold = (key, label) => `<label class="bvh-number-field">${label}<div><input id="bvh-setting-${key}" data-setting="${key}" type="number" min="1" max="99" value="${esc(d[key])}" aria-describedby="bvh-error-${key}"><span>%</span></div><small class="bvh-field-error" id="bvh-error-${key}"></small></label>`;
+            this.q('[data-pane="settings"]').innerHTML = `<div class="bvh-settings-layout"><div class="bvh-setting-groups">
+                <section class="bvh-section"><div class="bvh-section-heading"><span>01</span><h2>播放与提示</h2></div>${toggle('autoResumePrompt', '续播提示', '再次打开视频时，提示上次观看的位置。')}<div class="bvh-setting-row"><label for="bvh-setting-floatingButtonVisibility">悬浮入口<small>选择在哪些页面显示快捷入口。</small></label><select id="bvh-setting-floatingButtonVisibility" data-setting="floatingButtonVisibility">${[['show-all', '所有页面显示'], ['hide-video', '仅非视频页显示'], ['hide-non-video', '仅视频页显示'], ['hide-all', '全部隐藏']].map(([value, text]) => `<option value="${value}" ${d.floatingButtonVisibility === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div></section>
+                <section class="bvh-section"><div class="bvh-section-heading"><span>02</span><h2>页面标记</h2></div>${toggle('showProgressBar', '观看进度条', '在视频封面上显示已观看的进度。')}${toggle('showVisitedTag', '已访问标签', '标记打开过、但还未开始观看的视频。')}</section>
+                <section class="bvh-section"><div class="bvh-section-heading"><span>03</span><h2>标签样式</h2></div><fieldset class="bvh-position"><legend>标签位置</legend><div>${[['top-left', '左上'], ['top-right', '右上'], ['bottom-left', '左下'], ['bottom-right', '右下']].map(([value, label]) => `<label><input type="radio" name="bvh-position" data-setting="tagPosition" value="${value}" ${d.tagPosition === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset><div class="bvh-setting-row"><label for="bvh-opacity-number">标签透明度<small>数值越高，标签越清晰。</small></label><div class="bvh-opacity"><input aria-label="标签透明度滑块" type="range" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><input id="bvh-opacity-number" type="number" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><span>%</span></div></div><div class="bvh-thresholds">${threshold('lowThreshold', '低进度分界')}${threshold('highThreshold', '高进度分界')}</div><p class="bvh-help">低于低分界为低进度；超过高分界为高进度。</p></section>
+                <section class="bvh-section"><div class="bvh-section-heading"><span>04</span><h2>诊断与维护</h2></div>${toggle('debug', '调试日志', '需要排查问题时开启，记录脚本运行信息。')}<div class="bvh-maintenance-links"><button data-action="download-log">下载日志</button><button data-action="clear-log">清空日志</button><button data-action="reset-position">恢复悬浮位置</button>${this.options.currentKey && StorageManager.getRecord(this.options.currentKey)?.currentTime ? '<button data-action="jump">跳转到已记录进度</button>' : ''}</div><details class="bvh-storage-tools"><summary>存储维护</summary><p class="bvh-help">以下离线操作需要先关闭其他所有运行本脚本的页面。</p><button data-action="staging-info">检查暂存数据</button><button data-action="cleanup-staging">离线清理暂存数据</button><button data-action="legacy-snapshot">生成旧版兼容快照</button><p data-storage-info role="status"></p></details></section>
+                </div><aside class="bvh-preview-panel"><div class="bvh-eyebrow">LIVE PREVIEW</div><h2>标记效果预览</h2><p>调整左侧选项，即时查看效果。</p><div class="bvh-preview-cover"><div class="bvh-preview-art">${workbenchIcon('mark')}<span>每一段观看，都有迹可循。</span><small>WATCH · PAUSE · CONTINUE</small></div><div data-preview-tag></div><div data-preview-bar></div><span class="bvh-preview-duration">12:48</span></div><h3>下一次，从这里继续</h3><p class="bvh-preview-caption">演示画幅 · 仅用于样式预览</p><div class="bvh-preview-states" aria-label="预览记录类型">${[['visited', '已访问'], ['low', '低进度'], ['mid', '中进度'], ['high', '高进度'], ['multi', '多 P']].map(([v, l]) => `<button data-preview="${v}" aria-pressed="${v === this.previewState}">${l}</button>`).join('')}</div><div class="bvh-preview-note"><span class="bvh-dot"></span>预览不会修改实际记录<br><small>保存设置后，页面上的标记才会更新。</small></div></aside></div>`;
+            this.renderPreview();
+        }
+        renderPreview() {
+            const d = this.draft, state = this.previewState, p = { low: 15, mid: 55, high: 95, multi: 55 }[state];
+            const tag = this.q('[data-preview-tag]'), bar = this.q('[data-preview-bar]');
+            tag.className = 'bvh-preview-tag';
+            tag.textContent = state === 'visited' ? '已访问' : state === 'multi' ? '已记录 多P' : `已观看 ${p}%`;
+            const color = state === 'visited' ? '#626D78' : state === 'multi' ? '#007EAD' : p < Number(d.lowThreshold) ? '#93611A' : p <= Number(d.highThreshold) ? '#007EAD' : '#23734E';
+            tag.style.cssText = `background:${color};opacity:${Number(d.tagOpacity) / 100};${d.tagPosition.includes('top') ? 'top' : 'bottom'}:12px;${d.tagPosition.includes('left') ? 'left' : 'right'}:12px`;
+            tag.hidden = state === 'visited' && !d.showVisitedTag;
+            bar.className = 'bvh-preview-bar'; bar.style.width = `${p || 0}%`; bar.style.background = color; bar.hidden = !d.showProgressBar || state === 'visited' || state === 'multi';
+            this.root.querySelectorAll('[data-preview]').forEach(el => el.setAttribute('aria-pressed', el.dataset.preview === state));
+        }
+        historyShell() {
+            this.q('[data-pane="history"]').innerHTML = `<div class="bvh-search-row"><label class="bvh-search">${workbenchIcon('history')}<input data-query aria-label="搜索标题或视频编号" placeholder="搜索视频标题、BV / AV 编号…"></label><button data-action="clear-query">清除</button></div><div class="bvh-history-tools"><label>状态 <select data-filter="status"><option value="all">全部记录</option><option>已观看</option><option>已访问</option></select></label><label>排序 <select data-filter="sort"><option value="savedAt-desc">最近保存优先</option><option value="savedAt-asc">最早保存优先</option><option value="percent-desc">进度从高到低</option><option value="percent-asc">进度从低到高</option><option value="title-asc">标题顺序</option></select></label><div class="bvh-tool-spacer"></div><button data-action="import">导入</button><button data-action="export">导出记录</button></div><div class="bvh-selection-bar"><span data-selection-info>选择记录后可批量操作</span><button data-action="clear-selection">取消选择</button><button class="danger" data-action="delete-selected" disabled>删除选中</button></div><div data-results aria-live="polite"></div><details class="bvh-retention"><summary>数据维护 · 清理久远记录</summary><div><label>保留最近 <input data-retention-value type="number" min="1" step="1" value="6" aria-label="保留数量"></label><select data-retention-unit aria-label="保留时间单位"><option value="months">个月</option><option value="days">天</option><option value="years">年</option></select><button class="danger" data-action="retention">检查清理范围</button></div><p>清理全部历史中的过期记录，不受搜索、筛选或勾选范围影响；确认前会显示截止时间和记录数量。</p></details>`;
+        }
+        async refresh() {
+            if (this.tab === 'settings' || this.disposed) return;
+            const generation = ++this.generation, tab = this.tab;
+            const target = this.q(tab === 'history' ? '[data-results]' : '[data-pane="stats"]');
+            target.innerHTML = '<div class="bvh-empty" role="status"><span class="bvh-loader"></span><h3>正在整理记录…</h3><p>你可以继续搜索、切换页签或关闭面板。</p></div>';
+            try {
+                const result = tab === 'history' ? await HistoryQueries.query(this.state, { cancelled: () => this.disposed || generation !== this.generation }) : await HistoryQueries.stats(this.state.range);
+                if (this.disposed || generation !== this.generation || tab !== this.tab) return;
+                if (tab === 'history') { this.filtered = result; this.renderHistory(); } else this.renderStats(result);
+            } catch (error) {
+                if (this.disposed || generation !== this.generation) return;
+                target.innerHTML = `<div class="bvh-empty"><h3>记录暂时无法加载</h3><p>${Utils.escapeHTML(error.message)}</p><button data-action="retry">重试</button></div>`;
+            }
+        }
+        renderHistory() {
+            const rows = this.filtered || [], pages = Math.max(1, Math.ceil(rows.length / this.state.pageSize));
+            this.state.page = Math.min(pages, Math.max(1, this.state.page));
+            this.pageRows = rows.slice((this.state.page - 1) * this.state.pageSize, this.state.page * this.state.pageSize);
+            const esc = Utils.escapeHTML;
+            this.q('[data-results]').innerHTML = rows.length ? `<div class="bvh-table-scroll"><table><thead><tr><th><input data-select-page type="checkbox" aria-label="选择当前页全部记录"></th><th>视频记录</th><th>观看进度</th><th>最近保存</th><th><span class="bvh-sr-only">操作</span></th></tr></thead><tbody>${this.pageRows.map(row => `<tr><td><input type="checkbox" data-select="${row.key}" ${this.selected.has(row.key) ? 'checked' : ''} aria-label="选择 ${esc(row.record.title || row.key)}"></td><td class="bvh-title-cell"><a href="https://www.bilibili.com/video/${row.key}" target="_blank" rel="noopener" title="${esc(row.record.title)}">${esc(row.record.title || '未记录标题')}</a><small>${esc(row.key)} <span class="bvh-status-badge">${esc(row.record.status)}</span></small></td><td><span class="bvh-progress-number">${esc(row.record.percent || '—')}</span><div class="bvh-row-progress"><i style="width:${row.percent}%"></i></div></td><td class="bvh-time-cell">${esc(row.record.savedAt)}</td><td><button class="bvh-text-danger" data-delete="${row.key}" aria-label="删除 ${esc(row.record.title || row.key)}">删除</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="bvh-empty">${workbenchIcon('history')}<h3>${StorageManager.getAllKeys().length ? '没有匹配的记录' : '你的观看记录，从下一次播放开始'}</h3><p>${StorageManager.getAllKeys().length ? '试试其他关键词，或清除当前筛选条件。' : '观看视频后会自动记录，也可以导入已有备份。'}</p><button data-action="${StorageManager.getAllKeys().length ? 'clear-query' : 'import'}">${StorageManager.getAllKeys().length ? '清除筛选' : '导入历史备份'}</button></div>`;
+            this.q('[data-page-info]').textContent = `共 ${rows.length.toLocaleString()} 条 · ${this.state.page} / ${pages} 页`;
+            this.q('[data-action="prev"]').disabled = this.state.page <= 1;
+            this.q('[data-action="next"]').disabled = this.state.page >= pages;
+            this.selectionState();
+        }
+        selectionState() {
+            const count = (this.pageRows || []).filter(row => this.selected.has(row.key)).length;
+            const all = this.q('[data-select-page]'); if (all) { all.checked = count > 0 && count === this.pageRows.length; all.indeterminate = count > 0 && count < this.pageRows.length; }
+            this.q('[data-selection-info]').textContent = this.selected.size ? `已选择 ${this.selected.size} 条记录（保留跨页选择）` : '选择记录后可批量操作';
+            this.q('[data-action="delete-selected"]').disabled = !this.selected.size || this.busy;
+        }
+        renderStats({ counts: c, days }) {
+            const ratio = c.total ? Math.round(c.high / c.total * 100) : 0, max = Math.max(1, ...days.map(d => d.value));
+            const distribution = (title, items) => `<section class="bvh-section bvh-chart-card"><h2>${title}</h2>${items.map(([label, value, color]) => `<div class="bvh-distribution"><div><span>${label}</span><strong>${value.toLocaleString()}</strong></div><div><i style="width:${c.total ? value / c.total * 100 : 0}%;background:${color}"></i></div></div>`).join('')}</section>`;
+            this.q('[data-pane="stats"]').innerHTML = `<div class="bvh-stat-summary">${[['全部记录', c.total], ['已观看', c.watched], ['已访问', c.visited], ['近七天记录', c.recent7Days]].map(([l, n], i) => `<section class="${i === 0 ? 'featured' : ''}"><span>${l}</span><strong>${n.toLocaleString()}</strong><small>${i === 0 ? '视频与分 P 独立计数' : i === 3 ? '按最近保存时间' : '条记录'}</small></section>`).join('')}</div>${!c.total ? '<p class="bvh-empty-inline">还没有历史记录。开始观看后，这里会展示你的记录概况。</p>' : ''}<div class="bvh-stats-grid"><section class="bvh-section bvh-chart-card"><h2>高进度占比</h2><div class="bvh-donut"><svg viewBox="0 0 160 160" role="img" aria-label="高进度占比 ${ratio}%"><circle cx="80" cy="80" r="61" fill="none" stroke="#E8EDEB" stroke-width="12"/><circle cx="80" cy="80" r="61" fill="none" stroke="#23734E" stroke-width="12" pathLength="100" stroke-dasharray="${ratio} 100" transform="rotate(-90 80 80)"/><text x="80" y="85" text-anchor="middle" fill="#20262E" font-size="30" font-weight="600">${ratio}%</text><text x="80" y="105" text-anchor="middle" fill="#626D78" font-size="10">${c.high} / ${c.total} 条</text></svg></div><p class="bvh-help">进度超过 ${CONFIG.highThreshold}% 的记录 ÷ 全部记录</p></section>${distribution('记录状态', [['已观看', c.watched, '#007EAD'], ['已访问', c.visited, '#A1ADB4']])}${distribution('观看进度分布', [['低进度', c.low, '#93611A'], ['中进度', c.mid, '#007EAD'], ['高进度', c.high, '#23734E']])}</div><section class="bvh-section bvh-trend"><div class="bvh-trend-heading"><div><h2>近期记录趋势</h2><p>最近 ${this.state.range} 天 · 按最近保存时间统计</p></div><div class="bvh-range-buttons">${[7, 30, 90].map(n => `<button data-range="${n}" aria-pressed="${n === this.state.range}">${n} 天</button>`).join('')}</div></div><div class="bvh-chart-scroll"><svg viewBox="0 0 720 180" role="img" aria-label="近 ${days.length} 天记录趋势，最多每天 ${max} 条"><path d="M16 140H704M16 80H704M16 20H704" stroke="#DFE4E8" stroke-dasharray="3 5"/>${days.map((d, i) => { const width = 680 / days.length, height = d.value / max * 110; return `<g><rect x="${20 + i * width}" y="${140 - height}" width="${Math.max(2, width - 3)}" height="${height}" rx="2" fill="#007EAD"><title>${d.date}：${d.value} 条</title></rect>${i === 0 || i === days.length - 1 || i % Math.ceil(days.length / 6) === 0 ? `<text x="${20 + i * width}" y="165" fill="#626D78" font-size="10">${d.date}</text>` : ''}</g>`; }).join('')}</svg></div><details><summary>查看每日数值</summary><div class="bvh-daily-values">${days.map(d => `<span>${d.date}<strong>${d.value} 条</strong></span>`).join('')}</div></details></section>`;
+        }
+        input(event) {
+            const el = event.target;
+            if (el.matches('[data-query]')) { this.state.query = el.value; this.state.page = 1; clearTimeout(this.searchTimer); this.generation++; this.searchTimer = setTimeout(() => this.refresh(), 180); }
+            if (el.dataset.setting) {
+                const key = el.dataset.setting; this.draft[key] = el.type === 'checkbox' ? el.checked : el.value;
+                if (key === 'tagOpacity') this.root.querySelectorAll('[data-setting="tagOpacity"]').forEach(other => { if (other !== el) other.value = el.value; });
+                this.renderPreview(); this.renderFooter();
+            }
+        }
+        change(event) {
+            const el = event.target;
+            if (el.dataset.setting) this.input(event);
+            if (el.dataset.filter) { this.state[el.dataset.filter] = el.value; this.state.page = 1; this.refresh(); }
+            if (el.hasAttribute('data-page-size')) { this.state.pageSize = Number(el.value); this.state.page = 1; if (this.filtered) this.renderHistory(); }
+            if (el.dataset.select) { el.checked ? this.selected.add(el.dataset.select) : this.selected.delete(el.dataset.select); this.selectionState(); }
+            if (el.hasAttribute('data-select-page')) { for (const row of this.pageRows) el.checked ? this.selected.add(row.key) : this.selected.delete(row.key); this.renderHistory(); }
+        }
+        async click(event) {
+            const button = event.target.closest('button');
+            if (event.target === this.root || button?.hasAttribute('data-close')) { await this.requestClose(); return; }
+            if (!button) return;
+            if (button.dataset.tab) { this.tab = button.dataset.tab; this.generation++; this.renderTab(); return; }
+            if (button.dataset.preview) { this.previewState = button.dataset.preview; this.renderPreview(); return; }
+            if (button.dataset.range) { this.state.range = Number(button.dataset.range); this.refresh(); return; }
+            if (button.dataset.delete) { await this.deleteKeys([button.dataset.delete]); return; }
+            const action = button.dataset.action;
+            try {
+                if (action === 'save') await this.save();
+                if (action === 'defaults') { this.draft = { ...DEFAULT_CONFIG }; this.renderSettings(); this.renderFooter(); }
+                if (action === 'retry') this.refresh();
+                if ((action === 'prev' || action === 'next') && this.filtered) { this.state.page += action === 'prev' ? -1 : 1; this.renderHistory(); }
+                if (action === 'clear-selection') { this.selected.clear(); this.renderHistory(); }
+                if (action === 'clear-query') { this.state.query = ''; this.state.status = 'all'; this.q('[data-query]').value = ''; this.q('[data-filter="status"]').value = 'all'; this.state.page = 1; this.refresh(); }
+                if (action === 'delete-selected') await this.deleteKeys([...this.selected]);
+                if (action === 'retention') await this.retention();
+                if (action === 'export') await this.export();
+                if (action === 'import') this.import();
+                if (action === 'download-log') Utils.downloadDebugLog();
+                if (action === 'clear-log') { Utils.clearDebugLogs(); UIComponent.toast('日志已清空', 'success'); }
+                if (action === 'reset-position') { GM_deleteValue('bvh_panel_position'); const panel = document.getElementById('bvh-view-panel'); if (panel) Object.assign(panel.style, { left: '15px', bottom: '15px', top: 'auto' }); UIComponent.toast('悬浮位置已恢复', 'success'); }
+                if (action === 'jump') {
+                    if (EpisodeResolver.getCurrentKey() === this.options.currentKey) UIComponent.jumpToProgress(StorageManager.getRecord(this.options.currentKey));
+                    else UIComponent.toast('视频已切换，请重新打开当前视频的管理面板', 'info');
+                }
+                if (action === 'staging-info') { const info = await StorageManager._store.stagingInfo(); this.q('[data-storage-info]').textContent = `未提交暂存块 ${info.count} 个，占用约 ${(info.bytes / 1024).toFixed(1)} KB；不会参与历史查询。`; }
+                if (action === 'cleanup-staging' || action === 'legacy-snapshot') {
+                    const choice = await WorkbenchLayers.confirm('确认所有其他写入页面已关闭', action === 'cleanup-staging' ? '只清理未提交的暂存块。请先关闭其他运行本脚本的页面，避免中断正在提交的记录。' : '将当前完整记录写成旧版可读快照。请先关闭其他运行本脚本的页面，并保存一份导出备份。', [{ value: 'cancel', label: '取消' }, { value: 'confirm', label: '已关闭其他页面，继续', primary: true }]);
+                    if (choice === 'confirm') { await StorageManager._enqueue(async () => { if (action === 'cleanup-staging') await StorageManager._store.cleanupStaging({ writersStopped: true }); else await StorageManager.createLegacySnapshot({ writersStopped: true }); }); UIComponent.toast('离线维护完成', 'success'); }
+                }
+            } catch (error) { UIComponent.toast(error.message || '操作失败，请重试', 'error', 5000); }
+        }
+        async save() {
+            if (this.saving) return false;
+            const errors = {}, next = { ...this.draft };
+            for (const key of ['lowThreshold', 'highThreshold', 'tagOpacity']) {
+                const raw = String(next[key]).trim(), number = Number(raw), min = key === 'tagOpacity' ? 40 : 1, max = key === 'tagOpacity' ? 100 : 99;
+                if (!raw || !Number.isFinite(number) || !Number.isInteger(number) || number < min || number > max) errors[key] = `请输入 ${min}–${max} 的整数`;
+                else next[key] = number;
+            }
+            if (!errors.lowThreshold && !errors.highThreshold && next.lowThreshold >= next.highThreshold) errors.highThreshold = '高分界必须大于低分界';
+            for (const key of ['lowThreshold', 'highThreshold']) { const input = this.q(`[data-setting="${key}"]`); input.setAttribute('aria-invalid', !!errors[key]); this.q(`#bvh-error-${key}`).textContent = errors[key] || ''; }
+            if (Object.keys(errors).length) { this.tab = 'settings'; this.renderTab(); this.renderFooter(Object.values(errors)[0]); this.q(`[data-setting="${Object.keys(errors)[0]}"]`).focus(); return false; }
+            this.saving = true; this.renderFooter();
+            try {
+                await SettingsManager.save(next); this.saved = { ...next }; this.draft = { ...next };
+                UIComponent.refreshFloatingButtons(); this.renderFooter('已保存'); return true;
+            } catch (error) { this.renderFooter('保存失败：' + error.message); UIComponent.toast('设置保存失败，输入已保留', 'error'); return false; }
+            finally { this.saving = false; const button = this.q('[data-action="save"]'); if (button) { button.disabled = false; button.textContent = '保存设置'; } }
+        }
+        async requestClose() {
+            if (this.closing || this.disposed) return; this.closing = true;
+            try {
+                if (this.dirty) {
+                    const choice = await WorkbenchLayers.confirm('保存这次设置修改？', '你的设置草稿尚未应用。可以保存后关闭，或放弃本次修改。', [{ value: 'cancel', label: '继续编辑' }, { value: 'discard', label: '放弃修改' }, { value: 'save', label: '保存后关闭', primary: true }]);
+                    if (choice === 'cancel' || choice === 'save' && !await this.save()) return;
+                }
+                this.dispose();
+            } finally { this.closing = false; }
+        }
+        dispose() { if (this.disposed) return; this.disposed = true; this.generation++; clearTimeout(this.searchTimer); this.unsubscribe?.(); this.closeLayer?.(); if (HistoryManagerPanel.active === this) HistoryManagerPanel.active = null; }
+        async export() {
+            await StorageManager.initialize();
+            const data = Object.fromEntries(StorageManager.getAllRecords().map(({ key, record }) => [key, record]));
+            const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+            const a = document.createElement('a'); a.href = url; a.download = `bilibili-history-${new Date().toISOString().slice(0, 10)}.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+        import() {
+            if (this.busy) return;
+            const input = document.createElement('input'); input.type = 'file'; input.accept = '.json';
+            input.onchange = async () => {
+                if (!input.files[0]) return; this.busy = true;
+                const feedback = UIComponent.progressToast('正在校验并导入记录…');
+                try { const result = await StorageManager.importRecords(JSON.parse(await input.files[0].text())); feedback.close(`导入 ${result.count} 条，跳过 ${result.skipCount} 条已有记录`, 'success', 4000); if (!this.disposed) this.refresh(); }
+                catch (error) { feedback.close('导入失败：' + error.message, 'error', 6000); }
+                finally { this.busy = false; }
+            }; input.click();
+        }
+        async deleteKeys(keys, confirmed = false) {
+            if (this.busy || !keys.length) return;
+            if (!confirmed && await WorkbenchLayers.confirm('删除选中的记录？', `预计删除 ${keys.length} 条记录。成功后 5 秒内可以撤销。`) !== 'confirm') return;
+            this.busy = true; this.selectionState(); const progress = UIComponent.progressToast(`正在提交 ${keys.length} 条删除…`);
+            try {
+                const result = await StorageManager.deleteRecords(keys, true, { details: true });
+                progress.close(`已删除 ${result.count} 条记录`, 'success', 1800);
+                UIComponent.toastUndo(`已删除 ${result.count} 条记录`, 5000, async () => { const count = await StorageManager.undoDelete(result); return `撤销完成：恢复 ${count} 条，跳过 ${result.count - count} 条已变化记录`; });
+                for (const key of keys) this.selected.delete(key); if (!this.disposed) this.refresh();
+            } catch (error) { progress.close('删除失败：' + error.message, 'error', 5000); }
+            finally { this.busy = false; if (!this.disposed) this.selectionState(); }
+        }
+        async retention() {
+            const raw = this.q('[data-retention-value]').value, amount = Number(raw), unit = this.q('[data-retention-unit]').value;
+            if (!/^\d+$/.test(raw) || !Number.isSafeInteger(amount) || amount < 1) throw new Error('保留数量必须为正整数');
+            const cutoff = new Date(); if (unit === 'months') cutoff.setMonth(cutoff.getMonth() - amount); else if (unit === 'years') cutoff.setFullYear(cutoff.getFullYear() - amount); else cutoff.setDate(cutoff.getDate() - amount);
+            if (!Number.isFinite(cutoff.getTime())) throw new Error('保留范围过大，无法计算截止时间');
+            const rows = await HistoryQueries.model(), keys = rows.filter(row => Number.isFinite(row.time) && row.time < cutoff.getTime()).map(row => row.key);
+            if (!keys.length) { UIComponent.toast('没有需要清理的记录', 'success'); return; }
+            const period = amount + { days: '天', months: '个月', years: '年' }[unit];
+            const result = await WorkbenchLayers.confirm('清理久远的历史记录', `保留最近 ${period} 的记录。\n截止时间：${cutoff.toLocaleString('zh-CN', { hour12: false })}\n删除范围：全部历史中保存时间早于截止时间的记录（不受搜索、筛选或勾选影响）。\n预计删除：${keys.length} 条。`);
+            if (result === 'confirm') await this.deleteKeys(keys, true);
+        }
+    }
+
+    let workbenchStylesInjected = false;
+    function injectWorkbenchStyles() {
+        if (workbenchStylesInjected) return; workbenchStylesInjected = true;
+        GM_addStyle(`
+        .bvh-workbench{--bvh-ink:#20262E;--bvh-muted:#626D78;--bvh-line:#DFE4E8;--bvh-blue:#007EAD;--bvh-paper:#F5F4F0;color:var(--bvh-ink);font:14px/1.6 "HarmonyOS Sans SC","Source Han Sans SC","Microsoft YaHei",sans-serif;font-variant-numeric:tabular-nums;text-align:left;color-scheme:light}
+        .bvh-workbench *{box-sizing:border-box}.bvh-workbench [hidden]{display:none!important}.bvh-workbench h1,.bvh-workbench h2,.bvh-workbench h3,.bvh-workbench p{margin:0}.bvh-workbench h1{font-size:24px;line-height:1.4;font-weight:650}.bvh-workbench h2{font-size:15px;font-weight:650}.bvh-workbench h3{font-size:14px;font-weight:600}.bvh-workbench small{font-size:12px}.bvh-workbench button,.bvh-workbench input,.bvh-workbench select{font:inherit;color:inherit}.bvh-workbench button,.bvh-workbench select,.bvh-workbench input:not([type=checkbox]):not([type=radio]):not([type=range]){border:1px solid var(--bvh-line);border-radius:8px;background:white;min-height:40px;padding:8px 12px;line-height:1.4}.bvh-workbench button{cursor:pointer;transition:background .15s,border-color .15s;white-space:nowrap}.bvh-workbench button:hover{background:#EBF3F6;border-color:#B5CFDA}.bvh-workbench button:disabled{opacity:.45;cursor:default}.bvh-workbench button.primary{background:var(--bvh-blue);border-color:var(--bvh-blue);color:white}.bvh-workbench button.primary:hover{background:#00698F}.bvh-workbench button.danger{color:#BF414B;border-color:#E8BEC2;background:#FFF8F8}.bvh-workbench :focus-visible{outline:3px solid #007EAD;outline-offset:3px}.bvh-workbench input[type=checkbox],.bvh-workbench input[type=radio],.bvh-workbench input[type=range]{accent-color:var(--bvh-blue)}.bvh-workbench input[type=checkbox]{width:17px;height:17px;cursor:pointer}.bvh-workbench input[type=number]{width:80px}.bvh-workbench a{color:inherit;text-decoration:none}.bvh-workbench a:hover{color:var(--bvh-blue)}
+        .bvh-manager-mask,.bvh-dialog-mask{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(21,30,39,.48);z-index:2147483000;isolation:isolate}.bvh-shell{display:grid;grid-template-columns:184px minmax(0,1fr);width:min(1120px,100%);height:min(840px,calc(100dvh - 48px));background:var(--bvh-paper);border-radius:18px;overflow:hidden;box-shadow:0 24px 100px #0D192D55}.bvh-nav{padding:32px 16px 24px;background:#20262E;color:#F7F8FA;display:flex;flex-direction:column}.bvh-brand{display:flex;align-items:center;gap:10px;padding:0 8px;font-size:17px;font-weight:600}.bvh-brand>svg{width:28px;height:28px;color:#56CCF3}.bvh-brand small{display:block;font-size:8px;letter-spacing:1.3px;color:#AAB4BD;margin-top:3px}.bvh-nav-label{font-size:10px;letter-spacing:2px;color:#9BA7B1;margin:44px 12px 12px}.bvh-nav nav{display:grid;gap:8px}.bvh-nav button{display:flex;align-items:center;gap:12px;text-align:left;background:transparent;border-color:transparent;color:#C0C9D0;border-radius:8px;padding:12px;min-height:46px}.bvh-nav button:hover{color:white;background:#2B3540;border-color:transparent}.bvh-nav button[aria-current=page]{color:#F7F8FA;background:#344551;box-shadow:inset 3px 0 #00AEEC}.bvh-nav button[aria-current=page] svg{color:#72D4F6}.bvh-nav-note{margin-top:auto;padding:20px 8px 0;font-size:11px;color:#C0C9D0}.bvh-nav-note small{display:block;font-size:10px;color:#9AA7B2;margin-top:6px}.bvh-dot{display:inline-block;width:6px;height:6px;background:#58C19D;border-radius:50%;margin-right:7px;vertical-align:middle}.bvh-main{display:flex;min-width:0;min-height:0;flex-direction:column}.bvh-page-header{display:flex;justify-content:space-between;gap:20px;padding:28px 32px 24px;border-bottom:1px solid var(--bvh-line);flex-shrink:0}.bvh-eyebrow{font-size:9px;font-weight:600;letter-spacing:2px;color:var(--bvh-muted);margin-bottom:8px}.bvh-page-header p{font-size:12px;color:var(--bvh-muted);margin-top:8px}.bvh-workbench .bvh-close{border-color:transparent;background:transparent;width:36px;min-height:36px;height:36px;display:grid;place-items:center;padding:8px}.bvh-content{overflow-y:auto;min-height:0;padding:24px 32px;flex:1;scrollbar-width:thin;overscroll-behavior:contain}.bvh-footer{padding:16px 32px;min-height:73px;border-top:1px solid var(--bvh-line);background:#FFFEFC;display:flex;align-items:center;gap:12px;flex-shrink:0;font-size:12px}.bvh-footer>span:first-child{margin-right:auto}.bvh-save-status{margin-left:auto;color:var(--bvh-muted)}.bvh-settings-layout{display:grid;grid-template-columns:minmax(0,1fr) 246px;gap:24px;align-items:start}.bvh-setting-groups{min-width:0;display:grid;gap:20px}.bvh-section{padding:20px;background:white;border:1px solid var(--bvh-line);border-radius:12px}.bvh-section-heading{display:flex;gap:10px;align-items:center;margin-bottom:8px}.bvh-section-heading>span{font-size:10px;color:#8C9BA5;letter-spacing:1px}.bvh-setting-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 0;border-bottom:1px solid #EEF0F2}.bvh-setting-row:last-child{border-bottom:0;padding-bottom:0}.bvh-setting-row label{font-size:13px;flex:1;min-width:0}.bvh-setting-row label small{display:block;color:var(--bvh-muted);font-size:11px;margin-top:4px}.bvh-setting-row select{max-width:160px;font-size:12px}.bvh-workbench input.bvh-switch{appearance:none;width:36px;height:21px;border:0;border-radius:14px;background:#C7CFD5;position:relative;flex-shrink:0;margin:0;transition:background .15s}.bvh-switch:before{content:"";position:absolute;width:15px;height:15px;top:3px;left:3px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0002;transition:transform .15s}.bvh-workbench input.bvh-switch:checked{background:var(--bvh-blue)}.bvh-switch:checked:before{transform:translateX(15px)}.bvh-position{border:0;padding:12px 0;margin:0}.bvh-position legend{font-size:12px;padding:0;margin:0 0 8px}.bvh-position>div{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.bvh-position label{cursor:pointer;position:relative}.bvh-position input{position:absolute;opacity:0;width:100%;height:100%;margin:0}.bvh-position span{display:block;text-align:center;border:1px solid var(--bvh-line);border-radius:7px;padding:9px 2px;font-size:12px}.bvh-position input:checked+span{border-color:var(--bvh-blue);color:var(--bvh-blue);background:#EFF8FB}.bvh-position input:focus-visible+span{outline:3px solid var(--bvh-blue);outline-offset:2px}.bvh-opacity{display:flex;align-items:center;gap:7px}.bvh-opacity input[type=range]{width:74px}.bvh-opacity input[type=number]{width:64px!important;padding:8px!important}.bvh-thresholds{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding-top:16px}.bvh-number-field{font-size:12px}.bvh-number-field>div{display:flex;align-items:center;gap:8px;margin-top:8px}.bvh-field-error{display:block;color:#BF414B;min-height:16px;padding-top:3px}.bvh-workbench [aria-invalid=true]{border-color:#BF414B!important}.bvh-help{font-size:11px;color:var(--bvh-muted);line-height:1.7}.bvh-maintenance-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.bvh-maintenance-links button{font-size:11px;padding:7px 10px;min-height:34px}.bvh-storage-tools{font-size:11px;margin-top:16px}.bvh-storage-tools button{font-size:11px;margin:8px 4px 0 0}.bvh-workbench summary{cursor:pointer;padding:8px 0}.bvh-preview-panel{position:sticky;top:0;min-width:0;padding-top:4px}.bvh-preview-panel>p{font-size:11px;color:var(--bvh-muted);margin-top:8px}.bvh-preview-cover{position:relative;aspect-ratio:16/10;border-radius:10px;overflow:hidden;background:#DDE6E9;margin:20px 0 12px}.bvh-preview-art{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;background:linear-gradient(135deg,#D9E5E8,#EAEDEA);color:#576C76}.bvh-preview-art:before,.bvh-preview-art:after{content:"";position:absolute;border:1px solid #FFF8;border-radius:50%;width:190px;height:190px;right:-65px;top:-100px}.bvh-preview-art:after{width:140px;height:140px;right:-40px;top:-74px}.bvh-preview-art svg{width:36px;height:36px;margin-bottom:12px;color:#64818D}.bvh-preview-art span{font-size:11px}.bvh-preview-art small{font-size:7px;letter-spacing:2px;margin-top:7px}.bvh-preview-tag{position:absolute;border-radius:4px;font-size:10px;color:white;padding:4px 7px}.bvh-preview-bar{position:absolute;left:0;bottom:0;height:4px}.bvh-preview-duration{position:absolute;bottom:10px;right:10px;font-size:9px;color:#54636B}.bvh-preview-caption{font-size:10px!important}.bvh-preview-states{display:flex;flex-wrap:wrap;gap:6px;margin-top:18px}.bvh-preview-states button{font-size:10px;padding:6px 9px;min-height:30px;background:transparent}.bvh-workbench button[aria-pressed=true]{border-color:var(--bvh-blue);color:var(--bvh-blue);background:#EAF5F9}.bvh-preview-note{border-top:1px solid var(--bvh-line);font-size:11px;color:var(--bvh-muted);margin-top:24px;padding-top:16px;line-height:2}.bvh-preview-note small{font-size:10px;margin-left:13px}
+        .bvh-search-row{display:flex;gap:10px}.bvh-search{display:flex;align-items:center;gap:10px;flex:1;background:white;border:1px solid var(--bvh-line);border-radius:9px;padding:0 12px;min-width:0;color:var(--bvh-muted)}.bvh-search input{border:0!important;outline:none!important;min-width:0;width:100%;background:transparent!important;padding-left:0!important}.bvh-search:focus-within{outline:2px solid var(--bvh-blue);outline-offset:2px}.bvh-history-tools{display:flex;align-items:center;flex-wrap:wrap;gap:10px;margin:14px 0 20px;font-size:12px}.bvh-history-tools label{display:flex;align-items:center;gap:8px}.bvh-history-tools select{font-size:12px}.bvh-tool-spacer{flex:1}.bvh-selection-bar{padding:10px 12px;display:flex;align-items:center;gap:8px;background:#EBF0F1;border-radius:8px 8px 0 0;font-size:11px}.bvh-selection-bar>span{margin-right:auto}.bvh-selection-bar button{font-size:11px;min-height:32px;padding:5px 9px}.bvh-table-scroll{overflow:auto;background:white;border:1px solid var(--bvh-line);border-radius:0 0 10px 10px}.bvh-workbench table{border-collapse:collapse;width:100%;min-width:620px;table-layout:fixed;font-size:12px}.bvh-workbench th{position:sticky;top:0;background:#F9FAFA;color:var(--bvh-muted);font-size:10px;font-weight:500;text-align:left;z-index:1}.bvh-workbench td,.bvh-workbench th{padding:14px 10px;border-bottom:1px solid #EDF0F1;vertical-align:middle}.bvh-workbench th:first-child{width:36px}.bvh-workbench th:nth-child(2){width:43%}.bvh-workbench th:nth-child(3){width:100px}.bvh-workbench th:nth-child(4){width:134px}.bvh-workbench th:last-child{width:56px}.bvh-workbench tbody tr:last-child td{border-bottom:0}.bvh-workbench tr:has(input:checked){background:#F0F8FB}.bvh-title-cell a{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:500}.bvh-title-cell small{display:flex;align-items:center;flex-wrap:wrap;gap:6px;color:var(--bvh-muted);font-size:10px;margin-top:6px}.bvh-status-badge{padding:1px 5px;border-radius:4px;background:#EEF3F5;color:#5D7480;font-size:9px}.bvh-row-progress{height:3px;background:#E6EDF0;border-radius:3px;overflow:hidden;margin-top:6px}.bvh-row-progress i{display:block;height:100%;background:#007EAD}.bvh-progress-number{font-size:11px}.bvh-time-cell{color:var(--bvh-muted);font-size:10px}.bvh-workbench .bvh-text-danger{background:transparent;border:0;color:#BF414B;font-size:11px;padding:4px;min-height:30px}.bvh-retention{margin-top:20px;font-size:12px;color:var(--bvh-muted)}.bvh-retention>div{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}.bvh-retention p{font-size:11px;margin-top:8px}.bvh-retention input{width:70px!important}.bvh-page-size{white-space:nowrap}.bvh-page-size select{min-height:32px;padding:5px 7px}.bvh-empty{padding:48px 12px;text-align:center;color:var(--bvh-muted);background:#FFF9;border-radius:10px}.bvh-empty>svg{width:32px;height:32px;margin-bottom:12px}.bvh-empty h3{color:var(--bvh-ink);margin-bottom:8px}.bvh-empty p{font-size:12px;margin-bottom:18px}.bvh-loader{display:inline-block;width:22px;height:22px;border:2px solid #DBE7EB;border-top-color:#007EAD;border-radius:50%;animation:bvh-spin 1s linear infinite;margin-bottom:12px}.bvh-empty-inline{padding:16px 0;font-size:12px;color:var(--bvh-muted)}
+        .bvh-stat-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}.bvh-stat-summary section{padding:18px;border-radius:12px;background:white;border:1px solid var(--bvh-line)}.bvh-stat-summary span{font-size:11px;color:var(--bvh-muted)}.bvh-stat-summary strong{display:block;font-size:28px;letter-spacing:-1px;line-height:1.2;margin:12px 0 10px;font-weight:600}.bvh-stat-summary small{font-size:9px;color:var(--bvh-muted)}.bvh-stat-summary section.featured{background:#263D49;color:white;border-color:#263D49}.bvh-stat-summary .featured span,.bvh-stat-summary .featured small{color:#CCDDE5}.bvh-stats-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.bvh-chart-card{padding:18px}.bvh-chart-card h2{font-size:13px}.bvh-donut{max-width:160px;margin:10px auto 0}.bvh-donut svg{display:block;width:100%}.bvh-chart-card .bvh-help{font-size:9px}.bvh-distribution{margin-top:24px;font-size:11px}.bvh-distribution>div:first-child{display:flex;justify-content:space-between;margin-bottom:8px}.bvh-distribution>div:last-child{height:5px;background:#EDF1F2;border-radius:5px;overflow:hidden}.bvh-distribution i{display:block;height:100%;border-radius:5px}.bvh-trend{margin-top:20px}.bvh-trend-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}.bvh-trend-heading p{font-size:10px;color:var(--bvh-muted);margin-top:4px}.bvh-range-buttons{display:flex;gap:5px}.bvh-range-buttons button{font-size:10px;min-height:32px;padding:6px 9px}.bvh-chart-scroll{overflow-x:auto;padding-top:18px}.bvh-chart-scroll svg{min-width:440px;width:100%;display:block}.bvh-trend summary{font-size:10px;color:var(--bvh-muted)}.bvh-daily-values{display:grid;grid-template-columns:repeat(auto-fill,minmax(85px,1fr));gap:10px;font-size:10px}.bvh-daily-values strong{display:block;font-weight:500}.bvh-dialog-mask{z-index:2147483100;background:#15202E66}.bvh-confirm{width:min(460px,100%);padding:28px;background:var(--bvh-paper);border:1px solid white;border-radius:16px;box-shadow:0 24px 100px #0004}.bvh-confirm h2{font-size:20px}.bvh-confirm-message{white-space:pre-line;overflow-wrap:anywhere;color:var(--bvh-muted);font-size:13px;margin:16px 0 24px!important}.bvh-dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px}.bvh-dialog-actions button{font-size:12px}.bvh-sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+        .bvh-toast-container{z-index:2147483200!important;max-width:calc(100vw - 32px)!important}.bvh-toast{font:13px/1.6 "Microsoft YaHei",sans-serif!important;border-radius:10px!important;box-shadow:0 8px 32px #14212F33!important;max-width:min(460px,calc(100vw - 32px))!important;overflow-wrap:anywhere}.bvh-toast button{font:inherit;color:inherit;background:transparent;border:1px solid currentColor;border-radius:5px;padding:3px 10px;margin-left:14px;cursor:pointer}.bvh-resume{z-index:2147482900!important}.bvh-toast button:focus-visible{outline:3px solid #007EAD;outline-offset:3px}
+        @keyframes bvh-spin{to{transform:rotate(360deg)}}
+        @media(max-width:1050px){.bvh-settings-layout{grid-template-columns:minmax(0,1fr) 210px;gap:18px}.bvh-shell{grid-template-columns:164px minmax(0,1fr)}.bvh-page-header{padding:24px}.bvh-content{padding:20px 24px}.bvh-footer{padding:14px 24px}.bvh-section{padding:16px}.bvh-setting-row{gap:10px}.bvh-setting-row select{max-width:135px}.bvh-opacity input[type=range]{width:45px}.bvh-stat-summary section{padding:14px}.bvh-stat-summary strong{font-size:25px}}
+        @media(max-width:779px){.bvh-manager-mask{padding:12px}.bvh-shell{display:flex;flex-direction:column;height:calc(100dvh - 24px);border-radius:14px}.bvh-nav{padding:12px 16px;flex-direction:row;align-items:center;gap:16px;flex-shrink:0}.bvh-brand{padding:0}.bvh-brand>svg{width:24px}.bvh-brand>span{font-size:12px}.bvh-brand small,.bvh-nav-label,.bvh-nav-note{display:none}.bvh-nav nav{display:flex;gap:4px;flex:1;justify-content:flex-end}.bvh-nav button{padding:8px;gap:5px;min-height:44px;font-size:12px}.bvh-nav button svg{width:16px;height:16px}.bvh-nav button[aria-current=page]{box-shadow:inset 0 -2px #00AEEC}.bvh-main{flex:1}.bvh-page-header{padding:20px}.bvh-content{padding:18px 20px}.bvh-footer{padding:12px 20px}.bvh-settings-layout{grid-template-columns:minmax(0,1fr) 220px}.bvh-setting-row{flex-wrap:wrap}.bvh-stats-grid{grid-template-columns:1fr 1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:span 2}.bvh-workbench button,.bvh-workbench select{min-height:44px}}
+        @media(max-width:600px){.bvh-manager-mask{padding:8px}.bvh-shell{height:calc(100dvh - 16px)}.bvh-nav{padding:8px 12px;gap:8px}.bvh-brand>span{display:none}.bvh-nav nav{justify-content:space-between}.bvh-nav button{font-size:11px;padding:8px 9px}.bvh-nav button svg{display:none}.bvh-page-header{padding:18px 16px}.bvh-page-header h1{font-size:22px}.bvh-page-header p{font-size:11px}.bvh-eyebrow{font-size:8px}.bvh-content{padding:16px}.bvh-settings-layout{display:flex;flex-direction:column}.bvh-setting-groups{width:100%}.bvh-preview-panel{position:static;order:-1;width:100%;padding:16px;background:#EAEFEC;border-radius:10px}.bvh-preview-cover{margin-top:12px;aspect-ratio:16/8}.bvh-preview-note{margin-top:14px;padding-top:10px}.bvh-preview-panel>h3,.bvh-preview-caption{display:none}.bvh-preview-states{margin-top:12px;gap:5px}.bvh-preview-states button{min-height:44px;font-size:10px;padding:6px 8px}.bvh-setting-row{flex-wrap:nowrap}.bvh-setting-row select{max-width:132px}.bvh-opacity input[type=range]{width:48px}.bvh-footer{padding:12px 16px;gap:8px;flex-wrap:wrap;font-size:10px}.bvh-footer button{font-size:11px;padding:8px 10px}.bvh-save-status{font-size:10px}.bvh-footer:has([data-page-info])>span{width:100%}.bvh-history-tools{gap:8px}.bvh-history-tools label{font-size:10px}.bvh-history-tools select{font-size:11px;padding:7px}.bvh-tool-spacer{display:none}.bvh-selection-bar{flex-wrap:wrap}.bvh-selection-bar>span{width:100%}.bvh-selection-bar button{min-height:44px}.bvh-stat-summary{grid-template-columns:1fr 1fr;gap:10px}.bvh-stat-summary strong{font-size:28px}.bvh-stats-grid{grid-template-columns:1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:auto}.bvh-chart-card .bvh-help{text-align:center}.bvh-distribution{margin-top:18px}.bvh-trend-heading{flex-wrap:wrap}.bvh-confirm{padding:22px}.bvh-dialog-mask{padding:16px}.bvh-dialog-actions{justify-content:stretch}.bvh-dialog-actions button{flex:1}}
+        .bvh-nav button[data-dirty=true]:after{content:"";width:6px;height:6px;border-radius:50%;background:#F0BD62;margin-left:auto;flex-shrink:0}
+        .bvh-table-scroll{max-height:calc(100dvh - 390px);min-height:180px}
+        @media(max-width:600px){.bvh-settings-layout>.bvh-setting-groups{display:contents}.bvh-setting-groups>.bvh-section{width:100%}.bvh-setting-groups>.bvh-section:nth-child(1){order:0}.bvh-setting-groups>.bvh-section:nth-child(2){order:1}.bvh-setting-groups>.bvh-section:nth-child(3){order:2}.bvh-settings-layout>.bvh-preview-panel{order:3}.bvh-setting-groups>.bvh-section:nth-child(4){order:4}.bvh-table-scroll{max-height:calc(100dvh - 460px)}}
+        @media(prefers-reduced-motion:reduce){.bvh-workbench *{animation:none!important;transition:none!important}.bvh-loader{border-color:#007EAD}}
+        `);
+    }
 
     const HistoryPageSync = {
         _button: null,
@@ -2847,7 +2647,7 @@
 
                 HistoryPageSync.updateButton('同步中...', true);
                 progress.update(continueMode ? 55 : 25, `正在解析 ${HistoryPageSync.countCards()} 条历史卡片...`);
-                const result = HistoryPageSync.syncLoadedCards();
+                const result = await HistoryPageSync.syncLoadedCards();
                 result.beforeCardCount = beforeCount;
                 result.afterCardCount = HistoryPageSync.countCards();
                 result.newLoaded = Math.max(0, result.afterCardCount - beforeCount);
@@ -2903,7 +2703,8 @@
             document.body?.scrollHeight || 0
         ),
 
-        syncLoadedCards: () => {
+        syncLoadedCards: async () => {
+            await StorageManager._syncIfStale();
             const result = {
                 scanned: 0,
                 candidates: 0,
@@ -2948,8 +2749,9 @@
             });
 
             if (writes.length > 0) {
-                result.saved = StorageManager.saveRecords(writes, false);
-                if (result.saved > 0) StorageManager._notifyChange();
+                const committed = await StorageManager.saveRecords(writes, false, { source: 'history', details: true });
+                result.saved = committed.count; result.created = committed.created; result.updated = committed.updated;
+                result.skipped += writes.length - committed.count;
             }
             return result;
         },
@@ -3172,278 +2974,207 @@
 
     // --- 播放器监控层 ---
     class VideoPlayerObserver {
-        constructor() {
-            this.bvId = null;
-            this.videoEl = null;
-            this.title = '';
-            this.hasPlayed = false;
-            this.stateInterval = null;
-            this.videoWatchInterval = null;
-            this.destroyed = false;
-            this._lastKnownState = null; // 缓存最近一次有效进度，供 destroy 安全使用
-
-            // 绑定 this 用于事件注册与移除
-            this._onBeforeUnload = () => this.saveProgress(true);
-            this._onPlay = () => {
-                this.hasPlayed = true;
-                this.saveProgressDebounced();
+        static retired = new WeakMap();
+        constructor(onIdentityChange = null) {
+            this.generation = crypto.randomUUID(); this.state = 'waiting'; this.destroyed = false;
+            this.onIdentityChange = onIdentityChange; this.cid = null;
+            this.bvId = null; this.title = ''; this.videoEl = null; this.hasPlayed = false;
+            this._lastKnownState = null; this._source = ''; this._metadataSeen = false;
+            this._onPlay = () => { this.hasPlayed = true; this.saveProgressDebounced(); };
+            this._onTimeUpdate = () => { if (this.videoEl?.currentTime > 0) this.hasPlayed = true; this.capture(); this.saveProgressDebounced(); };
+            this._onPause = () => { this.capture(); this.persistSnapshot(); };
+            this._onBeforeUnload = () => { this.capture(); this.persistSnapshot(); };
+            this._onLoadStart = () => { this.state = 'switching'; this._metadataSeen = false; this._cancelSeek?.(); };
+            this._onMetadata = () => {
+                this._metadataSeen = true;
+                if (this._metadataTimer) clearTimeout(this._metadataTimer);
+                this._metadataTimer = setTimeout(() => this.confirmMedia(), 500);
             };
-            this._onTimeUpdate = () => {
-                if (!this.hasPlayed && this.videoEl && this.videoEl.currentTime > 0) {
-                    this.hasPlayed = true;
-                }
-                if (this.hasPlayed) {
-                    this.saveProgressDebounced();
-                }
-            };
-            this._onPause = () => {
-                if (this.hasPlayed) {
-                    this.saveProgress(true);
-                }
-            };
-
-            this.saveProgressDebounced = Utils.throttle(this.saveProgress.bind(this), 5000);
+            this.saveProgressDebounced = Utils.throttle(() => this.saveProgress(), 5000);
         }
-
         init() {
-            Utils.log('VideoPlayerObserver.init', `url=${location.href}`);
-            const getBvId = () => {
-                // 合集页面: bvid 在 URL query 参数中
-                const urlKey = VideoKey.fromUrl(location.href);
-                if (urlKey) return urlKey;
-                return VideoKey.normalize(window.__INITIAL_STATE__?.bvid);
-            };
-
-            this.bvId = getBvId();
-            if (!this.bvId) {
-                Utils.log('VideoPlayerObserver.init no bvId, start polling __INITIAL_STATE__');
-                let retries = 0;
-                this.stateInterval = setInterval(() => {
-                    this.bvId = getBvId();
-                    if (this.bvId) {
-                        Utils.log('VideoPlayerObserver polling resolved bvId:', this.bvId, `retries=${retries}`);
-                        clearInterval(this.stateInterval);
-                        this.setupRecord();
-                    } else if (retries++ > 50) {
-                        Utils.warn('VideoPlayerObserver polling stopped: bvId not found');
-                        clearInterval(this.stateInterval);
-                    }
-                }, 200);
-            } else {
-                Utils.log('VideoPlayerObserver.init bvId:', this.bvId);
-                this.setupRecord();
-            }
+            this.bvId = EpisodeResolver.getCurrentKey() || VideoKey.fromUrl(location.href);
+            this.startVideoWatch();
+            if (this.bvId) this.setupRecord();
         }
-
+        identityMatches() {
+            if (this.destroyed || !this.bvId || EpisodeResolver.getCurrentKey() !== this.bvId) return false;
+            const data = window.__INITIAL_STATE__?.videoData;
+            if (data?.bvid && VideoKey.base(data.bvid) !== VideoKey.base(this.bvId)) return false;
+            const cid = window.__INITIAL_STATE__?.cid;
+            if (this.cid && cid && String(cid) !== this.cid) return false;
+            return true;
+        }
         setupRecord() {
-            const done = Utils.debugTime('VideoPlayerObserver.setupRecord');
-            this.bvId = EpisodeResolver.getCurrentKey() || VideoKey.normalize(this.bvId);
-            const state = window.__INITIAL_STATE__;
-            this.title = document.title || (state?.videoData?.title) || '';
-            Utils.log('VideoPlayerObserver.setupRecord resolved', `key=${this.bvId}`, `title=${this.title}`);
-
+            if (this.destroyed) return;
+            const data = window.__INITIAL_STATE__?.videoData;
+            this.title = data?.bvid && VideoKey.base(data.bvid) === VideoKey.base(this.bvId) ? data.title || '' : '';
             const record = StorageManager.getRecord(this.bvId);
-            if (record) {
-                Utils.log('VideoPlayerObserver.setupRecord existing record', this.bvId, record.status, record.percent || '');
-                UIComponent.showViewPanel(record, this.bvId);
-            } else {
-                Utils.log('VideoPlayerObserver.setupRecord create visited record', this.bvId);
-                const visitedRecord = {
-                    v: 2,
-                    status: RECORD_STATUS.VISITED,
-                    currentTime: '',
-                    percent: '',
-                    savedAt: Utils.formatTime(),
-                    title: this.title
-                };
-                StorageManager.saveRecord(this.bvId, visitedRecord);
-                UIComponent.showViewPanel(visitedRecord, this.bvId);
-            }
-            const latest = EpisodeResolver.getLatestRecord(VideoKey.base(this.bvId));
-            if (latest) {
-                Utils.log('VideoPlayerObserver.setupRecord latest resume target', `current=${this.bvId}`, `target=${latest.key}`, latest.record.currentTime, latest.record.percent || '');
-                UIComponent.showResumePrompt(latest, () => {
-                    if (this.videoEl) {
-                        this.videoEl.currentTime = 0;
-                        this.videoEl.play();
-                    }
-                });
-            } else {
-                Utils.log('VideoPlayerObserver.setupRecord no resume target', this.bvId);
-            }
-
+            if (record) UIComponent.showViewPanel(record, this.bvId);
+            this.ensureVisitedRecord();
+            this.completeMissingTitle();
             this.waitForVideo().then(video => {
-                if (this.destroyed) return;
-                this.bindVideo(video);
-                this.startVideoWatch();
-                UIComponent.applyPendingSeek(this.bvId, video);
-                Utils.log('Video element bound');
-                done(`key=${this.bvId} videoReadyState=${video.readyState}`);
-            }).catch(e => {
-                Utils.error('Video element not found or timeout', e);
-                done(`key=${this.bvId} video=timeout`);
-            });
+                if (!this.destroyed) this.bindVideo(video);
+            }).catch(error => { if (!this.destroyed) Utils.warn('媒体尚未就绪，继续低频发现', error); });
         }
-
+        getCurrentVideo() { return document.querySelector('#bilibili-player video') || document.querySelector('bwp-video'); }
         waitForVideo(timeout = 10000) {
-            const done = Utils.debugTime('VideoPlayerObserver.waitForVideo');
             return new Promise((resolve, reject) => {
-                const getVid = () => this.getCurrentVideo();
-                let video = getVid();
-                if (video) {
-                    done('found immediately');
-                    return resolve(video);
-                }
-                let timer = null;
-
-                const observer = new MutationObserver(() => {
-                    video = getVid();
-                    if (video) {
-                        observer.disconnect();
-                        if (timer) clearTimeout(timer);
-                        done('found by mutation');
-                        resolve(video);
-                    }
-                });
+                const video = this.getCurrentVideo(); if (video) { resolve(video); return; }
+                let settled = false;
+                const finish = (video, error) => {
+                    if (settled) return; settled = true; observer.disconnect(); clearTimeout(timer); this._cancelWait = null;
+                    if (error) reject(error); else resolve(video);
+                };
+                const observer = new MutationObserver(() => { const video = this.getCurrentVideo(); if (video) finish(video); });
+                const timer = setTimeout(() => finish(null, new Error('等待媒体超时')), timeout);
+                this._cancelWait = () => finish(null, new Error('会话已结束'));
                 observer.observe(document.body, { childList: true, subtree: true });
-
-                timer = setTimeout(() => {
-                    observer.disconnect();
-                    done('timeout');
-                    reject(new Error("Timeout waiting for video element"));
-                }, timeout);
             });
         }
-
-        getCurrentVideo() {
-            return document.querySelector('#bilibili-player video') || document.querySelector('bwp-video');
-        }
-
         bindVideo(video) {
-            if (!video || video === this.videoEl) return;
-            if (this.videoEl) {
-                this.saveProgress(true);
-                this.unbindVideoEvents(this.videoEl);
-            }
-            this.videoEl = video;
-            if (video.currentTime > 0) this.hasPlayed = true;
+            if (!video || this.destroyed || video === this.videoEl) return;
+            this.ensureVisitedRecord();
+            this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
+            this.videoEl = video; this._metadataSeen = false; this.state = 'waiting';
             this.bindEvents();
+            const retired = VideoPlayerObserver.retired.get(video);
+            if (!retired || (retired.key === this.bvId && retired.source === (video.currentSrc || video.src || ''))) this.confirmMedia();
         }
-
+        confirmMedia() {
+            if (!this.identityMatches() || !this.videoEl || this.videoEl.readyState < 1) return false;
+            const source = this.videoEl.currentSrc || this.videoEl.src || '';
+            const retired = VideoPlayerObserver.retired.get(this.videoEl);
+            if (retired && retired.key !== this.bvId && !this._metadataSeen && source === retired.source) return false;
+            if (this.state === 'switching' && !this._metadataSeen) return false;
+            this.state = 'bound'; this._source = source;
+            this.cid = window.__INITIAL_STATE__?.cid ? String(window.__INITIAL_STATE__.cid) : null;
+            const data = window.__INITIAL_STATE__?.videoData;
+            this.title = data?.title || document.title || this.title;
+            this.ensureVisitedRecord();
+            this.completeMissingTitle();
+            if (!this._resumeShown) {
+                this._resumeShown = true;
+                const valid = () => this.state === 'bound' && this.identityMatches() && this.videoEl === this.getCurrentVideo();
+                const latest = EpisodeResolver.getLatestRecord(VideoKey.base(this.bvId));
+                if (latest) this._cancelPrompt = UIComponent.showResumePrompt(latest, () => {
+                    if (valid()) { this.videoEl.currentTime = 0; this.videoEl.play(); }
+                }, valid);
+                this._cancelSeek = UIComponent.applyPendingSeek(this.bvId, this.videoEl, valid);
+            }
+            return true;
+        }
+        ensureVisitedRecord() {
+            // 访问身份来自当前路由，不等待媒体确认，也不读取旧媒体的时间或标题。
+            if (this.destroyed || !this.bvId || EpisodeResolver.getCurrentKey() !== this.bvId || this._visitedSaved || StorageManager.getRecord(this.bvId)) return;
+            this._visitedSaved = true;
+            const title = this.getConfirmedTitle();
+            const visited = { status: RECORD_STATUS.VISITED, currentTime: '', percent: '', savedAt: Utils.formatTime(), title };
+            UIComponent.showViewPanel({ ...visited, status: '正在保存访问记录…' }, this.bvId);
+            StorageManager.saveRecord(this.bvId, visited, true, { source: 'visit' })
+                .then(() => {
+                    if (!this.destroyed && EpisodeResolver.getCurrentKey() === this.bvId) {
+                        const record = StorageManager.getRecord(this.bvId);
+                        if (record) UIComponent.showViewPanel(record, this.bvId);
+                        this.completeMissingTitle();
+                    }
+                })
+                .catch(error => {
+                    this._visitedSaved = false; Utils.warn('访问记录保存失败', error);
+                    if (!this.destroyed && EpisodeResolver.getCurrentKey() === this.bvId) UIComponent.showViewPanel({ ...visited, status: '访问记录保存失败，等待重试', savedAt: '' }, this.bvId);
+                });
+        }
+        completeMissingTitle() {
+            if (this.destroyed || !this.bvId || EpisodeResolver.getCurrentKey() !== this.bvId || this._titlePending) return;
+            const title = this.getConfirmedTitle();
+            if (!title) return;
+            this.title = title;
+            const current = StorageManager.getRecord(this.bvId);
+            if (!current || current.title) return;
+            // 提交时只补最新记录的空标题，不重写旧进度、保存时间，也不复活删除记录。
+            this._titlePending = StorageManager.saveRecord(this.bvId, { title }, true, { source: 'title' })
+                .then(() => {
+                    if (!this.destroyed && EpisodeResolver.getCurrentKey() === this.bvId) {
+                        const record = StorageManager.getRecord(this.bvId);
+                        if (record) UIComponent.showViewPanel(record, this.bvId);
+                    }
+                })
+                .catch(error => Utils.warn('标题补全失败，稍后重试', error))
+                .finally(() => { this._titlePending = null; });
+            return this._titlePending;
+        }
+        getConfirmedTitle() {
+            if (this.destroyed || EpisodeResolver.getCurrentKey() !== this.bvId) return '';
+            const base = VideoKey.base(this.bvId);
+            // 油猴沙箱 window 不一定暴露站点数据；部分页面的 bvid 只在状态顶层。
+            for (const state of [Utils._getPageWindow()?.__INITIAL_STATE__, window.__INITIAL_STATE__]) {
+                const data = state?.videoData;
+                const id = data?.bvid || state?.bvid;
+                if (id && VideoKey.base(id) === base && typeof data?.title === 'string' && data.title.trim()) return data.title.trim();
+            }
+            // 无页面全局数据时，用带视频身份的页面元信息核对标题；不直接采用 document.title。
+            const canonical = document.querySelector('link[rel="canonical"]')?.getAttribute?.('href');
+            const ogUrl = document.querySelector('meta[property="og:url"]')?.getAttribute?.('content');
+            const identityUrl = ogUrl || canonical;
+            if (!identityUrl || VideoKey.base(VideoKey.fromUrl(identityUrl)) !== base) return '';
+            const heading = document.querySelector('h1.video-title, h1[title]');
+            const title = heading?.getAttribute?.('title') || heading?.textContent
+                || document.querySelector('meta[property="og:title"]')?.getAttribute?.('content');
+            return typeof title === 'string' ? title.trim() : '';
+        }
+        capture() {
+            if (this.state !== 'bound' || !this.identityMatches() || !this.videoEl || !this.hasPlayed) return null;
+            if ((this.videoEl.currentSrc || this.videoEl.src || '') !== this._source) { this.state = 'switching'; return null; }
+            const current = this.videoEl.currentTime, duration = this.videoEl.duration;
+            if (!Number.isFinite(current) || !Number.isFinite(duration) || duration <= 0 || current < MIN_WATCH_SAVE_SECONDS) return null;
+            if (this._lastKnownState?.seconds === current) return this._lastKnownState;
+            const pad = n => String(n).padStart(2, '0');
+            const seconds = Math.floor(current), h = Math.floor(seconds / 3600);
+            const time = (h ? pad(h) + ':' : '') + pad(Math.floor(seconds % 3600 / 60)) + ':' + pad(seconds % 60);
+            this._lastKnownState = { key: this.bvId, seconds: current, transactionId: StorageManager._store.transactionId(), version: StorageManager.sampleVersion(), value: {
+                v: 3, status: RECORD_STATUS.WATCHED, currentTime: time, percent: Math.min(100, Math.round(current / duration * 100)) + '%',
+                savedAt: Utils.formatTime(), title: this.title
+            } };
+            return this._lastKnownState;
+        }
+        persistSnapshot() {
+            const snapshot = this._lastKnownState;
+            if (!snapshot || snapshot === this._savedSnapshot || snapshot === this._savingSnapshot) return Promise.resolve();
+            StorageManager.writeBackup(snapshot); this._savingSnapshot = snapshot;
+            return StorageManager.saveRecord(snapshot.key, snapshot.value, true, { version: snapshot.version, transactionId: snapshot.transactionId }).then(() => {
+                this._savedSnapshot = snapshot;
+                if (this._lastKnownState === snapshot && !this.destroyed) UIComponent.updateViewPanelProgress(snapshot.value);
+            }).catch(error => { Utils.error('播放进度保存失败，保留原采样备份', error); }).finally(() => { if (this._savingSnapshot === snapshot) this._savingSnapshot = null; });
+        }
+        saveProgress() { this.capture(); return this.persistSnapshot(); }
         startVideoWatch() {
             if (this.videoWatchInterval) return;
             this.videoWatchInterval = setInterval(() => {
                 if (this.destroyed) return;
-                const currentVideo = this.getCurrentVideo();
-                if (currentVideo && currentVideo !== this.videoEl) {
-                    Utils.warn('VideoPlayerObserver detected replaced video element, rebinding');
-                    this.bindVideo(currentVideo);
-                } else if (currentVideo && !currentVideo.paused && currentVideo.currentTime > 0) {
-                    // timeupdate 在后台节流或播放器异常时可能不再触发，轮询作为低频兜底。
-                    this.hasPlayed = true;
-                    this.saveProgressDebounced();
-                }
+                const activeKey = EpisodeResolver.getCurrentKey();
+                if (this.bvId && activeKey && activeKey !== this.bvId) { this.state = 'switching'; this.onIdentityChange?.(); return; }
+                if (!this.bvId) { this.bvId = EpisodeResolver.getCurrentKey(); if (this.bvId) this.setupRecord(); }
+                this.completeMissingTitle();
+                const video = this.getCurrentVideo();
+                if (video !== this.videoEl) this.bindVideo(video);
+                if (this.state === 'waiting') this.confirmMedia();
+                if (video && !video.paused) { this.hasPlayed = true; this.saveProgress(); }
             }, 5000);
         }
-
-        unbindVideoEvents(video) {
-            if (!video) return;
-            video.removeEventListener('play', this._onPlay);
-            video.removeEventListener('timeupdate', this._onTimeUpdate);
-            video.removeEventListener('pause', this._onPause);
-        }
-
         bindEvents() {
-            if (!this.videoEl) return;
-            Utils.log('VideoPlayerObserver.bindEvents', `key=${this.bvId}`, `duration=${this.videoEl.duration || 'unknown'}`);
-            this.videoEl.addEventListener('play', this._onPlay);
-            this.videoEl.addEventListener('timeupdate', this._onTimeUpdate);
-            this.videoEl.addEventListener('pause', this._onPause);
+            for (const [event, fn] of this.events()) this.videoEl.addEventListener(event, fn);
             window.addEventListener('beforeunload', this._onBeforeUnload);
         }
-
-        saveProgress(force = false) {
-            const start = performance.now();
-            const currentKey = EpisodeResolver.getCurrentKey() || this.bvId;
-            if (currentKey && currentKey !== this.bvId) {
-                Utils.log('VideoPlayerObserver.saveProgress key changed', `from=${this.bvId}`, `to=${currentKey}`);
-                this.bvId = currentKey;
-                const existing = StorageManager.getRecord(this.bvId);
-                if (existing) UIComponent.showViewPanel(existing, this.bvId);
-            }
-            if (!this.hasPlayed || !this.bvId || !this.videoEl) {
-                Utils.logEvery('saveProgressSkippedNotReady', 20, `force=${force}`, `hasPlayed=${this.hasPlayed}`, `key=${this.bvId || 'none'}`, `video=${!!this.videoEl}`);
-                return;
-            }
-            if (!this.videoEl.duration) {
-                Utils.logEvery('saveProgressSkippedNoDuration', 20, `force=${force}`, `key=${this.bvId}`);
-                return;
-            }
-
-            const current = this.videoEl.currentTime || 0;
-            const duration = this.videoEl.duration || 1;
-            if (current < MIN_WATCH_SAVE_SECONDS) {
-                Utils.logEvery('saveProgressSkippedTooEarly', 20, `force=${force}`, `key=${this.bvId}`, `current=${current.toFixed(2)}`);
-                return;
-            }
-
-            const format = (sec) => {
-                const h = Math.floor(sec / 3600);
-                const m = Math.floor((sec % 3600) / 60);
-                const s = Math.floor(sec % 60);
-                const pad = v => String(v).padStart(2, '0');
-                return h > 0 ? `${pad(h)}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
-            };
-
-            const percent = Math.round((current / duration) * 100) + '%';
-            const value = {
-                v: 2,
-                status: RECORD_STATUS.WATCHED,
-                currentTime: format(current),
-                percent: percent,
-                savedAt: Utils.formatTime(),
-                title: this.title
-            };
-
-            try {
-                StorageManager.saveRecord(this.bvId, value);
-            } catch (e) {
-                // GM_setValue 写入失败时，用 localStorage 作为异常兜底
-                Utils.error('StorageManager.saveRecord failed, falling back to localStorage', e);
-                localStorage.setItem(`${BACKUP_PREFIX}${this.bvId}`, JSON.stringify({ key: this.bvId, value: value, savedAt: Date.now() }));
-            }
-            if (force) {
-                localStorage.setItem(`${BACKUP_PREFIX}${this.bvId}`, JSON.stringify({ key: this.bvId, value: value, savedAt: Date.now() }));
-                StorageManager.cleanupLocalStorageBackupsThrottled();
-            }
-
-            // 缓存最近一次有效进度
-            this._lastKnownState = { key: this.bvId, value };
-
-            // 轻量更新 View Panel（不重建 DOM，避免闪烁）
-            const panel = document.getElementById('bvh-view-panel');
-            if (panel) panel.dataset.bvhKey = this.bvId;
-            UIComponent.updateViewPanelProgress(value);
-            Utils.log('VideoPlayerObserver.saveProgress saved', `key=${this.bvId}`, `time=${value.currentTime}`, `percent=${value.percent}`, `force=${force}`);
-            Utils.logSlow('VideoPlayerObserver.saveProgress', start, `key=${this.bvId} force=${force}`, 30);
-        }
-
+        events() { return [['play', this._onPlay], ['timeupdate', this._onTimeUpdate], ['pause', this._onPause], ['loadstart', this._onLoadStart], ['emptied', this._onLoadStart], ['loadedmetadata', this._onMetadata]]; }
+        unbindVideoEvents(video) { if (video) for (const [event, fn] of this.events()) video.removeEventListener(event, fn); }
         destroy() {
-            Utils.log('VideoPlayerObserver.destroy', `key=${this.bvId}`, `hasLastState=${!!this._lastKnownState}`);
-            this.destroyed = true;
-            // 使用缓存的进度数据保存，不再读取 video 元素（SPA 切换时 video 可能已加载新视频）
-            if (this._lastKnownState?.key && this._lastKnownState?.value) {
-                StorageManager.saveRecord(this._lastKnownState.key, this._lastKnownState.value);
-            }
-
+            if (this.destroyed) return;
+            this.destroyed = true; this.state = 'destroyed';
+            if (this.videoEl) VideoPlayerObserver.retired.set(this.videoEl, { key: this.bvId, source: this._source });
+            this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
             window.removeEventListener('beforeunload', this._onBeforeUnload);
-            this.unbindVideoEvents(this.videoEl);
-            if (this.stateInterval) {
-                clearInterval(this.stateInterval);
-            }
-            if (this.videoWatchInterval) {
-                clearInterval(this.videoWatchInterval);
-            }
+            this._cancelWait?.(); this._cancelSeek?.(); this._cancelPrompt?.();
+            clearInterval(this.videoWatchInterval); clearTimeout(this._metadataTimer);
         }
     }
 
@@ -3455,6 +3186,7 @@
             this.contentObservers = new Map();
             this.processedLinks = new WeakSet();
             this.visibleElements = new Set();
+            this.observedElements = new Set();
             this.pendingLinks = new Set();
             this.pendingPlaylistItems = new Set();
             this.pendingRescanRoots = new Map();
@@ -3482,17 +3214,20 @@
             Utils.log('DOMWatcher constructed', `mode=${this.pageMode}`);
 
             // 事件驱动而非定时盲扫
-            StorageManager.onDataChange(() => {
+            this._unsubscribe = StorageManager.onDataChange((change) => {
                 const start = performance.now();
                 let processed = 0;
                 let removed = 0;
                 this.relatedKeysCache.clear();
                 this.visibleElements.forEach(el => {
                     if (document.contains(el)) {
-                        this.enqueueElement(el);
+                        const base = VideoKey.base(this.getVideoKeyFromLink(el) || el._bvhLastVideoKey);
+                        if (change.fullReset || change.settingsChanged || change.changedBases.has(base)) this.enqueueElement(el);
                         processed++;
                     } else {
                         this.visibleElements.delete(el);
+                        this.intersectionObserver.unobserve(el);
+                        this.pendingLinks.delete(el); this.pendingPlaylistItems.delete(el);
                         removed++;
                     }
                 });
@@ -3546,6 +3281,7 @@
         }
 
         refreshForRoute() {
+            this.pruneDisconnected();
             const nextMode = this.getPageMode();
             if (nextMode !== this.pageMode) {
                 Utils.log('DOMWatcher mode changed', `from=${this.pageMode}`, `to=${nextMode}`, `url=${location.href}`);
@@ -3567,6 +3303,7 @@
                 let addedNodeCount = 0;
                 mutations.forEach(m => {
                     if (m.type !== 'childList') return;
+                    if (m.removedNodes.length) this.pruneDisconnected();
                     childListCount++;
                     m.addedNodes.forEach(node => {
                         addedNodeCount++;
@@ -3851,6 +3588,7 @@
             if (this.isSkippedHeaderNode(el)) return;
             if (!this.processedLinks.has(el) && this.isValidLink(el)) {
                 this.processedLinks.add(el);
+                this.observedElements.add(el);
                 this.intersectionObserver.observe(el);
                 Utils.logEvery('observedLinks', 100, Utils.describeElement(el), el.href || '');
             }
@@ -3911,10 +3649,19 @@
         }
 
         removeExistingMark(el) {
+            el._bvhTag?.remove(); el._bvhBar?.remove();
+            el._bvhTag = null; el._bvhBar = null; el._bvhMarkParent = null; el._bvhSignature = null;
             const existingTags = el.querySelectorAll('.bvh-tag, .bvh-tag-small, .bvh-tag-big');
             existingTags.forEach(tag => tag.remove());
             const existingBars = el.querySelectorAll('.bvh-progress-bar');
             existingBars.forEach(bar => bar.remove());
+        }
+
+        pruneDisconnected() {
+            for (const set of [this.visibleElements, this.observedElements, this.pendingLinks, this.pendingPlaylistItems]) {
+                for (const el of set) if (!el.isConnected) { set.delete(el); this.intersectionObserver.unobserve(el); }
+            }
+            for (const root of this.pendingRescanRoots.keys()) if (!root.isConnected) this.pendingRescanRoots.delete(root);
         }
 
         isValidLink(el) {
@@ -3973,6 +3720,7 @@
             if (!this.processedLinks.has(el)) {
                 if (this.getPlaylistItemInfo(el)) {
                     this.processedLinks.add(el);
+                    this.observedElements.add(el);
                     this.intersectionObserver.observe(el);
                     Utils.logEvery('observedPlaylistItems', 50, Utils.describeElement(el));
                 }
@@ -4075,6 +3823,7 @@
             const start = performance.now();
             const item = this.getPlaylistItemInfo(el);
             if (!item?.key) return;
+            el._bvhLastVideoKey = item.key;
 
             let record = StorageManager.getRecord(item.key);
             const isActionListItem = el.matches(ACTION_LIST_ITEM_SELECTOR);
@@ -4192,12 +3941,10 @@
 
             const existingTags = el.querySelectorAll('.bvh-tag, .bvh-tag-small, .bvh-tag-big');
             const existingBars = el.querySelectorAll('.bvh-progress-bar');
-            if (existingTags.length > 0 || existingBars.length > 0) {
-                if (existingTags.length === 1 && existingBars.length <= 1 && isSameVideoKey && existingTags[0].innerText === tagText) {
-                    Utils.logSlow('DOMWatcher.processLink unchanged', start, `key=${bv}`, 30, 'log');
-                    return;
-                }
-                this.removeExistingMark(el);
+            const signature = JSON.stringify([bv, tagText, tagTitle, record.percent, CONFIG.showProgressBar, CONFIG.tagPosition, CONFIG.tagOpacity, CONFIG.lowThreshold, CONFIG.highThreshold]);
+            if (!CONFIG.showProgressBar && existingBars.length) {
+                existingBars.forEach(bar => bar.remove?.());
+                if (!existingBars[0].remove) this.removeExistingMark(el);
             }
 
             let img = headerPopoverCover
@@ -4261,12 +4008,23 @@
                 }
             }
 
-            const tagEl = UIComponent.createTag(tagText, tagTitle, `bvh-tag ${tagColorClass} ${isSmall ? 'bvh-tag-small' : ''}`);
-            markParent.insertBefore(tagEl, markBeforeNode);
+            if (el._bvhSignature === signature && el._bvhMarkParent === markParent && el._bvhTag?.isConnected) return;
+            const template = UIComponent.createTag(tagText, tagTitle, `bvh-tag ${tagColorClass} ${isSmall ? 'bvh-tag-small' : ''}`);
+            let tagEl = el._bvhTag;
+            if (tagEl?.parentNode === markParent) {
+                tagEl.className = template.className; tagEl.style.cssText = template.style.cssText;
+                tagEl.textContent = tagText; tagEl.title = tagTitle;
+            } else {
+                this.removeExistingMark(el); tagEl?.remove(); tagEl = template;
+                markParent.insertBefore(tagEl, markBeforeNode);
+            }
+            el._bvhTag = tagEl; el._bvhMarkParent = markParent; el._bvhSignature = signature;
+            el._bvhBar?.remove(); el._bvhBar = null;
             el._bvhLastVideoKey = bv;
 
             if (CONFIG.showProgressBar && record.percent && !isMulti) {
                 const barEl = UIComponent.createProgressBar(record.percent);
+                el._bvhBar = barEl;
                 const statsNode = el.querySelector('.bili-video-card__stats');
                 if (!isHeaderPopoverLink && statsNode && el.children.length > 0) {
                     el.children[0].insertBefore(barEl, el.children[0].firstChild);
@@ -4288,20 +4046,34 @@
             this._domStarted = false;
         }
 
-        start() {
+        async start() {
             const done = Utils.debugTime('AppController.start');
             const currentVersion = typeof GM_info !== 'undefined' ? (GM_info.script?.version || 'unknown') : 'unknown';
             Utils.log(`Script started v${currentVersion}`, `url=${location.href}`, `readyState=${document.readyState}`, `debug=${CONFIG.debug}`);
             injectStyles();
 
+            const initialKey = VideoKey.fromUrl(location.href);
+            if (initialKey) UIComponent.showViewPanel({ status: '正在读取历史记录…', currentTime: '', percent: '', savedAt: '' }, initialKey);
+            const storageStarted = performance.now();
+
             // 数据迁移（v1/v2 → v3 分片，仅首次执行）
-            StorageManager.migrateIfNeeded();
+            try { await StorageManager.initializeForKeys(initialKey ? [initialKey] : []); }
+            catch (error) {
+                Utils.error('历史存储初始化失败', error);
+                if (initialKey) UIComponent.showViewPanel({ status: '历史读取失败，请刷新重试', currentTime: '', percent: '', savedAt: '' }, initialKey);
+                UIComponent.toast('历史存储初始化失败，请重试刷新页面', 'error'); return;
+            }
+            Utils.log('启动历史读取完成', `耗时=${Math.round(performance.now() - storageStarted)}ms`, `提交数=${StorageManager._store.commits.size}`);
 
             this.initMenuCommands();
-            StorageManager.restoreFromLocalStorage();
-            StorageManager.cleanupLocalStorageBackups();
-
+            window.addEventListener('pagehide', event => { if (!event.persisted) StorageManager.dispose(); });
             this.deferDomStart();
+            // 备份按原版本条件恢复，不再阻塞当前视频界面与媒体监听。
+            const restoreStarted = performance.now();
+            StorageManager.restoreFromLocalStorage()
+                .then(() => StorageManager.cleanupLocalStorageBackups())
+                .catch(error => Utils.warn('启动备份恢复失败，已保留备份', error))
+                .finally(() => Utils.log('启动备份恢复结束', `耗时=${Math.round(performance.now() - restoreStarted)}ms`));
             done('scheduled DOM start');
         }
 
@@ -4319,6 +4091,8 @@
             };
 
             const waitForHeader = () => {
+                // 播放记录和悬浮进度框只依赖 DOM 就绪，不等待头部动画或卡片扫描。
+                this.checkAndInitVideoPage();
                 if (this._domStarted) return;
                 Utils.log('AppController.waitForHeader start', `hasHeader=${!!document.querySelector(HEADER_SELECTOR)}`);
 
@@ -4370,11 +4144,7 @@
                 }
 
                 fallbackTimer = setTimeout(() => {
-                    if (document.querySelector(HEADER_SELECTOR)) {
-                        scheduleSettledStart('header fallback settled');
-                    } else {
-                        scheduleStart('header wait timeout');
-                    }
+                    scheduleStart('header wait timeout');
                 }, DOM_START_FALLBACK_DELAY);
             };
 
@@ -4408,10 +4178,10 @@
             done('initialized watchers/player/router');
 
             // 标签页切回时基于版本号判断是否需要同步（避免盲目全量刷新）
-            document.addEventListener('visibilitychange', () => {
+            document.addEventListener('visibilitychange', async () => {
                 Utils.log('visibilitychange', document.visibilityState);
                 if (document.visibilityState === 'visible') {
-                    const stale = StorageManager._syncIfStale();
+                    const stale = await StorageManager._syncIfStale().catch(error => { Utils.warn('历史同步失败', error); return false; });
                     if (stale) {
                         StorageManager._notifyChange();
                     }
@@ -4440,7 +4210,8 @@
                 UIComponent.showManagerPanel({ activeTab: 'settings' });
             });
 
-            GM_registerMenuCommand('导出历史记录', () => {
+            GM_registerMenuCommand('导出历史记录', async () => {
+                await StorageManager.initialize();
                 const data = {};
                 StorageManager.getAllRecords().forEach(({ key, record }) => data[key] = record);
                 const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -4471,10 +4242,10 @@
                     const file = e.target.files[0];
                     if (!file) return;
                     const reader = new FileReader();
-                    reader.onload = ev => {
+                    reader.onload = async ev => {
                         try {
                             const data = JSON.parse(ev.target.result);
-                            const result = StorageManager.importRecords(data);
+                            const result = await StorageManager.importRecords(data);
                             UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有记录)`, 'success', 4000);
                         } catch (err) {
                             UIComponent.toast('导入失败：文件格式错误', 'error');
@@ -4490,13 +4261,13 @@
             return VideoKey.fromUrl(location.href) || VideoKey.normalize(window.__INITIAL_STATE__?.bvid) || '';
         }
 
-        checkAndInitVideoPage() {
+        async checkAndInitVideoPage() {
             const isVideoPage = isVideoPageRoute();
             const routeKey = this.getRouteVideoKey();
             const observerKey = this.playerObserver?.bvId ? VideoKey.normalize(this.playerObserver.bvId) : '';
             Utils.log('AppController.checkAndInitVideoPage', `isVideoPage=${!!isVideoPage}`, `routeKey=${routeKey || 'none'}`, `observerKey=${observerKey || 'none'}`, `url=${location.href}`, `stateBvid=${window.__INITIAL_STATE__?.bvid || 'none'}`);
             if (isVideoPage) {
-                if (this.playerObserver && routeKey && observerKey === VideoKey.normalize(routeKey)) {
+                if (this.playerObserver && !this.playerObserver.destroyed && routeKey && observerKey === VideoKey.normalize(routeKey)) {
                     Utils.log('AppController.checkAndInitVideoPage skip: same video key');
                     this.currentVideoKey = routeKey;
                     return;
@@ -4504,8 +4275,12 @@
                 if (this.playerObserver) {
                     this.playerObserver.destroy();
                 }
+                const generation = this._videoInitGeneration = (this._videoInitGeneration || 0) + 1;
+                try { await StorageManager.initializeForKeys(routeKey ? [routeKey] : []); }
+                catch (error) { Utils.warn('当前视频历史读取失败', error); return; }
+                if (generation !== this._videoInitGeneration || routeKey !== this.getRouteVideoKey()) return;
                 this.currentVideoKey = routeKey;
-                this.playerObserver = new VideoPlayerObserver();
+                this.playerObserver = new VideoPlayerObserver(() => this.checkAndInitVideoPage());
                 this.playerObserver.init();
             } else if (this.playerObserver) {
                 Utils.log('AppController.checkAndInitVideoPage destroy: leave video page');
@@ -4541,6 +4316,7 @@
 
             window.addEventListener('locationchange', () => {
                 if (this.currentUrl !== location.href) {
+                    this.playerObserver?.destroy(); this.playerObserver = null;
                     this.currentUrl = location.href;
                     Utils.log('Route changed:', this.currentUrl);
                     setTimeout(() => {

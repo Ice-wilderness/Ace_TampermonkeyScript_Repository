@@ -1,7 +1,7 @@
 # bilibili-history-page-sync Specification
 
 ## Purpose
-TBD - created by archiving change sync-bilibili-history-records. Update Purpose after archive.
+规定从 Bilibili 历史页已加载卡片同步观看记录的入口、增量加载、分 P 识别、时间提取及进度合并规则，使本地历史能够接收官方页面的有效记录，同时保留更长的本地观看进度。
 ## Requirements
 ### Requirement: Floating history sync control
 The script SHALL provide a floating synchronization control on Bilibili history pages for syncing currently loaded history cards.
@@ -139,4 +139,3 @@ The script SHALL report synchronization results and refresh history-related loca
 - **WHEN** the user clicks continue sync after additional cards load
 - **THEN** the script MUST evaluate the newly loaded cards as well as already loaded cards
 - **AND** records already synchronized within the 5 percentage point threshold MUST be skipped
-
