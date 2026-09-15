@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.17.1
+// @version      2.18.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -2598,13 +2598,14 @@
             matches: ["galge.fun", "2dfan.com", "2dfan.org"],
             key: "2dfan",
             dashboard: {
-                url: "https://2dfan.com/users/177256/recheckin",
+                url: "https://2dfan.com/checkin",
                 openMode: "foreground",
                 resultMode: "script",
                 note: "签到提交需要验证码校验，需前台完成"
             },
             async run() {
-                if (location.href.includes('not_authenticated') || location.href.includes('sign_in')) {
+                if (/^\/login\/?$/.test(location.pathname) || location.href.includes('not_authenticated') ||
+                    location.href.includes('sign_in') || document.querySelector('a[href="/login"]')) {
                     recordTargetStatus('2dfan', 'needs-login', {
                         stage: 'login',
                         message: '2dfan 需要先登录账号',
@@ -2613,8 +2614,53 @@
                     return false;
                 }
 
-                if (!location.href.includes('recheckin')) {
-                    window.location.href = "/users/177256/recheckin";
+                if (!/^\/checkin\/?$/.test(location.pathname) && !location.href.includes('recheckin')) {
+                    window.location.href = "/checkin";
+                    return false;
+                }
+
+                if (/^\/checkin\/?$/.test(location.pathname)) {
+                    const isCheckinPage = () => /^\/checkin\/?$/.test(location.pathname);
+                    const isSigned = () => isCheckinPage() &&
+                        Array.from(document.querySelectorAll('.checkin-action button'))
+                            .some(button => button.textContent.trim() === '今日已签到');
+                    // 新版是异步渲染页面；日历图例中的“已签到”不能作为今日成功标记。
+                    const btn = await waitForElement('.checkin-action button', 10000);
+                    if (isSigned()) {
+                        return completeSign('2dfan', '页面显示今日已签到');
+                    }
+                    if (!isCheckinPage() || !btn) return false;
+
+                    const getCaptchaDialog = () => isCheckinPage()
+                        ? Array.from(document.querySelectorAll('[role="dialog"]')).find(dialog =>
+                            dialog.getClientRects().length > 0 && /人机验证/.test(dialog.textContent))
+                        : null;
+                    const captchaMonitor = ensureCaptchaAutoSubmitMonitor({
+                        siteKey: '2dfan',
+                        siteName: '2dfan',
+                        actionLabel: '确认签到',
+                        isSigned,
+                        isVerified: () => Boolean(getCaptchaDialog()
+                            ?.querySelector('input[name="cf-turnstile-response"]')?.value?.trim()),
+                        getSubmitButton: () => Array.from(getCaptchaDialog()?.querySelectorAll('button') || [])
+                            .find(button => button.textContent.trim() === '确认'),
+                        onSuccess: () => completeSign('2dfan', '人工验证后已自动签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION)
+                    });
+                    if (captchaMonitor.finished) return true;
+                    if (captchaMonitor.submitted) return false;
+
+                    // 复查期间只打开一次，避免弹窗关闭或请求未完成时重复签到。
+                    if (!getCaptchaDialog() && !captchaMonitor.dialogOpened && !btn.disabled &&
+                        btn.textContent.trim() === '签到') {
+                        captchaMonitor.dialogOpened = true;
+                        markPendingAutoCloseAfterSignAction('2dfan', 'sign-click');
+                        btn.click();
+                    }
+                    recordTargetStatus('2dfan', 'needs-foreground', {
+                        stage: 'captcha',
+                        message: '2dfan 需要在前台完成人机验证，验证通过后将自动确认签到',
+                        url: location.href
+                    });
                     return false;
                 }
 

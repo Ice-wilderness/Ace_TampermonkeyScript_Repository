@@ -230,7 +230,7 @@
 - 自动签到站点：脚本头部 `@match` 中列出的论坛与资源站页面。
 - 司机社：`https://sjs96.com/*`。
 - GalgameX 新站：`https://www.galgamex.net/*`。
-- 2dfan `https://2dfan.com/*` / `https://2dfan.org/*` 采用前台签到流程，人工完成 Cloudflare Turnstile 或阿里云验证码后会自动提交签到。
+- 2dfan `https://2dfan.com/*` / `https://2dfan.org/*` 采用前台签到流程，控制台默认打开新版 `/checkin` 页面；脚本自动打开人机验证弹窗，人工完成 Cloudflare Turnstile 验证后自动点击“确认”，并根据签到按钮的“今日已签到”状态确认成功。保留旧版 `recheckin` 页面的 Cloudflare Turnstile / 阿里云验证码自动提交逻辑。
 - 老王论坛 `https://laowang.vip/*` 采用前台签到流程，人工完成站点点击验证后会自动点击签到并确认状态。
 - 有叽叽论坛 `https://www.uu-gg.one/*` 因 Cloudflare 验证限制，采用后台打开签到页后由页面内 API 提交并检测完成状态。
 - 98堂 `https://www.sehuatang.org/*` 默认打开论坛首页，不强制跳转签到页；需要先回复 1 次，再手动进入签到页完成点选验证码。
