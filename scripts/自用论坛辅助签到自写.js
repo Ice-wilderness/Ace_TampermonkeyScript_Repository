@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.18.0
+// @version      2.18.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -2632,18 +2632,24 @@
                     if (!isCheckinPage() || !btn) return false;
 
                     const getCaptchaDialog = () => isCheckinPage()
-                        ? Array.from(document.querySelectorAll('[role="dialog"]')).find(dialog =>
-                            dialog.getClientRects().length > 0 && /人机验证/.test(dialog.textContent))
+                        ? Array.from(document.querySelectorAll('[role="dialog"], .n-modal')).find(dialog =>
+                            dialog.getClientRects().length > 0 && dialog.querySelector('.captcha-modal-body') &&
+                            /人机验证/.test(dialog.textContent))
                         : null;
+                    const getCaptchaConfirmButton = () => Array.from(getCaptchaDialog()?.querySelectorAll('button') || [])
+                        .find(button => button.textContent.trim() === '确认');
                     const captchaMonitor = ensureCaptchaAutoSubmitMonitor({
                         siteKey: '2dfan',
                         siteName: '2dfan',
                         actionLabel: '确认签到',
                         isSigned,
-                        isVerified: () => Boolean(getCaptchaDialog()
-                            ?.querySelector('input[name="cf-turnstile-response"]')?.value?.trim()),
-                        getSubmitButton: () => Array.from(getCaptchaDialog()?.querySelectorAll('button') || [])
-                            .find(button => button.textContent.trim() === '确认'),
+                        // 新版在组件内部保存验证结果，阿里云验证不会写入 Turnstile 隐藏字段。
+                        // 站点仅在 captchaReady 为真时启用确认按钮，以此兼容两种验证方式。
+                        isVerified: () => {
+                            const button = getCaptchaConfirmButton();
+                            return Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+                        },
+                        getSubmitButton: getCaptchaConfirmButton,
                         onSuccess: () => completeSign('2dfan', '人工验证后已自动签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION)
                     });
                     if (captchaMonitor.finished) return true;
