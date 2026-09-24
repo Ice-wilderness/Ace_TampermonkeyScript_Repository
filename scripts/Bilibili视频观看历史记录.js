@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.0.1
+// @version      4.1.0
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -47,7 +47,30 @@
     };
     const FLOATING_BUTTON_VISIBILITY_VALUES = Object.values(FLOATING_BUTTON_VISIBILITY);
 
+    const TAG_STYLE_DEFAULTS = {
+        coverStyle: 'label', episodeStyle: 'label',
+        coverRingSize: 36, episodeRingSize: 27,
+        tagVisitedBg: '#9e9e9e', tagVisitedText: '#ffffff',
+        tagLowBg: '#ff9800', tagLowText: '#ffffff',
+        tagMidBg: '#4285f4', tagMidText: '#ffffff',
+        tagHighBg: '#4caf50', tagHighText: '#ffffff',
+        coverFontSize: 12, coverRadius: 4, coverPadding: 5, coverLabelMode: 'full',
+        episodeFontSize: 10, episodeRadius: 4, episodePadding: 4, episodeLabelMode: 'full'
+    };
+    const TAG_STYLE_RANGES = {
+        coverRingSize: [24, 64], episodeRingSize: [20, 36],
+        coverFontSize: [9, 24], coverRadius: [0, 16], coverPadding: [0, 16],
+        episodeFontSize: [9, 16], episodeRadius: [0, 12], episodePadding: [0, 10]
+    };
+    const normalizeTagStyle = (settings) => Object.fromEntries(Object.entries(TAG_STYLE_DEFAULTS).map(([key, fallback]) => {
+        const value = settings[key], range = TAG_STYLE_RANGES[key];
+        const valid = range ? String(value ?? '').trim() !== '' && Number.isInteger(Number(value)) && Number(value) >= range[0] && Number(value) <= range[1]
+            : key.endsWith('Style') ? ['label', 'ring'].includes(value)
+                : key.endsWith('Mode') ? ['full', 'compact'].includes(value) : /^#[0-9a-f]{6}$/i.test(value);
+        return [key, valid ? (range ? Number(value) : value) : fallback];
+    }));
     const DEFAULT_CONFIG = {
+        ...TAG_STYLE_DEFAULTS,
         showProgressBar: true,
         showVisitedTag: true,
         debug: false,
@@ -60,6 +83,7 @@
     };
 
     const CONFIG = Object.assign({}, DEFAULT_CONFIG, GM_getValue('bvh_settings', {}));
+    Object.assign(CONFIG, normalizeTagStyle(CONFIG));
 
     const getFloatingButtonVisibility = () => (
         FLOATING_BUTTON_VISIBILITY_VALUES.includes(CONFIG.floatingButtonVisibility)
@@ -207,6 +231,87 @@
         isValid: (value) => !!VideoKey.fromText(value)
     };
 
+    // 页面标记和设置预览共用同一套样式，草稿不会改变已保存的配置。
+    const TagStyle = {
+        signature: () => Object.keys(TAG_STYLE_DEFAULTS).map(key => CONFIG[key]),
+        text: (record, scope = 'cover', compact = false, settings = CONFIG) => {
+            if (compact || settings[`${scope}LabelMode`] === 'compact') {
+                if (record.status === RECORD_STATUS.WATCHED) return record.percent || '看';
+                if (record.status === RECORD_STATUS.VISITED) return '访';
+            }
+            return `${record.status}${record.percent || ''}`;
+        },
+        state: (record, settings = CONFIG) => {
+            const p = parseInt(record.percent);
+            if (record.status !== RECORD_STATUS.WATCHED || isNaN(p)) return 'Visited';
+            return p < settings.lowThreshold ? 'Low' : p <= settings.highThreshold ? 'Mid' : 'High';
+        },
+        apply: (el, scope = 'cover', settings = CONFIG) => {
+            const d = normalizeTagStyle(settings);
+            el.classList.remove('bvh-tag-ring');
+            for (const key of ['background-image', 'width', 'min-width', 'max-width', 'min-height', 'max-height', 'flex', 'display', 'margin', 'box-shadow', 'text-align', 'font-variant-numeric', 'font-weight', 'box-sizing']) el.style.removeProperty(key);
+            const state = ['Visited', 'Low', 'Mid', 'High'].find(name => el.classList.contains(`bvh-tag-${name.toLowerCase()}`)) || 'Visited';
+            const hex = d[`tag${state}Bg`];
+            const rgb = [1, 3, 5].map(offset => parseInt(hex.slice(offset, offset + 2), 16));
+            const grid = el.classList.contains('bvh-episode-tag-grid');
+            const small = scope === 'cover' && el.classList.contains('bvh-tag-small');
+            const size = Math.max(8, d[`${scope}FontSize`] - (grid ? 1 : small ? 2 : 0));
+            const height = size + (scope === 'cover' ? 8 : grid ? 5 : 6);
+            const padding = Math.max(0, d[`${scope}Padding`] - (grid || small ? 1 : 0));
+            for (const [key, value] of Object.entries({
+                'background-color': `rgba(${rgb.join(',')},0.9)`, color: d[`tag${state}Text`],
+                'font-size': `${size}px`, 'border-radius': `${d[`${scope}Radius`]}px`,
+                padding: `0 ${padding}px`, height: `${height}px`, 'line-height': `${height}px`
+            })) el.style.setProperty(key, value, 'important');
+            if (grid) el.style.setProperty('max-width', `${Math.max(30, size * 4 + padding * 2)}px`, 'important');
+            el.style.opacity = String(Math.max(40, Math.min(100, Number(settings.tagOpacity) || 100)) / 100);
+            // 无具体进度的访问记录、多 P 汇总仍用文字，避免误导为 0%。
+            const match = el.textContent.match(/(-?\d+(?:\.\d+)?)%/);
+            if (d[`${scope}Style`] === 'ring' && match) {
+                const percent = Math.max(0, Math.min(100, Number(match[1])));
+                // 直径独立于字号；小封面和网格保留上限，防止遮挡或撑坏布局。
+                const requestedSize = d[`${scope}RingSize`];
+                const diameter = small ? Math.min(36, requestedSize) : grid ? Math.min(27, requestedSize) : requestedSize;
+                const ringSize = Math.min(size, diameter / 3);
+                const stroke = 2;
+                el.classList.add('bvh-tag-ring');
+                el.textContent = `${Math.round(percent)}%`;
+                for (const [key, value] of Object.entries({
+                    width: `${diameter}px`, height: `${diameter}px`, 'max-width': `${diameter}px`,
+                    'min-width': `${diameter}px`, 'min-height': `${diameter}px`, 'max-height': `${diameter}px`,
+                    flex: `0 0 ${diameter}px`, display: 'inline-block', 'font-size': `${ringSize}px`,
+                    padding: '0', 'line-height': `${diameter}px`, 'border-radius': '50%',
+                    'box-sizing': 'border-box', 'text-align': 'center', 'font-weight': '600', 'font-variant-numeric': 'tabular-nums',
+                    'background-color': 'transparent',
+                    'box-shadow': '0 1px 3px rgba(0,0,0,.16)'
+                })) el.style.setProperty(key, value, 'important');
+                const ns = 'http://www.w3.org/2000/svg';
+                const make = (name, attributes) => {
+                    const node = document.createElementNS(ns, name);
+                    for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+                    return node;
+                };
+                const center = diameter / 2, radius = center - stroke / 2 - .5;
+                const svg = make('svg', { viewBox: `0 0 ${diameter} ${diameter}`, role: 'img', 'aria-label': `观看进度 ${Math.round(percent)}%` });
+                svg.style.cssText = 'display:block!important;width:100%!important;height:100%!important;overflow:visible!important';
+                const track = make('circle', { cx: center, cy: center, r: radius, 'stroke-width': stroke });
+                track.style.cssText = 'fill:var(--bvh-ring-surface)!important;stroke:var(--bvh-ring-track)!important';
+                const progress = make('circle', { cx: center, cy: center, r: radius, fill: 'none', stroke: hex,
+                    'stroke-width': stroke, pathLength: 100, 'stroke-dasharray': `${percent} 100`,
+                    transform: `rotate(-90 ${center} ${center})`, 'stroke-linecap': 'round', opacity: percent === 0 ? 0 : 1 });
+                const label = `${Math.round(percent)}%`;
+                // 字体回退、页面字距和缩放都可能改变字宽；为内圈留白并明确约束文字长度。
+                const textWidth = Math.min(diameter - stroke * 2 - 6, label.length * ringSize * .62);
+                const text = make('text', { x: center, y: center, textLength: textWidth, lengthAdjust: 'spacingAndGlyphs' });
+                text.style.cssText = `fill:var(--bvh-ring-ink)!important;stroke:none!important;font:600 ${ringSize}px system-ui,sans-serif!important;font-variant-numeric:tabular-nums!important;letter-spacing:0!important;word-spacing:0!important;text-anchor:middle!important;dominant-baseline:central!important`;
+                text.textContent = label;
+                svg.append(track, progress, text);
+                el.replaceChildren(svg);
+                if (scope === 'cover') el.style.setProperty('margin', small ? '3px' : '5px', 'important');
+            }
+        }
+    };
+
     // --- 样式注入 ---
     let stylesInjected = false;
     const injectStyles = () => {
@@ -218,6 +323,10 @@
         .bvh-tag-low { background-color: rgba(255, 152, 0, 0.9) !important; }
         .bvh-tag-mid { background-color: rgba(66, 133, 244, 0.9) !important; }
         .bvh-tag-high { background-color: rgba(76, 175, 80, 0.9) !important; }
+        .bvh-tag-ring { --bvh-ring-surface: #fff; --bvh-ring-ink: #18232f; --bvh-ring-track: #dde2e7; }
+        @media (prefers-color-scheme: dark) {
+            .bvh-tag-ring { --bvh-ring-surface: #181818; --bvh-ring-ink: #fff; --bvh-ring-track: #454545; }
+        }
         .bvh-tag-small { margin: .2em!important; padding: 0 4px!important; height: 18px; line-height: 18px; font-size: 10px; }
         .bvh-tag-big { height: 22px; line-height: 23px; font-size: 14px; }
         .bvh-episode-tag { display: inline-block; margin-left: 6px; padding: 0 4px; height: 16px; line-height: 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 600; vertical-align: middle; white-space: nowrap; pointer-events: none; }
@@ -227,7 +336,7 @@
         .video-pod__list.grid .video-pod__item.page { position: relative; }
         .bvh-episode-tag-grid { position: absolute; top: 2px; right: 2px; margin: 0; padding: 0 3px; min-width: 14px; max-width: 30px; height: 14px; line-height: 14px; font-size: 9px; text-align: center; overflow: hidden; text-overflow: ellipsis; }
         .bpx-player-ctrl-eplist-multi-menu-item { position: relative; }
-        .bpx-player-ctrl-eplist-multi-menu-item .bpx-player-ctrl-eplist-multi-menu-item-text { display: block; padding-right: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .bpx-player-ctrl-eplist-multi-menu-item .bpx-player-ctrl-eplist-multi-menu-item-text { display: block; padding-right: var(--bvh-episode-label-space, 76px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .bpx-player-ctrl-eplist-multi-menu-item .bvh-episode-tag { position: absolute; right: 10px; top: 50%; margin-left: 0; transform: translateY(-50%); }
         .bvh-progress-bar { background: linear-gradient(90deg, rgba(122, 134, 234, 0.9), rgba(156, 166, 255, 0.7)); z-index: 108; position: absolute; height: 4px; bottom: 0px; border-bottom-left-radius: inherit; border-bottom-right-radius: inherit; pointer-events: none; }
         .bvh-toast-container { position: fixed; top: 24px; left: 50%; transform: translateX(-50%); z-index: 100010; display: flex; flex-direction: column; align-items: center; gap: 10px; width: min(420px, calc(100vw - 32px)); pointer-events: none; }
@@ -804,6 +913,7 @@
     if (CONFIG.debug) Utils.installIssueHooks();
 
     const DISPLAY_SETTINGS = new Set([
+        ...Object.keys(TAG_STYLE_DEFAULTS),
         'showProgressBar',
         'showVisitedTag',
         'tagOpacity',
@@ -815,6 +925,7 @@
     const SettingsManager = {
         save: async (patch = {}) => {
             const next = Object.assign({}, CONFIG, patch);
+            Object.assign(next, normalizeTagStyle(next));
             await HistoryStoreIO.set('bvh_settings', next);
             Object.assign(CONFIG, next);
             if (patch.debug) Utils.installIssueHooks();
@@ -859,11 +970,11 @@
             document.querySelectorAll('.video-pod__item[data-key]').forEach(el => {
                 const dataKey = el.getAttribute('data-key');
                 const directKey = VideoKey.fromText(dataKey);
-                const title = el.querySelector('.multi-p > .simple-base-item.head .title-txt')?.innerText ||
-                    el.querySelector('.single-p .title-txt')?.innerText ||
-                    el.querySelector('.title-txt')?.innerText ||
+                const title = el.querySelector('.multi-p > .simple-base-item.head .title-txt')?.textContent ||
+                    el.querySelector('.single-p .title-txt')?.textContent ||
+                    el.querySelector('.title-txt')?.textContent ||
                     el.querySelector('.title')?.getAttribute('title') ||
-                    el.innerText;
+                    el.textContent;
                 const normalizedTitle = normalizeTitle(title);
                 if (directKey && normalizedTitle) {
                     sectionBaseByTitle.set(normalizedTitle, directKey);
@@ -875,17 +986,18 @@
                 if (directKey && el.querySelector('.page-list .simple-base-item.page-item')) sectionMultiBases.add(directKey);
                 add(el, dataKey, title, directKey);
             });
+            const sectionPageIndexes = new Map();
             document.querySelectorAll('.video-pod__list.section .video-pod__item[data-key] .page-list .simple-base-item.page-item').forEach(el => {
                 const parent = el.closest('.video-pod__item[data-key]');
                 const baseKey = VideoKey.fromText(parent?.getAttribute('data-key'));
                 if (!baseKey) return;
-                const pages = Array.from(parent.querySelectorAll('.page-list .simple-base-item.page-item'));
-                const page = pages.indexOf(el) + 1;
+                const page = (sectionPageIndexes.get(parent) || 0) + 1;
+                sectionPageIndexes.set(parent, page);
                 const key = VideoKey.withPage(baseKey, page);
-                add(el, `section-page:${baseKey}:${page}`, el.querySelector('.title-txt')?.innerText || el.querySelector('.title')?.getAttribute('title') || el.innerText, key);
+                add(el, `section-page:${baseKey}:${page}`, el.querySelector('.title-txt')?.textContent || el.querySelector('.title')?.getAttribute('title') || el.textContent, key);
             });
             document.querySelectorAll('.bpx-player-ctrl-eplist-episodes').forEach(group => {
-                const groupTitle = group.querySelector('.bpx-player-ctrl-eplist-episodes-title-text')?.innerText || '';
+                const groupTitle = group.querySelector('.bpx-player-ctrl-eplist-episodes-title-text')?.textContent || '';
                 const isActiveGroup = group.querySelector('.bpx-state-multi-active-item') || group.querySelector('.bpx-player-ctrl-eplist-multi-menu-item.bpx-state-multi-active-item');
                 const baseKey = sectionBaseByTitle.get(normalizeTitle(groupTitle)) || (isActiveGroup && sectionMultiBases.has(currentBase) ? currentBase : '');
                 if (!baseKey) return;
@@ -894,13 +1006,13 @@
                     const page = index + 1;
                     const cid = el.getAttribute('data-cid');
                     const key = VideoKey.withPage(baseKey, page);
-                    add(el, cid, el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.innerText || el.innerText, key);
+                    add(el, cid, el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.textContent || el.textContent, key);
                 });
             });
             const playerMenuItems = Array.from(document.querySelectorAll('.bpx-player-ctrl-eplist-multi-menu-item[data-cid]'));
             const canMapPlayerByOrder = sectionVideoKeys.length > 1 && sectionVideoKeys.length === playerMenuItems.length;
             playerMenuItems.forEach((el, index) => {
-                const title = el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.innerText || el.innerText;
+                const title = el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.textContent || el.textContent;
                 add(el, el.getAttribute('data-cid'), title, keyByTitle.get(normalizeTitle(title)) || (canMapPlayerByOrder ? sectionVideoKeys[index] : ''));
             });
             document.querySelectorAll('.action-list-item-wrap[data-key]').forEach(el => {
@@ -916,7 +1028,7 @@
                             page,
                             key,
                             base: VideoKey.base(key),
-                            title: (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.innerText || el.innerText || '').trim()
+                            title: (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.textContent || el.textContent || '').trim()
                         });
                     }
                 }
@@ -1907,7 +2019,7 @@
             el.className = className;
             el.title = title;
             el.innerText = text;
-            el.style.opacity = String(Math.max(40, Math.min(100, CONFIG.tagOpacity)) / 100);
+            TagStyle.apply(el);
             const pos = CONFIG.tagPosition;
             if (pos.includes('right')) el.style.right = '0';
             else el.style.left = '0';
@@ -2365,6 +2477,50 @@
             else if (this.tab === 'history') footer.innerHTML = `<span data-page-info>正在准备记录…</span><label class="bvh-page-size">每页 <select data-page-size aria-label="每页记录数量">${[20, 30, 50, 100].map(n => `<option ${n === this.state.pageSize ? 'selected' : ''}>${n}</option>`).join('')}</select> 条</label><button data-action="prev" aria-label="上一页">上一页</button><button data-action="next" aria-label="下一页">下一页</button>`;
             else footer.innerHTML = '<span>统计依据：每个视频 / 分 P 的最近保存记录，不代表累计观看时长。</span>';
         }
+        renderTagStyleSettings() {
+            const d = this.draft, esc = Utils.escapeHTML;
+            const number = (key, label) => `<label class="bvh-number-field">${label}<div><input data-setting="${key}" type="number" min="${TAG_STYLE_RANGES[key][0]}" max="${TAG_STYLE_RANGES[key][1]}" step="1" value="${esc(d[key])}" aria-describedby="bvh-error-${key}"><span>px</span></div><small class="bvh-field-error" id="bvh-error-${key}"></small></label>`;
+            const scope = (prefix, label) => `<fieldset class="bvh-tag-dimensions"><legend>${label}</legend><div class="bvh-setting-row"><label for="bvh-${prefix}-style">外观</label><select id="bvh-${prefix}-style" data-setting="${prefix}Style">${[['label', '经典标签'], ['ring', '圆环进度']].map(([value, text]) => `<option value="${value}" ${d[`${prefix}Style`] === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div><div class="bvh-tag-size-fields">${number(`${prefix}FontSize`, '字号')}${number(`${prefix}Radius`, '圆角')}${number(`${prefix}Padding`, '左右留白')}${number(`${prefix}RingSize`, '圆环直径')}</div><div class="bvh-setting-row"><label for="bvh-${prefix}-mode">显示内容</label><select id="bvh-${prefix}-mode" data-setting="${prefix}LabelMode">${[['full', '完整 · 已观看80%'], ['compact', '精简 · 80% / 访']].map(([value, text]) => `<option value="${value}" ${d[`${prefix}LabelMode`] === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div></fieldset>`;
+            return `<section class="bvh-section"><div class="bvh-section-heading"><span>04</span><h2>颜色与尺寸</h2></div><p class="bvh-help">封面与合集分别调整大小，四种状态共用配色。</p><div class="bvh-tag-colors"><div class="bvh-color-heading"><span>记录状态</span><span>背景</span><span>文字</span></div>${[['Visited', '已访问'], ['Low', '低进度'], ['Mid', '中进度'], ['High', '高进度']].map(([state, label]) => `<div class="bvh-color-row"><span>${label}</span>${[['Bg', '背景'], ['Text', '文字']].map(([suffix, name]) => `<input type="color" data-setting="tag${state}${suffix}" value="${esc(d[`tag${state}${suffix}`])}" aria-label="${label}${name}颜色">`).join('')}</div>`).join('')}</div>${scope('cover', '视频封面')}${scope('episode', '合集列表')}<p class="bvh-help">圆环底色和文字随系统深浅色模式切换，背景色用作进度环颜色；圆环直径可单独调整，小封面最多 36px，合集网格最多 27px。圆角、留白和显示内容仅影响经典标签。圆环替代封面底部进度条。无进度记录仍显示文字。小封面略微缩小，合集网格始终精简显示；多 P 汇总保留“已记录 多P”。</p><button class="bvh-style-reset" data-action="style-defaults">恢复标签样式默认值</button></section>`;
+        }
+        organizeSettings() {
+            const groups = this.q('.bvh-setting-groups');
+            const [common, marks, placement, appearance, diagnostics] = [...groups.children];
+            const heading = (section, index, title) => {
+                section.querySelector('.bvh-section-heading>span').textContent = index;
+                section.querySelector('h2').textContent = title;
+            };
+            const disclosure = (title, nodes) => {
+                const details = document.createElement('details'); details.className = 'bvh-settings-details';
+                const summary = document.createElement('summary'); summary.textContent = title;
+                details.append(summary, ...nodes); return details;
+            };
+            heading(common, '01', '常用设置');
+            common.append(...[...marks.children].slice(1)); marks.remove();
+            heading(appearance, '02', '标签外观');
+            const colors = appearance.querySelector('.bvh-tag-colors');
+            const palette = disclosure('状态配色', [colors]);
+            const position = disclosure('位置、透明度与进度分界', [...placement.children].slice(1));
+            placement.remove();
+            const note = appearance.querySelector('.bvh-style-reset').previousElementSibling;
+            note.textContent = '圆环随系统切换深浅底色；小封面最多 36px，合集网格最多 27px。无进度与多 P 汇总保留文字。';
+            appearance.insertBefore(palette, note);
+            appearance.insertBefore(position, note);
+            const diagnosticDetails = disclosure('诊断与维护', [...diagnostics.children].slice(1));
+            diagnostics.replaceChildren(diagnosticDetails);
+            diagnostics.classList.add('bvh-diagnostics');
+            this.syncStyleFields();
+        }
+        syncStyleFields() {
+            for (const scope of ['cover', 'episode']) {
+                const ring = this.draft[`${scope}Style`] === 'ring';
+                for (const suffix of ['Radius', 'Padding', 'RingSize']) {
+                    const input = this.q(`[data-setting="${scope}${suffix}"]`);
+                    input.closest('label').hidden = suffix === 'RingSize' ? !ring : ring;
+                }
+                this.q(`[data-setting="${scope}LabelMode"]`).closest('.bvh-setting-row').hidden = ring;
+            }
+        }
         renderSettings() {
             const d = this.draft, esc = Utils.escapeHTML;
             const toggle = (key, label, note) => `<div class="bvh-setting-row"><label for="bvh-setting-${key}">${label}<small>${note}</small></label><input class="bvh-switch" id="bvh-setting-${key}" data-setting="${key}" type="checkbox" ${d[key] ? 'checked' : ''}></div>`;
@@ -2373,19 +2529,31 @@
                 <section class="bvh-section"><div class="bvh-section-heading"><span>01</span><h2>播放与提示</h2></div>${toggle('autoResumePrompt', '续播提示', '再次打开视频时，提示上次观看的位置。')}<div class="bvh-setting-row"><label for="bvh-setting-floatingButtonVisibility">悬浮入口<small>选择在哪些页面显示快捷入口。</small></label><select id="bvh-setting-floatingButtonVisibility" data-setting="floatingButtonVisibility">${[['show-all', '所有页面显示'], ['hide-video', '仅非视频页显示'], ['hide-non-video', '仅视频页显示'], ['hide-all', '全部隐藏']].map(([value, text]) => `<option value="${value}" ${d.floatingButtonVisibility === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div></section>
                 <section class="bvh-section"><div class="bvh-section-heading"><span>02</span><h2>页面标记</h2></div>${toggle('showProgressBar', '观看进度条', '在视频封面上显示已观看的进度。')}${toggle('showVisitedTag', '已访问标签', '标记打开过、但还未开始观看的视频。')}</section>
                 <section class="bvh-section"><div class="bvh-section-heading"><span>03</span><h2>标签样式</h2></div><fieldset class="bvh-position"><legend>标签位置</legend><div>${[['top-left', '左上'], ['top-right', '右上'], ['bottom-left', '左下'], ['bottom-right', '右下']].map(([value, label]) => `<label><input type="radio" name="bvh-position" data-setting="tagPosition" value="${value}" ${d.tagPosition === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset><div class="bvh-setting-row"><label for="bvh-opacity-number">标签透明度<small>数值越高，标签越清晰。</small></label><div class="bvh-opacity"><input aria-label="标签透明度滑块" type="range" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><input id="bvh-opacity-number" type="number" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><span>%</span></div></div><div class="bvh-thresholds">${threshold('lowThreshold', '低进度分界')}${threshold('highThreshold', '高进度分界')}</div><p class="bvh-help">低于低分界为低进度；超过高分界为高进度。</p></section>
-                <section class="bvh-section"><div class="bvh-section-heading"><span>04</span><h2>诊断与维护</h2></div>${toggle('debug', '调试日志', '需要排查问题时开启，记录脚本运行信息。')}<div class="bvh-maintenance-links"><button data-action="download-log">下载日志</button><button data-action="clear-log">清空日志</button><button data-action="reset-position">恢复悬浮位置</button>${this.options.currentKey && StorageManager.getRecord(this.options.currentKey)?.currentTime ? '<button data-action="jump">跳转到已记录进度</button>' : ''}</div><details class="bvh-storage-tools"><summary>存储维护</summary><p class="bvh-help">以下离线操作需要先关闭其他所有运行本脚本的页面。</p><button data-action="staging-info">检查暂存数据</button><button data-action="cleanup-staging">离线清理暂存数据</button><button data-action="legacy-snapshot">生成旧版兼容快照</button><p data-storage-info role="status"></p></details></section>
-                </div><aside class="bvh-preview-panel"><div class="bvh-eyebrow">LIVE PREVIEW</div><h2>标记效果预览</h2><p>调整左侧选项，即时查看效果。</p><div class="bvh-preview-cover"><div class="bvh-preview-art">${workbenchIcon('mark')}<span>每一段观看，都有迹可循。</span><small>WATCH · PAUSE · CONTINUE</small></div><div data-preview-tag></div><div data-preview-bar></div><span class="bvh-preview-duration">12:48</span></div><h3>下一次，从这里继续</h3><p class="bvh-preview-caption">演示画幅 · 仅用于样式预览</p><div class="bvh-preview-states" aria-label="预览记录类型">${[['visited', '已访问'], ['low', '低进度'], ['mid', '中进度'], ['high', '高进度'], ['multi', '多 P']].map(([v, l]) => `<button data-preview="${v}" aria-pressed="${v === this.previewState}">${l}</button>`).join('')}</div><div class="bvh-preview-note"><span class="bvh-dot"></span>预览不会修改实际记录<br><small>保存设置后，页面上的标记才会更新。</small></div></aside></div>`;
+                ${this.renderTagStyleSettings()}
+                <section class="bvh-section"><div class="bvh-section-heading"><span>05</span><h2>诊断与维护</h2></div>${toggle('debug', '调试日志', '需要排查问题时开启，记录脚本运行信息。')}<div class="bvh-maintenance-links"><button data-action="download-log">下载日志</button><button data-action="clear-log">清空日志</button><button data-action="reset-position">恢复悬浮位置</button>${this.options.currentKey && StorageManager.getRecord(this.options.currentKey)?.currentTime ? '<button data-action="jump">跳转到已记录进度</button>' : ''}</div><details class="bvh-storage-tools"><summary>存储维护</summary><p class="bvh-help">以下离线操作需要先关闭其他所有运行本脚本的页面。</p><button data-action="staging-info">检查暂存数据</button><button data-action="cleanup-staging">离线清理暂存数据</button><button data-action="legacy-snapshot">生成旧版兼容快照</button><p data-storage-info role="status"></p></details></section>
+                </div><aside class="bvh-preview-panel"><div class="bvh-eyebrow">LIVE PREVIEW</div><h2>标记效果预览</h2><p>调整左侧选项，即时查看效果。</p><div class="bvh-preview-cover"><div class="bvh-preview-art">${workbenchIcon('mark')}<span>每一段观看，都有迹可循。</span><small>WATCH · PAUSE · CONTINUE</small></div><div data-preview-tag></div><div data-preview-bar></div><span class="bvh-preview-duration">12:48</span></div><h3>下一次，从这里继续</h3><p class="bvh-preview-caption">演示画幅 · 仅用于样式预览</p><div class="bvh-preview-states" aria-label="预览记录类型">${[['visited', '已访问'], ['low', '低进度'], ['mid', '中进度'], ['high', '高进度'], ['multi', '多 P']].map(([v, l]) => `<button data-preview="${v}" aria-pressed="${v === this.previewState}">${l}</button>`).join('')}</div><div class="bvh-preview-playlist"><span class="bvh-help">合集列表</span><div class="bvh-preview-episode-row"><span>01 · 下一段旅程</span><span data-preview-episode></span></div><div class="bvh-preview-grid-row"><span class="bvh-help">网格分 P</span><div class="bvh-preview-grid-cell">01<span data-preview-grid></span></div></div></div><div class="bvh-preview-note"><span class="bvh-dot"></span>预览不会修改实际记录<br><small>保存设置后，页面上的标记才会更新。</small></div></aside></div>`;
+            this.organizeSettings();
             this.renderPreview();
         }
         renderPreview() {
+            this.syncStyleFields();
             const d = this.draft, state = this.previewState, p = { low: 15, mid: 55, high: 95, multi: 55 }[state];
             const tag = this.q('[data-preview-tag]'), bar = this.q('[data-preview-bar]');
-            tag.className = 'bvh-preview-tag';
-            tag.textContent = state === 'visited' ? '已访问' : state === 'multi' ? '已记录 多P' : `已观看 ${p}%`;
-            const color = state === 'visited' ? '#626D78' : state === 'multi' ? '#007EAD' : p < Number(d.lowThreshold) ? '#93611A' : p <= Number(d.highThreshold) ? '#007EAD' : '#23734E';
-            tag.style.cssText = `background:${color};opacity:${Number(d.tagOpacity) / 100};${d.tagPosition.includes('top') ? 'top' : 'bottom'}:12px;${d.tagPosition.includes('left') ? 'left' : 'right'}:12px`;
+            const record = { status: state === 'visited' ? RECORD_STATUS.VISITED : RECORD_STATUS.WATCHED, percent: p ? `${p}%` : '' };
+            const colorState = state === 'multi' ? 'Mid' : TagStyle.state(record, d);
+            tag.className = `bvh-preview-tag bvh-tag-${colorState.toLowerCase()}`;
+            tag.textContent = state === 'multi' ? '已记录 多P' : TagStyle.text(record, 'cover', false, d);
+            tag.style.cssText = `${d.tagPosition.includes('top') ? 'top' : 'bottom'}:12px;${d.tagPosition.includes('left') ? 'left' : 'right'}:12px`;
+            TagStyle.apply(tag, 'cover', d);
             tag.hidden = state === 'visited' && !d.showVisitedTag;
-            bar.className = 'bvh-preview-bar'; bar.style.width = `${p || 0}%`; bar.style.background = color; bar.hidden = !d.showProgressBar || state === 'visited' || state === 'multi';
+            for (const compact of [false, true]) {
+                const episode = this.q(compact ? '[data-preview-grid]' : '[data-preview-episode]');
+                episode.className = `bvh-episode-tag bvh-tag-${TagStyle.state(record, d).toLowerCase()}${compact ? ' bvh-episode-tag-grid' : ''}`;
+                episode.textContent = TagStyle.text(record, 'episode', compact, d);
+                TagStyle.apply(episode, 'episode', d);
+                episode.hidden = tag.hidden;
+            }
+            bar.className = 'bvh-preview-bar'; bar.style.width = `${p || 0}%`; bar.hidden = !d.showProgressBar || state === 'visited' || state === 'multi' || tag.classList.contains('bvh-tag-ring');
             this.root.querySelectorAll('[data-preview]').forEach(el => el.setAttribute('aria-pressed', el.dataset.preview === state));
         }
         historyShell() {
@@ -2431,7 +2599,10 @@
             const el = event.target;
             if (el.matches('[data-query]')) { this.state.query = el.value; this.state.page = 1; clearTimeout(this.searchTimer); this.generation++; this.searchTimer = setTimeout(() => this.refresh(), 180); }
             if (el.dataset.setting) {
-                const key = el.dataset.setting; this.draft[key] = el.type === 'checkbox' ? el.checked : el.value;
+                const key = el.dataset.setting, value = el.type === 'checkbox' ? el.checked : el.value;
+                // input 已更新草稿时，失焦触发的 change 不再重建页脚，避免吞掉保存点击。
+                if (this.draft[key] === value) return;
+                this.draft[key] = value;
                 if (key === 'tagOpacity') this.root.querySelectorAll('[data-setting="tagOpacity"]').forEach(other => { if (other !== el) other.value = el.value; });
                 this.renderPreview(); this.renderFooter();
             }
@@ -2456,6 +2627,10 @@
             try {
                 if (action === 'save') await this.save();
                 if (action === 'defaults') { this.draft = { ...DEFAULT_CONFIG }; this.renderSettings(); this.renderFooter(); }
+                if (action === 'style-defaults') {
+                    for (const key of [...Object.keys(TAG_STYLE_DEFAULTS), 'tagPosition', 'tagOpacity']) this.draft[key] = DEFAULT_CONFIG[key];
+                    this.renderSettings(); this.renderFooter();
+                }
                 if (action === 'retry') this.refresh();
                 if ((action === 'prev' || action === 'next') && this.filtered) { this.state.page += action === 'prev' ? -1 : 1; this.renderHistory(); }
                 if (action === 'clear-selection') { this.selected.clear(); this.renderHistory(); }
@@ -2481,14 +2656,28 @@
         async save() {
             if (this.saving) return false;
             const errors = {}, next = { ...this.draft };
-            for (const key of ['lowThreshold', 'highThreshold', 'tagOpacity']) {
-                const raw = String(next[key]).trim(), number = Number(raw), min = key === 'tagOpacity' ? 40 : 1, max = key === 'tagOpacity' ? 100 : 99;
+            for (const [key, [min, max]] of Object.entries({ lowThreshold: [1, 99], highThreshold: [1, 99], tagOpacity: [40, 100], ...TAG_STYLE_RANGES })) {
+                const raw = String(next[key]).trim(), number = Number(raw);
                 if (!raw || !Number.isFinite(number) || !Number.isInteger(number) || number < min || number > max) errors[key] = `请输入 ${min}–${max} 的整数`;
                 else next[key] = number;
             }
             if (!errors.lowThreshold && !errors.highThreshold && next.lowThreshold >= next.highThreshold) errors.highThreshold = '高分界必须大于低分界';
-            for (const key of ['lowThreshold', 'highThreshold']) { const input = this.q(`[data-setting="${key}"]`); input.setAttribute('aria-invalid', !!errors[key]); this.q(`#bvh-error-${key}`).textContent = errors[key] || ''; }
-            if (Object.keys(errors).length) { this.tab = 'settings'; this.renderTab(); this.renderFooter(Object.values(errors)[0]); this.q(`[data-setting="${Object.keys(errors)[0]}"]`).focus(); return false; }
+            for (const key of Object.keys(TAG_STYLE_DEFAULTS).filter(key => !TAG_STYLE_RANGES[key])) {
+                if (key.endsWith('Style') ? !['label', 'ring'].includes(next[key]) : key.endsWith('Mode') ? !['full', 'compact'].includes(next[key]) : !/^#[0-9a-f]{6}$/i.test(next[key])) errors[key] = '请选择有效的标签样式';
+            }
+            for (const key of ['lowThreshold', 'highThreshold', 'tagOpacity', ...Object.keys(TAG_STYLE_DEFAULTS)]) {
+                this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(input => input.setAttribute('aria-invalid', !!errors[key]));
+                const error = this.q(`#bvh-error-${key}`); if (error) error.textContent = errors[key] || '';
+            }
+            if (Object.keys(errors).length) {
+                this.tab = 'settings'; this.renderTab(); this.renderFooter(Object.values(errors)[0]);
+                const input = this.q(`[data-setting="${Object.keys(errors)[0]}"]`);
+                for (let parent = input.parentElement; parent && parent !== this.root; parent = parent.parentElement) {
+                    if (parent.tagName === 'DETAILS') parent.open = true;
+                    if (parent.hidden) parent.hidden = false;
+                }
+                input.focus(); return false;
+            }
             this.saving = true; this.renderFooter();
             try {
                 await SettingsManager.save(next); this.saved = { ...next }; this.draft = { ...next };
@@ -2560,12 +2749,14 @@
         .bvh-stat-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}.bvh-stat-summary section{padding:18px;border-radius:12px;background:white;border:1px solid var(--bvh-line)}.bvh-stat-summary span{font-size:11px;color:var(--bvh-muted)}.bvh-stat-summary strong{display:block;font-size:28px;letter-spacing:-1px;line-height:1.2;margin:12px 0 10px;font-weight:600}.bvh-stat-summary small{font-size:9px;color:var(--bvh-muted)}.bvh-stat-summary section.featured{background:#263D49;color:white;border-color:#263D49}.bvh-stat-summary .featured span,.bvh-stat-summary .featured small{color:#CCDDE5}.bvh-stats-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.bvh-chart-card{padding:18px}.bvh-chart-card h2{font-size:13px}.bvh-donut{max-width:160px;margin:10px auto 0}.bvh-donut svg{display:block;width:100%}.bvh-chart-card .bvh-help{font-size:9px}.bvh-distribution{margin-top:24px;font-size:11px}.bvh-distribution>div:first-child{display:flex;justify-content:space-between;margin-bottom:8px}.bvh-distribution>div:last-child{height:5px;background:#EDF1F2;border-radius:5px;overflow:hidden}.bvh-distribution i{display:block;height:100%;border-radius:5px}.bvh-trend{margin-top:20px}.bvh-trend-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}.bvh-trend-heading p{font-size:10px;color:var(--bvh-muted);margin-top:4px}.bvh-range-buttons{display:flex;gap:5px}.bvh-range-buttons button{font-size:10px;min-height:32px;padding:6px 9px}.bvh-chart-scroll{overflow-x:auto;padding-top:18px}.bvh-chart-scroll svg{min-width:440px;width:100%;display:block}.bvh-trend summary{font-size:10px;color:var(--bvh-muted)}.bvh-daily-values{display:grid;grid-template-columns:repeat(auto-fill,minmax(85px,1fr));gap:10px;font-size:10px}.bvh-daily-values strong{display:block;font-weight:500}.bvh-dialog-mask{z-index:2147483100;background:#15202E66}.bvh-confirm{width:min(460px,100%);padding:28px;background:var(--bvh-paper);border:1px solid white;border-radius:16px;box-shadow:0 24px 100px #0004}.bvh-confirm h2{font-size:20px}.bvh-confirm-message{white-space:pre-line;overflow-wrap:anywhere;color:var(--bvh-muted);font-size:13px;margin:16px 0 24px!important}.bvh-dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px}.bvh-dialog-actions button{font-size:12px}.bvh-sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
         .bvh-toast-container{z-index:2147483200!important;max-width:calc(100vw - 32px)!important}.bvh-toast{font:13px/1.6 "Microsoft YaHei",sans-serif!important;border-radius:10px!important;box-shadow:0 8px 32px #14212F33!important;max-width:min(460px,calc(100vw - 32px))!important;overflow-wrap:anywhere}.bvh-toast button{font:inherit;color:inherit;background:transparent;border:1px solid currentColor;border-radius:5px;padding:3px 10px;margin-left:14px;cursor:pointer}.bvh-resume{z-index:2147482900!important}.bvh-toast button:focus-visible{outline:3px solid #007EAD;outline-offset:3px}
         @keyframes bvh-spin{to{transform:rotate(360deg)}}
+        .bvh-tag-colors{margin:16px 0}.bvh-color-heading,.bvh-color-row{display:grid;grid-template-columns:minmax(0,1fr) 52px 52px;align-items:center;gap:12px;padding:6px 0}.bvh-color-heading{font-size:10px;color:var(--bvh-muted)}.bvh-color-heading span:not(:first-child){text-align:center}.bvh-color-row>span{font-size:12px}.bvh-workbench .bvh-color-row input[type=color]{width:52px;height:32px;min-height:32px;padding:3px;border-radius:6px;cursor:pointer}.bvh-tag-dimensions{min-width:0;border:0;border-top:1px solid var(--bvh-line);padding:16px 0;margin:16px 0 0}.bvh-tag-dimensions legend{font-size:12px;font-weight:600;padding:0 8px 0 0}.bvh-tag-size-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.bvh-tag-size-fields .bvh-number-field input{width:100%;min-width:0;padding:8px}.bvh-tag-size-fields .bvh-number-field>div{gap:4px}.bvh-tag-size-fields .bvh-number-field span{font-size:10px;color:var(--bvh-muted)}.bvh-style-reset{margin-top:14px;font-size:11px!important}.bvh-preview-playlist{margin-top:20px;padding-top:14px;border-top:1px solid var(--bvh-line)}.bvh-preview-episode-row{display:flex;align-items:center;justify-content:space-between;gap:4px;margin-top:8px;padding:12px 8px;border-radius:8px;background:white;min-width:0;overflow:hidden}.bvh-preview-episode-row>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}.bvh-preview-episode-row .bvh-episode-tag{flex-shrink:0}.bvh-preview-grid-row{display:flex;align-items:center;justify-content:space-between;margin-top:10px}.bvh-preview-grid-cell{position:relative;width:76px;height:44px;border:1px solid var(--bvh-line);border-radius:6px;background:white;padding:16px 8px 4px;font-size:11px}.bvh-preview-bar{background:linear-gradient(90deg,rgba(122,134,234,.9),rgba(156,166,255,.7))}
+        .bvh-settings-details{border-top:1px solid var(--bvh-line);margin-top:16px;padding-top:6px}.bvh-settings-details>summary{font-size:12px;font-weight:600;min-height:38px;align-content:center}.bvh-settings-details[open]>summary{margin-bottom:8px}.bvh-diagnostics .bvh-settings-details{border-top:0;margin:0;padding:0}.bvh-workbench .bvh-setting-groups [hidden]{display:none!important}.bvh-tag-dimensions .bvh-tag-size-fields{padding-top:14px}.bvh-tag-dimensions .bvh-field-error:empty{display:none}
         @media(max-width:1050px){.bvh-settings-layout{grid-template-columns:minmax(0,1fr) 210px;gap:18px}.bvh-shell{grid-template-columns:164px minmax(0,1fr)}.bvh-page-header{padding:24px}.bvh-content{padding:20px 24px}.bvh-footer{padding:14px 24px}.bvh-section{padding:16px}.bvh-setting-row{gap:10px}.bvh-setting-row select{max-width:135px}.bvh-opacity input[type=range]{width:45px}.bvh-stat-summary section{padding:14px}.bvh-stat-summary strong{font-size:25px}}
         @media(max-width:779px){.bvh-manager-mask{padding:12px}.bvh-shell{display:flex;flex-direction:column;height:calc(100dvh - 24px);border-radius:14px}.bvh-nav{padding:12px 16px;flex-direction:row;align-items:center;gap:16px;flex-shrink:0}.bvh-brand{padding:0}.bvh-brand>svg{width:24px}.bvh-brand>span{font-size:12px}.bvh-brand small,.bvh-nav-label,.bvh-nav-note{display:none}.bvh-nav nav{display:flex;gap:4px;flex:1;justify-content:flex-end}.bvh-nav button{padding:8px;gap:5px;min-height:44px;font-size:12px}.bvh-nav button svg{width:16px;height:16px}.bvh-nav button[aria-current=page]{box-shadow:inset 0 -2px #00AEEC}.bvh-main{flex:1}.bvh-page-header{padding:20px}.bvh-content{padding:18px 20px}.bvh-footer{padding:12px 20px}.bvh-settings-layout{grid-template-columns:minmax(0,1fr) 220px}.bvh-setting-row{flex-wrap:wrap}.bvh-stats-grid{grid-template-columns:1fr 1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:span 2}.bvh-workbench button,.bvh-workbench select{min-height:44px}}
         @media(max-width:600px){.bvh-manager-mask{padding:8px}.bvh-shell{height:calc(100dvh - 16px)}.bvh-nav{padding:8px 12px;gap:8px}.bvh-brand>span{display:none}.bvh-nav nav{justify-content:space-between}.bvh-nav button{font-size:11px;padding:8px 9px}.bvh-nav button svg{display:none}.bvh-page-header{padding:18px 16px}.bvh-page-header h1{font-size:22px}.bvh-page-header p{font-size:11px}.bvh-eyebrow{font-size:8px}.bvh-content{padding:16px}.bvh-settings-layout{display:flex;flex-direction:column}.bvh-setting-groups{width:100%}.bvh-preview-panel{position:static;order:-1;width:100%;padding:16px;background:#EAEFEC;border-radius:10px}.bvh-preview-cover{margin-top:12px;aspect-ratio:16/8}.bvh-preview-note{margin-top:14px;padding-top:10px}.bvh-preview-panel>h3,.bvh-preview-caption{display:none}.bvh-preview-states{margin-top:12px;gap:5px}.bvh-preview-states button{min-height:44px;font-size:10px;padding:6px 8px}.bvh-setting-row{flex-wrap:nowrap}.bvh-setting-row select{max-width:132px}.bvh-opacity input[type=range]{width:48px}.bvh-footer{padding:12px 16px;gap:8px;flex-wrap:wrap;font-size:10px}.bvh-footer button{font-size:11px;padding:8px 10px}.bvh-save-status{font-size:10px}.bvh-footer:has([data-page-info])>span{width:100%}.bvh-history-tools{gap:8px}.bvh-history-tools label{font-size:10px}.bvh-history-tools select{font-size:11px;padding:7px}.bvh-tool-spacer{display:none}.bvh-selection-bar{flex-wrap:wrap}.bvh-selection-bar>span{width:100%}.bvh-selection-bar button{min-height:44px}.bvh-stat-summary{grid-template-columns:1fr 1fr;gap:10px}.bvh-stat-summary strong{font-size:28px}.bvh-stats-grid{grid-template-columns:1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:auto}.bvh-chart-card .bvh-help{text-align:center}.bvh-distribution{margin-top:18px}.bvh-trend-heading{flex-wrap:wrap}.bvh-confirm{padding:22px}.bvh-dialog-mask{padding:16px}.bvh-dialog-actions{justify-content:stretch}.bvh-dialog-actions button{flex:1}}
         .bvh-nav button[data-dirty=true]:after{content:"";width:6px;height:6px;border-radius:50%;background:#F0BD62;margin-left:auto;flex-shrink:0}
         .bvh-table-scroll{max-height:calc(100dvh - 390px);min-height:180px}
-        @media(max-width:600px){.bvh-settings-layout>.bvh-setting-groups{display:contents}.bvh-setting-groups>.bvh-section{width:100%}.bvh-setting-groups>.bvh-section:nth-child(1){order:0}.bvh-setting-groups>.bvh-section:nth-child(2){order:1}.bvh-setting-groups>.bvh-section:nth-child(3){order:2}.bvh-settings-layout>.bvh-preview-panel{order:3}.bvh-setting-groups>.bvh-section:nth-child(4){order:4}.bvh-table-scroll{max-height:calc(100dvh - 460px)}}
+        @media(max-width:600px){.bvh-settings-layout>.bvh-setting-groups{display:contents}.bvh-setting-groups>.bvh-section{width:100%}.bvh-setting-groups>.bvh-section:nth-child(1){order:0}.bvh-setting-groups>.bvh-section:nth-child(2){order:1}.bvh-settings-layout>.bvh-preview-panel{order:2}.bvh-setting-groups>.bvh-diagnostics{order:3}.bvh-table-scroll{max-height:calc(100dvh - 460px)}}
         @media(prefers-reduced-motion:reduce){.bvh-workbench *{animation:none!important;transition:none!important}.bvh-loader{border-color:#007EAD}}
         `);
     }
@@ -3301,9 +3492,9 @@
                 let shouldRefreshHeaderPopoverCards = false;
                 let childListCount = 0;
                 let addedNodeCount = 0;
+                if (mutations.some(m => m.removedNodes.length)) this.pruneDisconnected();
                 mutations.forEach(m => {
                     if (m.type !== 'childList') return;
-                    if (m.removedNodes.length) this.pruneDisconnected();
                     childListCount++;
                     m.addedNodes.forEach(node => {
                         addedNodeCount++;
@@ -3519,6 +3710,10 @@
         enqueueLinks(links) {
             links.forEach(link => {
                 if (!link || !document.contains(link)) return;
+                if (link.matches?.(PLAYLIST_ITEM_SELECTOR)) {
+                    this.enqueuePlaylistItems([link]);
+                    return;
+                }
                 this.observeLink(link);
                 this.pendingLinks.add(link);
             });
@@ -3529,7 +3724,8 @@
             items.forEach(item => {
                 if (!item || !document.contains(item)) return;
                 this.observePlaylistItem(item);
-                this.pendingPlaylistItems.add(item);
+                // 发现节点只注册观察；滚动进入视口附近后才解析身份和渲染。
+                if (this.visibleElements.has(item)) this.pendingPlaylistItems.add(item);
             });
             this.scheduleQueueFlush();
         }
@@ -3565,7 +3761,7 @@
 
             while (this.pendingPlaylistItems.size > 0 && playlist < DOM_PLAYLIST_BATCH_SIZE && hasBudget()) {
                 const item = take(this.pendingPlaylistItems);
-                if (item && document.contains(item)) this.processPlaylistItem(item);
+                if (item && document.contains(item) && this.visibleElements.has(item)) this.processPlaylistItem(item);
                 playlist++;
                 processedTotal++;
             }
@@ -3612,18 +3808,13 @@
             }
         }
 
-        // 强制刷新所有播放列表项标签（绕过 processedLinks 检查）
+        // 注册新条目，仅刷新视口附近的标签；屏幕外条目由 IntersectionObserver 补齐。
         refreshPlaylistItems() {
             const done = Utils.debugTime('DOMWatcher.refreshPlaylistItems');
             const items = document.querySelectorAll(PLAYLIST_ITEM_SELECTOR);
             let processed = 0;
-            items.forEach(item => {
-                // 确保新节点也被纳入观察
-                this.observePlaylistItem(item);
-                this.pendingPlaylistItems.add(item);
-                processed++;
-            });
-            this.scheduleQueueFlush();
+            this.enqueuePlaylistItems(items);
+            items.forEach(item => { if (this.visibleElements.has(item)) processed++; });
             done(`items=${items.length} processed=${processed}`);
         }
 
@@ -3659,7 +3850,11 @@
 
         pruneDisconnected() {
             for (const set of [this.visibleElements, this.observedElements, this.pendingLinks, this.pendingPlaylistItems]) {
-                for (const el of set) if (!el.isConnected) { set.delete(el); this.intersectionObserver.unobserve(el); }
+                for (const el of set) if (!el.isConnected) {
+                    set.delete(el);
+                    this.processedLinks.delete(el);
+                    this.intersectionObserver.unobserve(el);
+                }
             }
             for (const root of this.pendingRescanRoots.keys()) if (!root.isConnected) this.pendingRescanRoots.delete(root);
         }
@@ -3718,12 +3913,10 @@
         // --- 合集播放列表项处理 ---
         observePlaylistItem(el) {
             if (!this.processedLinks.has(el)) {
-                if (this.getPlaylistItemInfo(el)) {
-                    this.processedLinks.add(el);
-                    this.observedElements.add(el);
-                    this.intersectionObserver.observe(el);
-                    Utils.logEvery('observedPlaylistItems', 50, Utils.describeElement(el));
-                }
+                this.processedLinks.add(el);
+                this.observedElements.add(el);
+                this.intersectionObserver.observe(el);
+                Utils.logEvery('observedPlaylistItems', 50, Utils.describeElement(el));
             }
         }
 
@@ -3743,13 +3936,20 @@
                     page,
                     base: VideoKey.base(key),
                     key,
-                    title: (el.querySelector('.title-txt')?.innerText || el.querySelector('.title')?.getAttribute('title') || el.innerText || '').trim()
+                    title: (el.querySelector('.title-txt')?.textContent || el.querySelector('.title')?.getAttribute('title') || el.textContent || '').trim()
                 };
             }
             if (el.matches('.video-pod__item[data-key], .bpx-player-ctrl-eplist-multi-menu-item[data-cid]')) {
                 if (el.matches('.video-pod__list.section .video-pod__item[data-key]') && el.querySelector('.page-list .simple-base-item.page-item')) {
                     return null;
                 }
+                // 合集 data-key 已包含 BV 时无需为单个条目扫描整份合集。
+                const directKey = VideoKey.fromText(el.getAttribute('data-key'));
+                if (directKey) return {
+                    el, cid: el.getAttribute('data-key'), key: directKey,
+                    page: VideoKey.page(directKey), base: VideoKey.base(directKey),
+                    title: (el.querySelector('.title-txt')?.textContent || el.querySelector('.title')?.getAttribute('title') || '').trim()
+                };
                 const items = EpisodeResolver.getItems();
                 const cid = el.getAttribute('data-key') || el.getAttribute('data-cid');
                 return items.find(item => item.cid === cid) || null;
@@ -3763,7 +3963,7 @@
                     page: VideoKey.page(key),
                     base: VideoKey.base(key),
                     key,
-                    title: (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.innerText || el.innerText || '').trim()
+                    title: (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.textContent || el.textContent || '').trim()
                 };
             }
             return null;
@@ -3786,27 +3986,14 @@
             const tagColorClass = this.getRecordTagColorClass(record);
             const tagEl = document.createElement('span');
             tagEl.className = `bvh-episode-tag ${tagColorClass}${compact ? ' bvh-episode-tag-grid' : ''}`;
-            if (compact) {
-                const p = parseInt(record.percent);
-                if (record.status === RECORD_STATUS.WATCHED && !isNaN(p)) {
-                    tagEl.innerText = `${p}%`;
-                } else if (record.status === RECORD_STATUS.WATCHED) {
-                    tagEl.innerText = '看';
-                } else if (record.status === RECORD_STATUS.VISITED) {
-                    tagEl.innerText = '访';
-                } else {
-                    tagEl.innerText = record.status.slice(1, 2) || '记';
-                }
-            } else {
-                tagEl.innerText = `${record.status}${record.percent || ''}`;
-            }
+            tagEl.textContent = TagStyle.text(record, 'episode', compact);
             tagEl.title = `${record.status}${record.percent || ''}${record.savedAt ? ` ${record.savedAt}` : ''}`;
-            tagEl.style.opacity = String(Math.max(40, Math.min(100, CONFIG.tagOpacity)) / 100);
+            TagStyle.apply(tagEl, 'episode');
             return tagEl;
         }
 
         createPlaylistCoverTag(record) {
-            const tagText = `${record.status}${record.percent || ''}`;
+            const tagText = TagStyle.text(record);
             const tagTitle = `${record.status}${record.percent || ''}${record.savedAt ? ` ${record.savedAt}` : ''}`;
             return UIComponent.createTag(tagText, tagTitle, `bvh-tag ${this.getRecordTagColorClass(record)} bvh-action-list-cover-tag`);
         }
@@ -3827,6 +4014,13 @@
 
             let record = StorageManager.getRecord(item.key);
             const isActionListItem = el.matches(ACTION_LIST_ITEM_SELECTOR);
+            const isGridItem = el.classList.contains('page') || !!el.closest('.video-pod__list.grid');
+            const signature = JSON.stringify([item.key, record?.status, record?.percent, record?.savedAt,
+                CONFIG.showVisitedTag, CONFIG.tagOpacity, CONFIG.tagPosition, CONFIG.lowThreshold, CONFIG.highThreshold, isGridItem, TagStyle.signature()]);
+            if (el._bvhEpisodeSignature === signature && el._bvhEpisodeTag && el.contains(el._bvhEpisodeTag)) return;
+            el._bvhEpisodeSignature = null;
+            el._bvhEpisodeTag = null;
+            el.style.removeProperty('--bvh-episode-label-space');
             el.querySelectorAll(isActionListItem ? '.bvh-episode-tag, .bvh-action-list-cover-tag' : '.bvh-episode-tag').forEach(tag => tag.remove());
             if (!record) {
                 Utils.logSlow('DOMWatcher.processPlaylistItem no-record', start, `key=${item.key} el=${Utils.describeElement(el)}`, 30, 'log');
@@ -3845,7 +4039,7 @@
                     if (el._bvhActionListRetryCount < 5) {
                         el._bvhActionListRetryCount++;
                         Utils.log('DOMWatcher.processPlaylistItem retry action-list cover', `key=${item.key}`, `retry=${el._bvhActionListRetryCount}`);
-                        setTimeout(() => this.processPlaylistItem(el), 600);
+                        setTimeout(() => this.enqueuePlaylistItems([el]), 600);
                     }
                     return;
                 }
@@ -3857,11 +4051,12 @@
                 } else {
                     coverTarget.insertBefore(tagEl, coverTarget.firstChild);
                 }
+                el._bvhEpisodeSignature = signature;
+                el._bvhEpisodeTag = tagEl;
                 Utils.logSlow('DOMWatcher.processPlaylistItem action-list', start, `key=${item.key}`, 30, 'log');
                 return;
             }
 
-            const isGridItem = el.classList.contains('page') || !!el.closest('.video-pod__list.grid');
             const tagEl = this.createEpisodeTag(record, isGridItem);
             const isSectionItem = !!el.closest('.video-pod__list.section');
             const target = isGridItem
@@ -3872,6 +4067,13 @@
                         : (el.querySelector('.simple-base-item.normal > .title') || el.querySelector('.title') || el))
                     : (el.querySelector('.title-txt, .bpx-player-ctrl-eplist-multi-menu-item-text, .title') || el);
             target.appendChild(tagEl);
+            if (el.matches('.bpx-player-ctrl-eplist-multi-menu-item')) {
+                const size = parseFloat(tagEl.style.fontSize), padding = parseFloat(tagEl.style.paddingLeft);
+                const width = tagEl.classList.contains('bvh-tag-ring') ? parseFloat(tagEl.style.width) : tagEl.textContent.length * size + padding * 2;
+                el.style.setProperty('--bvh-episode-label-space', `${width + 20}px`);
+            }
+            el._bvhEpisodeSignature = signature;
+            el._bvhEpisodeTag = tagEl;
             Utils.logSlow('DOMWatcher.processPlaylistItem', start, `key=${item.key} record=${record.status}${record.percent || ''}`, 30, 'log');
         }
 
@@ -3923,7 +4125,7 @@
             }
 
             const isMulti = multiRecords.length > 1;
-            const tagText = isMulti ? "已记录 多P" : `${record.status}${record.percent || ''}`;
+            const tagText = isMulti ? "已记录 多P" : TagStyle.text(record);
 
             let tagTitle = record.savedAt || "";
             if (isMulti) {
@@ -3941,7 +4143,7 @@
 
             const existingTags = el.querySelectorAll('.bvh-tag, .bvh-tag-small, .bvh-tag-big');
             const existingBars = el.querySelectorAll('.bvh-progress-bar');
-            const signature = JSON.stringify([bv, tagText, tagTitle, record.percent, CONFIG.showProgressBar, CONFIG.tagPosition, CONFIG.tagOpacity, CONFIG.lowThreshold, CONFIG.highThreshold]);
+            const signature = JSON.stringify([bv, tagText, tagTitle, record.percent, CONFIG.showProgressBar, CONFIG.tagPosition, CONFIG.tagOpacity, CONFIG.lowThreshold, CONFIG.highThreshold, TagStyle.signature()]);
             if (!CONFIG.showProgressBar && existingBars.length) {
                 existingBars.forEach(bar => bar.remove?.());
                 if (!existingBars[0].remove) this.removeExistingMark(el);
@@ -3985,8 +4187,10 @@
             }
 
             if (img) {
-                const width = img.width || img.getBoundingClientRect().width;
+                const rect = img.getBoundingClientRect();
+                const width = rect.width || img.width;
                 if (width > 0 && width < 83) isSmall = true;
+                if (CONFIG.coverStyle === 'ring' && (headerPopoverCover || (width > 0 && width < 160) || (rect.height > 0 && rect.height < 90))) isSmall = true;
             }
 
             const markParent = headerPopoverCover || img.parentNode;
@@ -4013,7 +4217,7 @@
             let tagEl = el._bvhTag;
             if (tagEl?.parentNode === markParent) {
                 tagEl.className = template.className; tagEl.style.cssText = template.style.cssText;
-                tagEl.textContent = tagText; tagEl.title = tagTitle;
+                tagEl.replaceChildren(...template.childNodes); tagEl.title = tagTitle;
             } else {
                 this.removeExistingMark(el); tagEl?.remove(); tagEl = template;
                 markParent.insertBefore(tagEl, markBeforeNode);
@@ -4022,7 +4226,7 @@
             el._bvhBar?.remove(); el._bvhBar = null;
             el._bvhLastVideoKey = bv;
 
-            if (CONFIG.showProgressBar && record.percent && !isMulti) {
+            if (CONFIG.showProgressBar && record.percent && !isMulti && !tagEl.classList.contains('bvh-tag-ring')) {
                 const barEl = UIComponent.createProgressBar(record.percent);
                 el._bvhBar = barEl;
                 const statsNode = el.querySelector('.bili-video-card__stats');
