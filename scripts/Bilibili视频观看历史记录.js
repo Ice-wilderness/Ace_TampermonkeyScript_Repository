@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.2.0
-// @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
+// @version      4.3.0
+// @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -29,7 +29,9 @@
 // @grant        GM_addStyle
 // @grant        GM_registerMenuCommand
 // @grant        GM_info
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      *
 // @run-at       document-start
 // @license      MIT
 // @downloadURL https://update.greasyfork.org/scripts/574216/Bilibili%E8%A7%86%E9%A2%91%E8%A7%82%E7%9C%8B%E5%8E%86%E5%8F%B2%E8%AE%B0%E5%BD%95.user.js
@@ -1234,6 +1236,8 @@
             this.syncing = null;
             this.scope = null;
             this.headers = new Map();
+            this.epoch = 'initial';
+            this.pruneKey = null;
         }
         version(time = Date.now()) {
             this.clock = Math.max(this.clock + 1, time);
@@ -1250,7 +1254,8 @@
         }
         async readCommit(key, knownManifest) {
             const manifest = knownManifest || await this.io.get(key);
-            if (!manifest || manifest.protocol !== 1 || !Array.isArray(manifest.blocks) || !manifest.blocks.length) return null;
+            if (!manifest || manifest.protocol !== 1 || !Array.isArray(manifest.blocks)
+                || (!manifest.blocks.length && !(['epoch', 'prune'].includes(manifest.kind) && manifest.count === 0))) return null;
             const entries = [];
             const blocks = await readHistoryBatch(manifest.blocks, ref => this.io.get(ref.key));
             for (let index = 0; index < manifest.blocks.length; index++) {
@@ -1320,12 +1325,17 @@
             const loadedCommits = await readHistoryBatch(commitKeys, async key => {
                 if (this.commits.has(key)) return this.commits.get(key);
                 if (!this.scope) { const commit = await this.readCommit(key); if (!commit) this._incomplete = true; return commit; }
-                if (!this.scope.size) return null;
-                const route = covered.has(key) && index.routes?.[key];
-                if (Array.isArray(route) && !route.some(base => this.scope.has(base))) return null;
                 const header = this.headers.get(key) || await this.io.get(key);
                 if (!header) { this._incomplete = true; return null; }
                 this.headers.set(key, header);
+                if (header.kind === 'epoch' || header.kind === 'prune') {
+                    const commit = await this.readCommit(key, header);
+                    if (!commit) this._incomplete = true;
+                    return commit;
+                }
+                if (!this.scope.size) return null;
+                const route = covered.has(key) && index.routes?.[key];
+                if (Array.isArray(route) && !route.some(base => this.scope.has(base))) return null;
                 if (Array.isArray(header.bases)) {
                     if (!header.bases.some(base => this.scope.has(base))) return null;
                 } else if (covered.has(key) && Array.isArray(header.blocks) && !intersectsShards(header)) { skippedLegacy.set(key, header); return null; }
@@ -1354,11 +1364,25 @@
             }
             const afterKeys = (await this.io.list()).filter(k => k.startsWith('bvh_commit_')).sort();
             if (JSON.stringify(afterKeys) !== JSON.stringify(keys.filter(k => k.startsWith('bvh_commit_')).sort())) return this._sync();
+            const latestEpoch = [...commits].filter(([, commit]) => ['epoch', 'prune'].includes(commit.manifest.kind))
+                .sort(([a], [b]) => b.localeCompare(a))[0];
+            const activeEpoch = latestEpoch?.[1].manifest.epoch || 'initial';
+            if (latestEpoch && activeEpoch !== 'initial' && !WebDavFormat.uuid.test(activeEpoch))
+                throw new Error('本地回滚批次无效');
+            const latestPrune = [...commits].filter(([, commit]) => commit.manifest.kind === 'prune'
+                && (commit.manifest.epoch || 'initial') === activeEpoch).sort(([a], [b]) => b.localeCompare(a))[0];
+            const pruneKey = latestPrune?.[0] || null, pruneAt = latestPrune?.[1].manifest.cutoverAt || 0;
+            const pruneCheckpoints = new Set(latestPrune?.[1].manifest.checkpoints || []);
+            if (latestPrune && (!Array.isArray(latestPrune[1].manifest.checkpoints)
+                || (this.scope === null && [...pruneCheckpoints].some(key => !commits.has(key))))) throw new Error('本地回收检查点不完整');
             const removed = [...this.commits.keys()].some(key => !commits.has(key));
-            const rebuild = !this._hasView || removed;
-            const entries = new Map(rebuild ? this.baseline : this.entries), candidates = new Set(rebuild ? entries.keys() : []);
+            const rebuild = !this._hasView || removed || activeEpoch !== this.epoch || pruneKey !== this.pruneKey;
+            const entries = new Map(rebuild ? (activeEpoch === 'initial' && !pruneKey ? this.baseline : []) : this.entries), candidates = new Set(rebuild ? entries.keys() : []);
             let processed = 0;
-            for (const [container, commit] of commits) if (rebuild || !this.commits.has(container)) for (const entry of commit.entries) {
+            for (const [container, commit] of commits) if ((commit.manifest.epoch || 'initial') === activeEpoch
+                && (!pruneKey || container === pruneKey || pruneCheckpoints.has(container)
+                    || (commit.manifest.kind !== 'prune' && (commit.manifest.sampledAt || 0) > pruneAt))
+                && (rebuild || !this.commits.has(container))) for (const entry of commit.entries) {
                 if (this.scope && !this.scope.has(VideoKey.base(entry.key))) continue;
                 candidates.add(entry.key);
                 const previous = entries.get(entry.key);
@@ -1368,14 +1392,21 @@
                 if (++processed % 128 === 0) await yieldIfNeeded();
             }
             const changed = new Set();
+            let compared = 0;
             for (const key of candidates) {
                 const entry = entries.get(key);
                 const old = this.entries.get(key);
                 if (!old || HistoryCommitStore.compare(old.version, entry.version) !== 0 || old.deleted !== entry.deleted) changed.add(key);
+                if (++compared % 256 === 0) await yieldIfNeeded();
             }
-            if (rebuild) for (const key of this.entries.keys()) if (!entries.has(key)) changed.add(key);
+            if (rebuild) for (const key of this.entries.keys()) {
+                if (!entries.has(key)) changed.add(key);
+                if (++compared % 256 === 0) await yieldIfNeeded();
+            }
             this.entries = entries;
             this.commits = commits;
+            this.epoch = activeEpoch;
+            this.pruneKey = pruneKey;
             this._hasView = true;
             this.seenKeys = new Set(commitKeys);
             for (const key of this.headers.keys()) if (!this.seenKeys.has(key)) this.headers.delete(key);
@@ -1393,7 +1424,7 @@
             if (!old || HistoryCommitStore.compare(entry.version, old.version) > 0) this.baseline.set(key, entry);
         }
         transactionId() { return `${String(Date.now()).padStart(16, '0')}_${this.writer}_${String(++this.sequence).padStart(12, '0')}`; }
-        async prepare(entries, kind = 'tx', identity, createdAt = Date.now()) {
+        async prepare(entries, kind = 'tx', identity, createdAt = Date.now(), epoch = this.epoch, sampledAt = performance.timeOrigin + performance.now(), cutoverAt = null) {
             const id = identity || this.transactionId();
             const grouped = new Map();
             await HistoryQueries.each(entries, entry => {
@@ -1407,13 +1438,14 @@
                 key: kind === 'checkpoint' ? `bvh_checkpoint_${shard}_${id}` : `bvh_tx_${id}_${shard}`,
                 value: { id, createdAt, entries }
             }));
-            const manifest = { protocol: 1, kind, id, createdAt, count: entries.length,
+            const manifest = { protocol: 1, kind, id, createdAt, count: entries.length, epoch, sampledAt,
                 bases: [...new Set(entries.map(entry => VideoKey.base(entry.key)))].sort(),
                 blocks: blocks.map(block => ({ key: block.key, count: block.value.entries.length, checksum: HistoryCommitStore.checksum(block.value) })) };
+            if (kind === 'prune') manifest.cutoverAt = cutoverAt;
             return { key: `bvh_commit_${id}`, blocks, manifest };
         }
         async publish(transaction, guard, deferSync = false) {
-            if (!transaction.blocks.length) return new Set();
+            if (!transaction.blocks.length && !['epoch', 'prune'].includes(transaction.manifest.kind)) return new Set();
             // 重试前检查并补齐块，沿用原事务身份。
             for (const block of transaction.blocks) {
                 const current = await this.io.get(block.key);
@@ -1441,14 +1473,34 @@
         async compact({ resume = false } = {}) {
             if (this.scope) throw new Error('内部整理需要先加载完整历史');
             await this.sync();
+            if (this.epoch !== 'initial' || this.pruneKey) for (const [key, commit] of [...this.commits]) {
+                if ((commit.manifest.epoch || 'initial') === this.epoch) continue;
+                // 已确认的新批次本身就是旧事务的完整替代，空历史也能回收旧块。
+                await this.io.delete(key);
+                for (const ref of commit.manifest.blocks) await this.io.delete(ref.key);
+            }
+            await this.sync();
+            if (this.pruneKey) {
+                const cutoverAt = this.commits.get(this.pruneKey)?.manifest.cutoverAt || 0;
+                const protectedKeys = new Set(this.commits.get(this.pruneKey)?.manifest.checkpoints || []);
+                for (const [key, commit] of [...this.commits]) {
+                    if (key === this.pruneKey || protectedKeys.has(key) || commit.manifest.kind === 'epoch') continue;
+                    if (commit.manifest.kind !== 'prune' && (commit.manifest.sampledAt || 0) > cutoverAt) continue;
+                    await this.io.delete(key);
+                    for (const ref of commit.manifest.blocks) await this.io.delete(ref.key);
+                }
+                await this.sync();
+            }
             if (!this.entries.size) return { before: this.commits.size, after: this.commits.size };
             const before = this.commits.size;
             // 每个 base 固定进入一个整理组，避免一个全量检查点迫使视频页读取全部历史。
             const groups = new Map();
+            let grouped = 0;
             for (const entry of this.entries.values()) {
                 const group = StorageManager._getShardId(VideoKey.base(entry.key));
                 if (!groups.has(group)) groups.set(group, []);
                 groups.get(group).push(entry);
+                if (++grouped % 256 === 0) await new Promise(resolve => setTimeout(resolve, 0));
             }
             const replacements = [];
             const checkpointTime = [...this.commits.values()].reduce((time, commit) => Math.max(time, Number(commit.manifest.id.split('_')[0]) || 0), Date.now()) + 1;
@@ -1469,14 +1521,20 @@
             }
             await this.sync();
             const byKey = new Map(), retained = new Set(replacements);
+            let indexed = 0;
             for (const key of replacements) {
                 const replacement = await this.readCommit(key);
-                for (const entry of replacement?.entries || []) byKey.set(entry.key, { ...entry, container: key });
+                for (const entry of replacement?.entries || []) {
+                    byKey.set(entry.key, { ...entry, container: key });
+                    if (++indexed % 256 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+                }
             }
             // 每个旧清单整体判断，禁止先删多分片事务的一部分数据块。
             // 替代副本若被其他整理回收，其严格更高的替代链仍完整保留这些版本。
             for (const [key, commit] of [...this.commits]) {
                 if (retained.has(key)) continue;
+                if (commit.manifest.kind === 'epoch' || commit.manifest.kind === 'prune') continue;
+                if (this.pruneKey && (this.commits.get(this.pruneKey)?.manifest.checkpoints || []).includes(key)) continue;
                 const covered = commit.entries.every(entry => {
                     const next = byKey.get(entry.key);
                     if (!next) return false;
@@ -1528,6 +1586,7 @@
     const STATUS_REVERSE = { '已访问': 0, '已观看': 1, '已删除': 2 };
     const StorageManager = {
         _store: new HistoryCommitStore(),
+        _tabId: crypto.randomUUID(),
         _ready: null, _queue: Promise.resolve(), _dataVersion: 0, _migrationCount: 0,
         _shardCache: new Map(), _bvBaseIndex: new Map(), _shardForBase: new Map(),
         _allKeysCache: null, _changeCallbacks: new Set(), _pendingChange: null, _changeTimer: null,
@@ -1666,10 +1725,12 @@
         async _persistBaseIndex(store = StorageManager._store) {
             const s = StorageManager, index = {};
             if (store.scope) return;
+            let scanned = 0;
             for (const [key, entry] of store.entries) if (!entry.deleted) {
                 const base = VideoKey.base(key), shard = s._getShardId(key);
                 if (!index[base]) index[base] = [];
                 if (!index[base].includes(shard)) index[base].push(shard);
+                if (++scanned % 256 === 0) await new Promise(resolve => setTimeout(resolve, 0));
             }
             await HistoryStoreIO.set(s._BASE_INDEX_KEY, { version: 2, complete: true,
                 coverage: [...store.commits.keys()].sort(), index,
@@ -1693,6 +1754,129 @@
             return [...(StorageManager._bvBaseIndex.get(VideoKey.base(base)) || [])].sort((a, b) => VideoKey.page(a) - VideoKey.page(b));
         },
         getAllRecords() { return StorageManager.getAllKeys().map(key => ({ key, record: StorageManager.getRecord(key) })); },
+        async getCloudEntries() {
+            const s = StorageManager;
+            await s.initialize(); await s._syncIfStale();
+            if (s._store._incomplete) throw new Error('本地历史存在不完整提交，已停止云同步');
+            const rows = []; let index = 0;
+            for (const entry of s._store.entries.values()) {
+                const row = { key: entry.key, version: [...entry.version], deleted: !!entry.deleted };
+                if (entry.deleted) {
+                    if (entry.publishedRevision !== undefined) row.publishedRevision = entry.publishedRevision;
+                    if (entry.publishedAt !== undefined) row.publishedAt = entry.publishedAt;
+                } else row.record = { ...entry.record };
+                rows.push(row);
+                if (++index % 256 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            return rows;
+        },
+        async mergeCloudEntries(remote) {
+            const s = StorageManager;
+            return s._enqueue(async () => {
+                await s.initialize(); await s._syncIfStale();
+                if (s._store._incomplete) throw new Error('本地历史存在不完整提交，已停止云同步');
+                const selected = [], observed = new Map();
+                let index = 0;
+                for (const candidate of remote) {
+                    if (++index % 256 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+                    const current = s._store.entries.get(candidate.key);
+                    const order = current ? HistoryCommitStore.compare(candidate.version, current.version) : 1;
+                    if (!order && (current.deleted !== candidate.deleted || (!current.deleted && JSON.stringify(current.record) !== JSON.stringify(candidate.record))))
+                        throw new Error(`云同步记录版本冲突：${candidate.key}`);
+                    const published = !order && current.deleted && candidate.deleted && candidate.publishedRevision !== undefined
+                        && (current.publishedRevision !== candidate.publishedRevision || current.publishedAt !== candidate.publishedAt);
+                    if (order < 0 || (!order && !published)) continue;
+                    observed.set(candidate.key, current?.version);
+                    selected.push({ ...candidate, version: [...candidate.version], record: candidate.record && { ...candidate.record }, source: 'cloud' });
+                }
+                if (!selected.length) return 0;
+                const transaction = await s._store.prepare(selected);
+                const changed = await s._store.publish(transaction, async () => {
+                    const concurrent = await s._store.sync(); s._accept(concurrent);
+                    return [...observed].every(([key, version]) => {
+                        const current = s._store.entries.get(key);
+                        return JSON.stringify(current?.version) === JSON.stringify(version);
+                    });
+                });
+                s._accept(new Set([...changed, ...selected.map(entry => entry.key)]));
+                s._scheduleCompaction();
+                return selected.length;
+            });
+        },
+        async replaceCloudEntries(remote, epoch) {
+            if (epoch !== 'initial' && !WebDavFormat.uuid.test(epoch)) throw new Error('云端回滚批次无效');
+            const s = StorageManager;
+            return s._enqueue(async () => {
+                await s.initialize(); await s._syncIfStale();
+                if (s._store._incomplete) throw new Error('本地历史存在不完整提交，已停止回滚');
+                const entries = remote.map(entry => ({ ...entry, version: [...entry.version],
+                    record: entry.record && { ...entry.record }, source: 'cloud' }));
+                if (epoch === 'initial') {
+                    const cutoverAt = performance.timeOrigin + performance.now(), groups = new Map(), checkpoints = [];
+                    for (const entry of entries) {
+                        const shard = s._getShardId(entry.key);
+                        if (!groups.has(shard)) groups.set(shard, []);
+                        groups.get(shard).push(entry);
+                    }
+                    for (const group of groups.values()) {
+                        const checkpoint = await s._store.prepare(group, 'checkpoint', undefined, Date.now(), epoch, cutoverAt);
+                        await s._store.publish(checkpoint, null, true); checkpoints.push(checkpoint.key);
+                    }
+                    const marker = await s._store.prepare([], 'prune', undefined, Date.now(), epoch, cutoverAt, cutoverAt);
+                    marker.manifest.checkpoints = checkpoints;
+                    const changed = await s._store.publish(marker);
+                    s._accept(new Set([...changed, ...s._store.entries.keys()]));
+                    await s._persistBaseIndex(); s._scheduleCompaction();
+                    return entries.length;
+                }
+                const changed = await s._store.publish(await s._store.prepare(entries, 'epoch', undefined, Date.now(), epoch));
+                s._accept(new Set([...changed, ...s._store.entries.keys()]));
+                await s._persistBaseIndex();
+                s._scheduleCompaction();
+                return entries.length;
+            });
+        },
+        async pruneCloudDeleted(keys, minSyncRevision, epoch) {
+            const s = StorageManager;
+            return s._enqueue(async () => {
+                await s.initialize(); await s._syncIfStale();
+                if (s._store._incomplete || s._store.epoch !== epoch) throw new Error('清理前本地同步基线已变化');
+                const now = Date.now(), tabKeys = (await HistoryStoreIO.list()).filter(key => key.startsWith('bvh_active_tab_'));
+                for (const key of tabKeys) {
+                    if (key === `bvh_active_tab_${s._tabId}`) continue;
+                    const heartbeat = await HistoryStoreIO.get(key);
+                    if (heartbeat && now - heartbeat.time < 120000) return 0;
+                }
+                const dropped = new Set(keys);
+                for (const key of dropped) {
+                    const entry = s._store.entries.get(key);
+                    if (!entry?.deleted || !entry.publishedRevision || entry.publishedRevision > minSyncRevision)
+                        throw new Error('删除尚未确认传播，拒绝本地回收');
+                }
+                if (!dropped.size) return 0;
+                const kept = [...s._store.entries.values()].filter(entry => !dropped.has(entry.key));
+                const cutoverAt = performance.timeOrigin + performance.now();
+                const groups = new Map();
+                for (const entry of kept) {
+                    const shard = s._getShardId(entry.key);
+                    if (!groups.has(shard)) groups.set(shard, []);
+                    groups.get(shard).push(entry);
+                }
+                const checkpoints = [];
+                for (const group of groups.values()) {
+                    const transaction = await s._store.prepare(group, 'checkpoint', undefined, Date.now(), epoch, cutoverAt);
+                    await s._store.publish(transaction, null, true);
+                    checkpoints.push(transaction.key);
+                }
+                const marker = await s._store.prepare([], 'prune', undefined, Date.now(), epoch, cutoverAt, cutoverAt);
+                marker.manifest.checkpoints = checkpoints;
+                const changed = await s._store.publish(marker);
+                s._accept(new Set([...changed, ...dropped]));
+                await HistoryStoreIO.set('bvh_prune_pending', { epoch, cutoverAt });
+                s._scheduleCompaction();
+                return dropped.size;
+            });
+        },
         validateImport(data) {
             if (!data || Array.isArray(data) || typeof data !== 'object') throw new Error('文件必须是视频 key 对应记录的对象');
             const result = [], seen = new Set();
@@ -1718,8 +1902,16 @@
             return result;
         },
         sampleVersion() { return StorageManager._store.version(); },
+        async startPresence() {
+            const s = StorageManager, key = `bvh_active_tab_${s._tabId}`;
+            if (s._presenceTimer) return;
+            await HistoryStoreIO.set(key, { time: Date.now() });
+            s._presenceTimer = setInterval(() => HistoryStoreIO.set(key, { time: Date.now() }).catch(() => {}), 60000);
+        },
         dispose() {
             StorageManager._disposed = true;
+            clearInterval(StorageManager._presenceTimer); StorageManager._presenceTimer = null;
+            HistoryStoreIO.delete(`bvh_active_tab_${StorageManager._tabId}`).catch(() => {});
             clearTimeout(StorageManager._compactionTimer); StorageManager._compactionTimer = null;
             if (StorageManager._listener !== undefined && typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(StorageManager._listener);
             StorageManager._listener = undefined;
@@ -1736,9 +1928,12 @@
             const s = StorageManager;
             // 采样身份在入队前确定；等待或重试不把旧采样变成新采样。
             const version = options.version || s.sampleVersion();
+            const epoch = s._store.epoch;
+            const sampledAt = performance.timeOrigin + performance.now();
             return s._enqueue(async () => {
                 for (;;) {
                 await s.initializeForKeys(records.map(item => item.key)); await s._syncIfStale();
+                if (epoch !== s._store.epoch) return options.details ? { count: 0, created: 0, updated: 0 } : 0;
                 const entries = [], source = options.source || 'playback';
                 const observed = new Map(records.map(item => { const key = VideoKey.normalize(item.key); return [key, JSON.stringify(s._store.entries.get(key)?.version)]; }));
                 for (const item of records) {
@@ -1762,14 +1957,15 @@
                 }
                 if (!entries.length) return options.details ? { count: 0, created: 0, updated: 0 } : 0;
                 const created = entries.filter(entry => !s.getRecord(entry.key)).length;
-                const transaction = await s._store.prepare(entries, 'tx', options.transactionId, options.transactionId ? version[0] : Date.now());
+                const transaction = await s._store.prepare(entries, 'tx', options.transactionId, options.transactionId ? version[0] : Date.now(), epoch, sampledAt);
                 let changed;
                 try {
-                    changed = await s._store.publish(transaction, source === 'playback' ? null : async () => {
+                    changed = await s._store.publish(transaction, async () => {
                         const changes = await s._store.sync(); s._accept(changes);
-                        return [...observed].every(([key, version]) => JSON.stringify(s._store.entries.get(key)?.version) === version);
+                        return epoch === s._store.epoch && (source === 'playback'
+                            || [...observed].every(([key, version]) => JSON.stringify(s._store.entries.get(key)?.version) === version));
                     });
-                } catch (error) { if (error.code === 'BVH_RETRY') continue; throw error; }
+                } catch (error) { if (error.code === 'BVH_RETRY' && epoch === s._store.epoch) continue; if (epoch !== s._store.epoch) return 0; throw error; }
                 s._accept(new Set([...changed, ...entries.map(e => e.key)]));
                 // 新提交自带 bases；旧索引 coverage 之外的提交会独立读取，无需每次保存重写全量索引。
                 // 完整派生索引由显式全量初始化、重建或后台整理维护。
@@ -1786,8 +1982,11 @@
         deleteRecord(key, notify = true) { return StorageManager.deleteRecords([key], notify); },
         deleteRecords(keys, notify = true, options = {}) {
             const s = StorageManager;
+            const epoch = s._store.epoch;
+            const sampledAt = performance.timeOrigin + performance.now();
             return s._enqueue(async () => {
                 await s.initialize(); await s._syncIfStale();
+                if (epoch !== s._store.epoch) return options.details ? { count: 0, deleteId: '', backups: [] } : 0;
                 const deleteId = crypto.randomUUID(), backups = [], entries = [];
                 for (const rawKey of new Set(keys)) {
                     const key = VideoKey.normalize(rawKey), record = s.getRecord(key);
@@ -1795,7 +1994,10 @@
                     backups.push({ key, record }); entries.push({ key, deleted: true, version: s.sampleVersion(), source: 'delete', deleteId });
                 }
                 if (entries.length) {
-                    const changed = await s._store.publish(await s._store.prepare(entries)); s._accept(new Set([...changed, ...entries.map(e => e.key)]));
+                    const changed = await s._store.publish(await s._store.prepare(entries, 'tx', undefined, Date.now(), epoch, sampledAt), async () => {
+                        const concurrent = await s._store.sync(); s._accept(concurrent);
+                        return epoch === s._store.epoch;
+                    }); s._accept(new Set([...changed, ...entries.map(e => e.key)]));
                     for (const { key } of entries) { try { localStorage.removeItem(BACKUP_PREFIX + key); } catch {} }
                     try { await s._persistBaseIndex(); } catch (error) { Utils.warn('删除已提交，索引可重建', error); }
                 }
@@ -1828,8 +2030,9 @@
             }]));
             const keys = (await io.list()).filter(key => key.startsWith('bvh_commit_'));
             const done = await io.get('bvh_grouping_complete_v1');
+            const prunePending = await io.get('bvh_prune_pending');
             const covered = new Set(done?.coverage || []), pending = keys.filter(key => !covered.has(key));
-            if (done && pending.length < 128) {
+            if (done && pending.length < 128 && !prunePending) {
                 let wide = false;
                 for (const key of pending) {
                     const manifest = await io.get(key);
@@ -1841,6 +2044,7 @@
             await worker.sync();
             if (worker._incomplete) throw new Error('存在未通过完整性校验的提交');
             const result = await worker.compact({ resume: true });
+            if (prunePending && worker.epoch === prunePending.epoch) await io.delete('bvh_prune_pending');
             if (worker._incomplete) throw new Error('整理期间存在未通过完整性校验的提交');
             await s._persistBaseIndex(worker);
             // 只覆盖实际整理过的清单，并发产生的新提交仍会在后续检查中被识别。
@@ -1865,7 +2069,9 @@
             return StorageManager.getAllKeys().length;
         },
         writeBackup(snapshot) {
-            try { localStorage.setItem(BACKUP_PREFIX + snapshot.key, JSON.stringify({ ...snapshot, savedAt: snapshot.version?.[0] || Date.now() })); }
+            try { localStorage.setItem(BACKUP_PREFIX + snapshot.key, JSON.stringify({ ...snapshot,
+                epoch: StorageManager._store.epoch, pruneKey: StorageManager._store.pruneKey,
+                savedAt: snapshot.version?.[0] || Date.now() })); }
             catch (error) { Utils.error('临时备份无法写入', error); }
         },
         async restoreFromLocalStorage() {
@@ -1875,6 +2081,9 @@
             for (const key of keys) {
                 try {
                     const backup = JSON.parse(localStorage.getItem(key));
+                    await StorageManager._syncIfStale();
+                    if ((backup.epoch || 'initial') !== StorageManager._store.epoch
+                        || (backup.pruneKey || null) !== StorageManager._store.pruneKey) { localStorage.removeItem(key); continue; }
                     const time = backup?.savedAt || Date.parse(backup?.value?.savedAt);
                     if (!Number.isFinite(time) || Date.now() - time > BACKUP_MAX_AGE) { localStorage.removeItem(key); continue; }
                     const rows = StorageManager.validateImport({ [backup.key]: backup.value });
@@ -1960,6 +2169,694 @@
     };
     StorageManager.cleanupLocalStorageBackupsThrottled = Utils.throttle(StorageManager.cleanupLocalStorageBackups, 30000);
     VideoKey.latestRelatedRecord = (base) => EpisodeResolver.getLatestRecord(base);
+
+    const WebDavFormat = {
+        uuid: /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+        file(snapshotId) { return `history-${snapshotId}.json.gz`; },
+        validateIndex(value) {
+            const index = typeof value === 'string' ? JSON.parse(value) : value;
+            if (!index || Array.isArray(index) || index.format !== 'bvh-webdav-index' || index.schemaVersion !== 1
+                || !this.uuid.test(index.snapshotId) || index.file !== this.file(index.snapshotId)) throw new Error('云同步索引格式无效');
+            return index;
+        },
+        validateSnapshot(value, expectedId = null) {
+            const data = typeof value === 'string' ? JSON.parse(value) : value;
+            const integer = number => Number.isSafeInteger(number) && number >= 0;
+            if (!data || Array.isArray(data) || data.format !== 'bvh-webdav' || data.schemaVersion !== 1
+                || !this.uuid.test(data.snapshotId) || (expectedId && data.snapshotId !== expectedId)
+                || !(data.epoch === 'initial' || this.uuid.test(data.epoch))
+                || !integer(data.revision) || !integer(data.minSyncRevision) || data.minSyncRevision > data.revision
+                || !Number.isSafeInteger(data.backupRetentionDays) || data.backupRetentionDays < 1
+                || typeof data.createdAt !== 'string' || !Number.isFinite(Date.parse(data.createdAt))
+                || !['latest', 'daily', 'before-restore', 'before-resync-local', 'before-resync-cloud'].includes(data.kind)
+                || !Array.isArray(data.entries)) throw new Error('云同步快照格式无效');
+            const seen = new Set();
+            for (const entry of data.entries) {
+                if (!entry || !/^(?:BV[A-Za-z0-9]{10}|av[0-9]+)(?:\?p=(?:[2-9]|[1-9][0-9]+))?$/.test(entry.key)
+                    || seen.has(entry.key) || !Array.isArray(entry.version) || entry.version.length !== 3
+                    || !integer(entry.version[0]) || typeof entry.version[1] !== 'string'
+                    || !integer(entry.version[2]) || typeof entry.deleted !== 'boolean') throw new Error('云同步记录或版本无效');
+                seen.add(entry.key);
+                if (entry.deleted) {
+                    if ('record' in entry || (entry.publishedRevision !== undefined && (!integer(entry.publishedRevision)
+                        || entry.publishedRevision > data.revision || entry.publishedRevision < 1))
+                        || (entry.publishedAt !== undefined && (!integer(entry.publishedAt) || entry.publishedAt < 1))
+                        || (entry.publishedRevision === undefined) !== (entry.publishedAt === undefined)) throw new Error('云同步删除标记无效');
+                } else {
+                    const record = entry.record;
+                    if (!record || typeof record !== 'object' || Array.isArray(record)
+                        || ![0, 1].includes(record.s) || typeof record.t !== 'string'
+                        || !Number.isFinite(record.p) || record.p < 0 || record.p > 100
+                        || !Number.isFinite(record.a) || typeof record.n !== 'string'
+                        || entry.publishedRevision !== undefined || entry.publishedAt !== undefined) throw new Error('云同步观看记录无效');
+                }
+            }
+            return data;
+        }
+    };
+
+    const WebDavCodec = {
+        async digest(snapshot) {
+            const entries = snapshot.entries.map(entry => entry.deleted
+                ? [entry.key, entry.version, true, entry.publishedRevision ?? null, entry.publishedAt ?? null]
+                : [entry.key, entry.version, false, entry.record.s, entry.record.t, entry.record.p, entry.record.a, entry.record.n]);
+            entries.sort((a, b) => a[0].localeCompare(b[0]));
+            const data = new TextEncoder().encode(JSON.stringify([
+                snapshot.epoch, snapshot.revision, snapshot.minSyncRevision, snapshot.backupRetentionDays, entries
+            ]));
+            const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+            return [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');
+        },
+        async encode(snapshot) {
+            WebDavFormat.validateSnapshot(snapshot);
+            if (typeof CompressionStream !== 'function') throw new Error('浏览器不支持 gzip 压缩');
+            const input = new TextEncoder().encode(JSON.stringify(snapshot));
+            const stream = new ReadableStream({ start(controller) { controller.enqueue(input); controller.close(); } });
+            return new Response(stream.pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+        },
+        async decode(bytes, expectedId = null) {
+            if (typeof DecompressionStream !== 'function') throw new Error('浏览器不支持 gzip 解压');
+            const stream = new ReadableStream({ start(controller) { controller.enqueue(new Uint8Array(bytes)); controller.close(); } });
+            const text = await new Response(stream.pipeThrough(new DecompressionStream('gzip'))).text();
+            return WebDavFormat.validateSnapshot(text, expectedId);
+        }
+    };
+
+    const WebDavWorker = {
+        async run(action, input, expectedId = null) {
+            if (typeof Worker !== 'function' || typeof Blob !== 'function' || typeof URL.createObjectURL !== 'function')
+                throw new Error('浏览器无法创建后台处理任务，云同步暂不可用');
+            const code = `
+                const WebDavFormat = { uuid: ${WebDavFormat.uuid}, ${WebDavFormat.validateSnapshot.toString()} };
+                const WebDavCodec = { ${WebDavCodec.digest.toString()}, ${WebDavCodec.encode.toString()}, ${WebDavCodec.decode.toString()} };
+                let header, entries = [], local = [], action, expectedId;
+                onmessage = async event => {
+                    try {
+                        const message = event.data;
+                        if (message.type === 'start') {
+                            action = message.action; expectedId = message.expectedId;
+                            if (action === 'decode') {
+                                const snapshot = await WebDavCodec.decode(message.bytes, expectedId);
+                                const { entries: rows, ...meta } = snapshot;
+                                postMessage({ type: 'header', value: meta });
+                                for (let index = 0; index < rows.length; index += 256) {
+                                    postMessage({ type: 'batch', value: rows.slice(index, index + 256) });
+                                    await new Promise(resolve => setTimeout(resolve, 0));
+                                }
+                                postMessage({ type: 'done' });
+                            } else { header = message.header; entries = []; local = []; }
+                        } else if (message.type === 'batch') entries.push(...message.value);
+                        else if (message.type === 'local') local.push(...message.value);
+                        else if (message.type === 'finish') {
+                            if (action === 'difference') {
+                                const known = new Map(local.map(entry => [entry.key, entry]));
+                                const newer = [];
+                                for (const entry of entries) {
+                                    const old = known.get(entry.key);
+                                    const a = entry.version, b = old?.version;
+                                    const order = !b ? 1 : a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) || a[2] - b[2];
+                                    if (!order && (entry.deleted !== old.deleted || (!entry.deleted && JSON.stringify(entry.record) !== JSON.stringify(old.record))))
+                                        throw new Error('云同步记录版本冲突：' + entry.key);
+                                    if (order > 0 || (!order && entry.deleted && old.publishedRevision !== entry.publishedRevision)) newer.push(entry);
+                                }
+                                for (let index = 0; index < newer.length; index += 256) {
+                                    postMessage({ type: 'batch', value: newer.slice(index, index + 256) });
+                                    await new Promise(resolve => setTimeout(resolve, 0));
+                                }
+                                postMessage({ type: 'done' }); return;
+                            }
+                            const snapshot = WebDavFormat.validateSnapshot({ ...header, entries }, expectedId);
+                            if (action === 'digest') postMessage({ type: 'digest', value: await WebDavCodec.digest(snapshot) });
+                            else { const bytes = await WebDavCodec.encode(snapshot); postMessage({ type: 'bytes', value: bytes }, [bytes]); }
+                        }
+                    } catch (error) { postMessage({ type: 'error', message: error.message || String(error) }); }
+                };
+            `;
+            const url = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+            let worker;
+            try {
+                worker = new Worker(url);
+                const completion = new Promise((resolve, reject) => {
+                    let meta = null, rows = [];
+                    worker.onerror = error => reject(new Error(error.message || '后台处理失败'));
+                    worker.onmessage = event => {
+                        const message = event.data;
+                        if (message.type === 'error') reject(new Error(message.message));
+                        else if (message.type === 'header') meta = message.value;
+                        else if (message.type === 'batch') rows.push(...message.value);
+                        else if (message.type === 'done') resolve(action === 'difference' ? rows : { ...meta, entries: rows });
+                        else if (message.type === 'bytes' || message.type === 'digest') resolve(message.value);
+                    };
+                });
+                if (action === 'decode') worker.postMessage({ type: 'start', action, expectedId, bytes: input }, [input]);
+                else {
+                    const { entries, local, ...header } = input;
+                    worker.postMessage({ type: 'start', action, expectedId, header });
+                    if (action === 'difference') for (let index = 0; index < local.length; index += 256) {
+                        worker.postMessage({ type: 'local', value: local.slice(index, index + 256) });
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                    }
+                    for (let index = 0; index < entries.length; index += 256) {
+                        worker.postMessage({ type: 'batch', value: entries.slice(index, index + 256) });
+                        await new Promise(resolve => setTimeout(resolve, 0));
+                    }
+                    worker.postMessage({ type: 'finish' });
+                }
+                return await completion;
+            } finally { worker?.terminate(); URL.revokeObjectURL(url); }
+        },
+        encode(snapshot) { return this.run('encode', snapshot, snapshot.snapshotId); },
+        decode(bytes, expectedId) { return this.run('decode', bytes, expectedId); },
+        digest(snapshot) { return this.run('digest', snapshot, snapshot.snapshotId); },
+        difference(local, remote) { return this.run('difference', { local, entries: remote }); }
+    };
+
+    class WebDavClient {
+        constructor(config) {
+            const url = new URL(String(config.url || '').trim());
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash)
+                throw new Error('请输入不含账号、参数和片段的 HTTP(S) WebDAV 地址');
+            const directory = String(config.directory || '').trim().replace(/\/+$/g, '');
+            const segments = directory ? directory.split('/') : [];
+            if (directory.startsWith('/') || segments.some(part => !part || part === '.' || part === '..' || /[\\?#]/.test(part)))
+                throw new Error('保存目录只能填写相对路径，不能包含 ..、问号或反斜杠');
+            this.endpoint = url.href.endsWith('/') ? url.href : url.href + '/';
+            this.segments = segments;
+            this.root = new URL([...segments.map(encodeURIComponent), 'bilibili-history'].join('/') + '/', this.endpoint).href;
+            this.username = String(config.username || '');
+            this.password = String(config.password || '');
+            this.timeout = 30000;
+        }
+        url(path = '') {
+            if (path && (!/^[A-Za-z0-9._/-]+$/.test(path) || path.includes('..') || path.startsWith('/')))
+                throw new Error('云端文件名无效');
+            return new URL(path, this.root).href;
+        }
+        request(method, path = '', { body, headers = {}, responseType = 'text', allowed = [200, 201, 204, 207], targetUrl } = {}) {
+            if (typeof GM_xmlhttpRequest !== 'function') throw new Error('用户脚本管理器不支持 WebDAV 网络请求');
+            const auth = this.username || this.password
+                ? 'Basic ' + btoa(String.fromCharCode(...new TextEncoder().encode(`${this.username}:${this.password}`))) : null;
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({ method, url: targetUrl || this.url(path), data: body, responseType, timeout: this.timeout,
+                    headers: { ...(auth ? { Authorization: auth } : {}), ...headers },
+                    onload: result => {
+                        const response = { status: result.status, body: result.response, headers: result.responseHeaders || '' };
+                        if (allowed.includes(result.status)) resolve(response);
+                        else {
+                            const error = new Error(result.status === 401 || result.status === 403 ? 'WebDAV 认证失败或无权限'
+                                : result.status === 404 ? 'WebDAV 文件不存在'
+                                : result.status === 412 ? 'WebDAV 文件已变化，请重新同步'
+                                : `WebDAV 请求失败（HTTP ${result.status}）`);
+                            error.status = result.status; reject(error);
+                        }
+                    },
+                    onerror: () => reject(new Error('WebDAV 网络请求失败')),
+                    ontimeout: () => reject(new Error('WebDAV 请求超时'))
+                });
+            });
+        }
+        static header(response, name) {
+            const match = response.headers.match(new RegExp(`^${name}:\\s*(.+)$`, 'im'));
+            return match?.[1]?.trim() || '';
+        }
+        get(path, binary = false) { return this.request('GET', path, { responseType: binary ? 'arraybuffer' : 'text',
+            headers: { 'Cache-Control': 'no-cache', Pragma: 'no-cache' } }); }
+        put(path, body, headers = {}) { return this.request('PUT', path, { body, headers }); }
+        delete(path) { return this.request('DELETE', path, { allowed: [200, 202, 204, 404] }); }
+        async mkdir(path, targetUrl) {
+            try { await this.request('MKCOL', path, { allowed: [201, 405], targetUrl }); }
+            catch (error) { if (error.status !== 405) throw error; }
+        }
+        async ensureDirectories() {
+            for (let index = 0; index < this.segments.length; index++) {
+                const path = this.segments.slice(0, index + 1).map(encodeURIComponent).join('/') + '/';
+                await this.mkdir('', new URL(path, this.endpoint).href);
+            }
+            await this.mkdir(''); await this.mkdir('backups/');
+        }
+        async list(path = '') {
+            const response = await this.request('PROPFIND', path, { body: '<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/><d:getcontentlength/><d:getetag/></d:prop></d:propfind>',
+                headers: { Depth: '1', 'Content-Type': 'application/xml; charset=utf-8' }, allowed: [207] });
+            const xml = new DOMParser().parseFromString(response.body, 'application/xml');
+            if (xml.querySelector('parsererror')) throw new Error('WebDAV 目录响应格式无效');
+            const child = (node, name) => [...node.getElementsByTagNameNS('*', name)][0]?.textContent?.trim() || '';
+            const base = this.url(path);
+            return [...xml.getElementsByTagNameNS('*', 'response')].map(node => {
+                const href = child(node, 'href'); let url;
+                try { url = new URL(href, base); } catch { return null; }
+                if (url.origin !== new URL(base).origin || !url.href.startsWith(base) || url.href === base) return null;
+                const name = decodeURIComponent(url.href.slice(base.length));
+                if (!name || name.includes('/')) return null;
+                return { name, modifiedAt: Date.parse(child(node, 'getlastmodified')) || 0,
+                    bytes: Number(child(node, 'getcontentlength')) || 0, etag: child(node, 'getetag') };
+            }).filter(Boolean);
+        }
+        async readIndex() {
+            try {
+                const response = await this.get('state.json');
+                return { index: WebDavFormat.validateIndex(response.body), etag: WebDavClient.header(response, 'ETag') };
+            } catch (error) { if (error.status === 404) return null; throw error; }
+        }
+        async testConnection() {
+            await this.ensureDirectories();
+            const path = `probe-${crypto.randomUUID()}.bin`;
+            const body = new TextEncoder().encode('bvh-webdav-probe').buffer;
+            let conditional = false;
+            let completed = false;
+            try {
+                await this.put(path, body, { 'If-None-Match': '*' });
+                const read = await this.get(path, true);
+                const expected = new Uint8Array(body), actual = new Uint8Array(read.body);
+                if (actual.length !== expected.length || actual.some((byte, index) => byte !== expected[index]))
+                    throw new Error('WebDAV 测试文件读取不一致');
+                if (!(await this.list()).some(item => item.name === path)) throw new Error('WebDAV 目录无法列举测试文件');
+                try {
+                    await this.put(path, body, { 'If-None-Match': '*' });
+                } catch (error) { if (error.status !== 412) throw error; conditional = true; }
+                const etag = WebDavClient.header(read, 'ETag');
+                if (!etag || etag.startsWith('W/')) conditional = false;
+                if (conditional) {
+                    try { await this.put(path, body, { 'If-Match': '"bvh-impossible-etag"' }); conditional = false; }
+                    catch (error) { if (error.status !== 412) throw error; }
+                }
+                completed = true;
+            } finally {
+                if (completed) await this.delete(path);
+                else await this.delete(path).catch(() => {});
+            }
+            return { conditional };
+        }
+    }
+
+    const WebDavSync = {
+        _listeners: new Set(), _running: null, _timer: null, _owner: crypto.randomUUID(),
+        _status: { phase: 'idle', message: '' },
+        onChange(callback) { this._listeners.add(callback); return () => this._listeners.delete(callback); },
+        emit(patch) {
+            this._status = { ...this._status, ...patch };
+            for (const callback of this._listeners) callback(this._status);
+        },
+        async config() { return await HistoryStoreIO.get('bvh_webdav_config', {
+            url: '', directory: '', username: '', password: '', frequency: 'off', backupRetentionDays: 7
+        }); },
+        async saveConfig(input) {
+            const previous = await this.config();
+            const config = { url: String(input.url || '').trim(), directory: String(input.directory || '').trim(),
+                username: String(input.username || '').trim(),
+                password: String(input.password || ''), frequency: input.frequency,
+                backupRetentionDays: Number(input.backupRetentionDays) };
+            if (!['off', 'hourly', 'daily'].includes(config.frequency)) throw new Error('同步频率无效');
+            if (!Number.isSafeInteger(config.backupRetentionDays) || config.backupRetentionDays < 1) throw new Error('备份保留天数必须为正整数');
+            if (config.url) new WebDavClient(config);
+            if (config.frequency !== 'off' && !config.url) throw new Error('请先填写 WebDAV 目录地址');
+            await HistoryStoreIO.set('bvh_webdav_config', config);
+            if (previous.url === config.url && (previous.directory || '') === config.directory
+                && previous.backupRetentionDays !== config.backupRetentionDays && config.url) {
+                const state = await this.state(new WebDavClient(config).root);
+                state.retentionPending = true; await this.saveState(state);
+            }
+            this.emit({ phase: 'idle', message: '' });
+            this.check().catch(error => Utils.warn('云同步调度检查失败', error));
+            return config;
+        },
+        async state(root) {
+            const saved = await HistoryStoreIO.get('bvh_webdav_state', {});
+            return saved.root === root ? saved : { root, lastSuccess: 0, lastAttempt: 0 };
+        },
+        async saveState(state) { await HistoryStoreIO.set('bvh_webdav_state', state); this.emit({ state }); },
+        async adoptRetention(config, state) {
+            if (state.retentionPending || !state.backupRetentionDays
+                || config.backupRetentionDays === state.backupRetentionDays) return;
+            const saved = await this.config();
+            if (saved.url !== config.url || (saved.directory || '') !== config.directory
+                || saved.backupRetentionDays !== config.backupRetentionDays) return;
+            saved.backupRetentionDays = state.backupRetentionDays;
+            await HistoryStoreIO.set('bvh_webdav_config', saved); this.emit({ config: saved });
+        },
+        async stamp() {
+            const keys = await HistoryStoreIO.list();
+            const commits = keys.filter(key => key.startsWith('bvh_commit_')).sort();
+            let first = 2166136261, second = 5381;
+            for (const key of commits) for (let i = 0; i < key.length; i++) {
+                first = Math.imul(first ^ key.charCodeAt(i), 16777619);
+                second = Math.imul(second, 33) ^ key.charCodeAt(i);
+            }
+            return `${commits.length}:${first >>> 0}:${second >>> 0}`;
+        },
+        async lease() {
+            const now = Date.now(), prior = await HistoryStoreIO.get('bvh_webdav_lease');
+            if (prior && prior.owner !== this._owner && prior.until > now) return false;
+            await HistoryStoreIO.set('bvh_webdav_lease', { owner: this._owner, until: now + 90000 });
+            return (await HistoryStoreIO.get('bvh_webdav_lease'))?.owner === this._owner;
+        },
+        async release() {
+            const prior = await HistoryStoreIO.get('bvh_webdav_lease');
+            if (prior?.owner === this._owner) await HistoryStoreIO.delete('bvh_webdav_lease');
+        },
+        start() {
+            if (this._timer) return;
+            this._timer = setInterval(() => this.check().catch(error => Utils.warn('云同步调度检查失败', error)), 60000);
+            setTimeout(() => this.check().catch(error => Utils.warn('云同步启动检查失败', error)), 0);
+        },
+        stop() { clearInterval(this._timer); this._timer = null; this.release().catch(() => {}); },
+        async check() {
+            const config = await this.config();
+            if (!config.url || config.frequency === 'off' || document.visibilityState === 'hidden') return;
+            const client = new WebDavClient(config), state = await this.state(client.root), now = Date.now();
+            const interval = config.frequency === 'hourly' ? 3600000 : 86400000;
+            if (now - (state.lastSuccess || 0) < interval || now - (state.lastAttempt || 0) < 300000) return;
+            await this.sync();
+        },
+        async sync(manual = false) {
+            if (this._running) return this._running;
+            this._running = this._sync(manual).finally(() => { this._running = null; });
+            return this._running;
+        },
+        async _sync(manual) {
+            const config = await this.config();
+            if (!config.url) throw new Error('请先配置 WebDAV 目录地址');
+            if (!await this.lease()) return { skipped: '另一个标签页正在同步' };
+            const client = new WebDavClient(config), state = await this.state(client.root), started = Date.now();
+            const renew = setInterval(async () => {
+                try {
+                    if ((await HistoryStoreIO.get('bvh_webdav_lease'))?.owner === this._owner)
+                        await HistoryStoreIO.set('bvh_webdav_lease', { owner: this._owner, until: Date.now() + 90000 });
+                } catch {}
+            }, 30000);
+            this.emit({ phase: 'running', message: manual ? '' : '正在同步历史记录…' });
+            try {
+                if (!manual && state.lastSuccess && started - state.lastSuccess
+                    < (config.frequency === 'hourly' ? 3600000 : 86400000)) {
+                    this.emit({ phase: 'idle', message: '其他标签页已完成本轮同步' });
+                    return { skipped: '本轮已同步' };
+                }
+                state.lastAttempt = started; await this.saveState(state);
+                if (state.conditional === undefined) {
+                    const capability = await client.testConnection();
+                    state.conditional = capability.conditional; await this.saveState(state);
+                }
+                const result = await this.synchronize(client, state, config, started);
+                if (result.pendingChoice) {
+                    this.emit({ phase: 'choice', message: manual ? '' : '长期未同步 WebDAV，请选择使用本地或云端记录' });
+                    return result;
+                }
+                await this.adoptRetention(config, state);
+                state.lastSuccess = Date.now(); state.pendingChoice = null;
+                await this.saveState(state);
+                this.emit({ phase: 'success', message: manual ? '' : result.changed ? '历史记录已同步' : '记录已是最新', lastSuccess: state.lastSuccess });
+                try { await this.maintain(client, state, result.snapshot); }
+                catch (error) { this.emit({ backupError: error.message, backupErrorAt: Date.now() }); }
+                return result;
+            } catch (error) {
+                this.emit({ phase: 'error', message: manual ? '' : error.message, errorAt: Date.now() });
+                if (manual) throw error;
+                return { error: error.message };
+            } finally { clearInterval(renew); await this.release(); }
+        },
+        async readSnapshot(client, index) {
+            const response = await client.get(index.file, true);
+            return WebDavWorker.decode(response.body, index.snapshotId);
+        },
+        async publish(client, state, previous, snapshot, started, expectedStamp = null) {
+            if (Date.now() - started > 600000) throw new Error('同步耗时过长，请重新读取云端状态');
+            const bytes = await WebDavWorker.encode(snapshot);
+            const file = WebDavFormat.file(snapshot.snapshotId);
+            await client.put(file, bytes, { 'Content-Type': 'application/gzip' });
+            if (Date.now() - started > 600000) throw new Error('同步耗时过长，请重新读取云端状态');
+            const currentConfig = await this.config();
+            if (!currentConfig.url || new WebDavClient(currentConfig).root !== client.root)
+                throw new Error('WebDAV 地址或保存目录已变化，请重新同步');
+            if (expectedStamp !== null && expectedStamp !== await this.stamp())
+                throw new Error('本地历史已变化，请重新确认操作');
+            const header = state.conditional ? previous?.etag
+                ? { 'If-Match': previous.etag } : { 'If-None-Match': '*' } : {};
+            if (state.conditional && previous && (!previous.etag || previous.etag.startsWith('W/')))
+                throw new Error('云端缺少可靠 ETag，请重新测试连接');
+            await client.put('state.json', JSON.stringify({ format: 'bvh-webdav-index', schemaVersion: 1,
+                snapshotId: snapshot.snapshotId, file }), { ...header, 'Content-Type': 'application/json; charset=utf-8' });
+            state.lastAppliedSnapshotId = snapshot.snapshotId; state.epoch = snapshot.epoch;
+            state.revision = snapshot.revision; state.minSyncRevision = snapshot.minSyncRevision;
+            state.backupRetentionDays = snapshot.backupRetentionDays;
+            state.contentDigest = await WebDavWorker.digest(snapshot);
+            await this.saveState(state);
+            return snapshot;
+        },
+        async synchronize(client, state, config, started) {
+            const previous = await client.readIndex();
+            if (state.pendingChoice && previous?.index.snapshotId === state.pendingChoice.snapshotId)
+                return { pendingChoice: true, snapshot: null };
+            const localStamp = await this.stamp();
+            if (previous?.index.snapshotId === state.lastAppliedSnapshotId && state.localStamp === localStamp
+                && state.contentDigest && !state.retentionPending && StorageManager._store.epoch === state.epoch) {
+                await this.retryLocalPrune(state);
+                return { changed: false, snapshot: null };
+            }
+            const remote = previous && (previous.index.snapshotId !== state.lastAppliedSnapshotId || !state.contentDigest
+                || StorageManager._store.epoch !== state.epoch)
+                ? await this.readSnapshot(client, previous.index) : null;
+            const divergent = remote && state.lastAppliedSnapshotId && remote.epoch === state.epoch
+                && (remote.revision < state.revision || remote.revision === state.revision
+                    && remote.snapshotId !== state.lastAppliedSnapshotId || remote.minSyncRevision < state.minSyncRevision);
+            if (divergent) {
+                state.localStamp = null; state.contentDigest = null;
+                if (remote.minSyncRevision || state.minSyncRevision) {
+                    state.pendingChoice = { snapshotId: remote.snapshotId, revision: remote.revision };
+                    await this.saveState(state); return { pendingChoice: true, snapshot: remote };
+                }
+            }
+            if (remote && remote.minSyncRevision > 0
+                && (!state.lastAppliedSnapshotId || state.epoch === remote.epoch
+                    && state.revision < remote.minSyncRevision)
+                && (await StorageManager.getCloudEntries()).some(entry => !entry.deleted)) {
+                state.pendingChoice = { snapshotId: remote.snapshotId, revision: remote.revision, reason: 'stale' };
+                await this.saveState(state); return { pendingChoice: true, snapshot: remote };
+            }
+            if (remote && !state.lastAppliedSnapshotId && StorageManager._store.epoch !== remote.epoch
+                && remote.epoch === 'initial'
+                && (await StorageManager.getCloudEntries()).some(entry => !entry.deleted)) {
+                state.pendingChoice = { snapshotId: remote.snapshotId, revision: remote.revision, reason: 'different-batch' };
+                await this.saveState(state); return { pendingChoice: true, snapshot: remote };
+            }
+            if (remote && StorageManager._store.epoch !== remote.epoch
+                && (state.lastAppliedSnapshotId || remote.epoch !== 'initial'
+                    || !(await StorageManager.getCloudEntries()).some(entry => !entry.deleted))) {
+                await StorageManager.replaceCloudEntries(remote.entries, remote.epoch);
+                state.lastAppliedSnapshotId = remote.snapshotId; state.epoch = remote.epoch;
+                state.revision = remote.revision; state.minSyncRevision = remote.minSyncRevision;
+                state.contentDigest = await WebDavWorker.digest(remote);
+                state.localStamp = await this.stamp(); state.backupRetentionDays = remote.backupRetentionDays;
+                await this.saveState(state);
+                return { changed: true, snapshot: remote };
+            }
+            if (remote) {
+                const current = await StorageManager.getCloudEntries();
+                await StorageManager.mergeCloudEntries(await WebDavWorker.difference(current, remote.entries));
+                state.lastAppliedSnapshotId = remote.snapshotId; state.epoch = remote.epoch;
+                state.revision = remote.revision; state.minSyncRevision = remote.minSyncRevision;
+                state.backupRetentionDays = remote.backupRetentionDays;
+                state.contentDigest = await WebDavWorker.digest(remote);
+            }
+            const beforeRead = await this.stamp();
+            let entries = await StorageManager.getCloudEntries();
+            const epoch = remote?.epoch || state.epoch || 'initial';
+            const revision = remote?.revision ?? state.revision ?? 0;
+            const minSyncRevision = remote?.minSyncRevision ?? state.minSyncRevision ?? 0;
+            const cloudKeys = new Set(remote?.entries.map(entry => entry.key) || []);
+            entries = entries.filter(entry => !(entry.deleted && entry.publishedRevision <= minSyncRevision
+                && remote && !cloudKeys.has(entry.key)));
+            const retention = state.retentionPending ? config.backupRetentionDays
+                : remote?.backupRetentionDays || state.backupRetentionDays || config.backupRetentionDays;
+            const candidate = { format: 'bvh-webdav', schemaVersion: 1, snapshotId: crypto.randomUUID(),
+                epoch, revision, minSyncRevision, createdAt: new Date().toISOString(), kind: 'latest',
+                backupRetentionDays: retention, entries };
+            const candidateDigest = await WebDavWorker.digest(candidate);
+            if (previous && candidateDigest === state.contentDigest) {
+                state.localStamp = beforeRead; state.retentionPending = false; await this.saveState(state);
+                await this.pruneLocal(remote || candidate);
+                return { changed: !!remote, snapshot: remote };
+            }
+            candidate.revision = revision + 1;
+            candidate.entries = entries.map(entry => entry.deleted && entry.publishedRevision === undefined
+                ? { ...entry, publishedRevision: candidate.revision, publishedAt: Date.now() } : entry);
+            const prePublishStamp = await this.stamp();
+            await this.publish(client, state, previous, candidate, started);
+            const postPublishStamp = await this.stamp();
+            await StorageManager.mergeCloudEntries(candidate.entries);
+            state.localStamp = prePublishStamp === beforeRead && postPublishStamp === prePublishStamp
+                ? await this.stamp() : null;
+            state.retentionPending = false; await this.saveState(state);
+            await this.pruneLocal(candidate);
+            return { changed: true, snapshot: candidate };
+        },
+        async pruneLocal(snapshot) {
+            if (!snapshot?.minSyncRevision) return;
+            const remoteKeys = new Set(snapshot.entries.map(entry => entry.key));
+            const local = await StorageManager.getCloudEntries();
+            const dropped = local.filter(entry => entry.deleted && !remoteKeys.has(entry.key)
+                && entry.publishedRevision && entry.publishedRevision <= snapshot.minSyncRevision).map(entry => entry.key);
+            if (dropped.length) await StorageManager.pruneCloudDeleted(dropped, snapshot.minSyncRevision, snapshot.epoch);
+        },
+        async retryLocalPrune(state) {
+            if (!state.pendingPruneKeys?.length) return;
+            const local = await StorageManager.getCloudEntries();
+            const pending = new Set(state.pendingPruneKeys);
+            const keys = local.filter(entry => pending.has(entry.key) && entry.deleted && entry.publishedRevision
+                && entry.publishedRevision <= state.minSyncRevision).map(entry => entry.key);
+            if (!keys.length || await StorageManager.pruneCloudDeleted(keys, state.minSyncRevision, state.epoch)) {
+                state.pendingPruneKeys = []; state.localStamp = await this.stamp(); await this.saveState(state);
+            }
+        },
+        async listBackups(client) {
+            const items = await client.list('backups/');
+            return items.filter(item => /^(?:daily-\d{4}-\d{2}-\d{2}(?:-\d{6}-[0-9a-f-]{36})?|before-(?:restore|resync-local|resync-cloud)-\d{8}T\d{6}Z-[0-9a-f-]{36})\.json\.gz$/.test(item.name))
+                .sort((a, b) => b.modifiedAt - a.modifiedAt);
+        },
+        async backup(client, snapshot, kind, conditional = false) {
+            const date = new Date().toISOString(), id = crypto.randomUUID();
+            const filename = kind === 'daily' && conditional ? `daily-${date.slice(0, 10)}.json.gz`
+                : kind === 'daily' ? `daily-${date.slice(0, 10)}-${date.slice(11, 19).replaceAll(':', '')}-${id}.json.gz`
+                : `${kind}-${date.replace(/[-:]/g, '').slice(0, 15)}Z-${id}.json.gz`;
+            const data = { ...snapshot, snapshotId: id, kind, createdAt: date };
+            await client.put(`backups/${filename}`, await WebDavWorker.encode(data),
+                conditional ? { 'If-None-Match': '*', 'Content-Type': 'application/gzip' } : { 'Content-Type': 'application/gzip' });
+            return filename;
+        },
+        async maintain(client, state, current) {
+            const config = await this.config();
+            if (!config.url || new WebDavClient(config).root !== client.root) return;
+            const today = new Date().toISOString().slice(0, 10);
+            if (state.backedUpDate === today && Date.now() - (state.maintenanceAt || 0) < 86400000) return;
+            const backups = await this.listBackups(client);
+            if (!backups.some(item => item.name.startsWith(`daily-${today}`))) {
+                const latest = await client.readIndex();
+                if (!latest) throw new Error('云端索引丢失，无法备份');
+                const confirmed = current?.snapshotId === latest.index.snapshotId ? current
+                    : await this.readSnapshot(client, latest.index);
+                try { await this.backup(client, confirmed, 'daily', state.conditional); }
+                catch (error) { if (!(state.conditional && error.status === 412)) throw error; }
+            }
+            state.backedUpDate = today;
+            const retention = state.backupRetentionDays || 7, cutoff = Date.now() - retention * 86400000;
+            for (const item of backups) if (item.modifiedAt && item.modifiedAt < cutoff) await client.delete(`backups/${item.name}`);
+            const latest = await client.readIndex();
+            if (!latest) return;
+            const snapshot = current?.snapshotId === latest.index.snapshotId ? current
+                : await this.readSnapshot(client, latest.index);
+            const expired = snapshot.entries.filter(entry => entry.deleted && entry.publishedAt
+                && Date.now() - entry.publishedAt >= 30 * 86400000);
+            if (expired.length) {
+                const ids = new Set(expired.map(entry => entry.key));
+                const replacement = { ...snapshot, snapshotId: crypto.randomUUID(), revision: snapshot.revision + 1,
+                    minSyncRevision: Math.max(snapshot.minSyncRevision, ...expired.map(entry => entry.publishedRevision)),
+                    createdAt: new Date().toISOString(), entries: snapshot.entries.filter(entry => !ids.has(entry.key)) };
+                await this.publish(client, state, latest, replacement, Date.now());
+                state.pendingPruneKeys = expired.map(entry => entry.key);
+                await this.pruneLocal(replacement);
+                state.localStamp = await this.stamp(); await this.saveState(state);
+                await this.retryLocalPrune(state);
+            }
+            if (Date.now() - (state.filesCleanedAt || 0) >= 86400000) {
+                const files = await client.list();
+                const check = await client.readIndex();
+                if (check?.index.snapshotId !== (expired.length ? state.lastAppliedSnapshotId : latest.index.snapshotId)) return;
+                for (const item of files) if (/^history-[0-9a-f-]{36}\.json\.gz$/i.test(item.name)
+                    && item.name !== check.index.file && item.modifiedAt && Date.now() - item.modifiedAt > 86400000)
+                    await client.delete(item.name);
+                state.filesCleanedAt = Date.now(); await this.saveState(state);
+            }
+            state.maintenanceAt = Date.now(); await this.saveState(state);
+            this.emit({ backupError: null, lastBackupCheck: Date.now() });
+        },
+        async backups() {
+            const config = await this.config();
+            if (!config.url) throw new Error('请先配置 WebDAV 目录地址');
+            const client = new WebDavClient(config);
+            try { return await this.listBackups(client); }
+            catch (error) {
+                if ([404, 409].includes(error.status) && !await client.readIndex()) return [];
+                throw error;
+            }
+        },
+        async loadBackup(filename) {
+            const config = await this.config(), client = new WebDavClient(config);
+            if (!(await this.listBackups(client)).some(item => item.name === filename)) throw new Error('备份文件不存在');
+            return WebDavWorker.decode((await client.get(`backups/${filename}`, true)).body);
+        },
+        async restore(filename) {
+            if (this._running) throw new Error('同步正在进行，请稍后重试');
+            if (!await this.lease()) throw new Error('另一个标签页正在同步');
+            try {
+                const config = await this.config(), client = new WebDavClient(config), state = await this.state(client.root);
+                const target = await this.loadBackup(filename);
+                const previous = await client.readIndex();
+                if (!previous) throw new Error('云端当前历史不存在');
+                const current = await this.readSnapshot(client, previous.index);
+                const initialStamp = await this.stamp();
+                const local = await StorageManager.getCloudEntries();
+                if (initialStamp !== await this.stamp()) throw new Error('本地历史正在变化，请重新确认恢复');
+                const combined = current.epoch === StorageManager._store.epoch
+                    ? await this.combine(local, current.entries) : local;
+                await this.backup(client, { ...current, entries: combined }, 'before-restore');
+                if ((await client.readIndex())?.index.snapshotId !== previous.index.snapshotId
+                    || initialStamp !== await this.stamp()) throw new Error('恢复期间记录已变化，请重新确认');
+                const epoch = crypto.randomUUID();
+                const entries = target.entries.filter(entry => !entry.deleted).map(entry => ({ key: entry.key,
+                    record: { ...entry.record }, deleted: false, version: StorageManager.sampleVersion() }));
+                const replacement = { ...current, snapshotId: crypto.randomUUID(), epoch, revision: 1,
+                    minSyncRevision: 0, createdAt: new Date().toISOString(), kind: 'latest',
+                    backupRetentionDays: current.backupRetentionDays, entries };
+                await this.publish(client, state, previous, replacement, Date.now(), initialStamp);
+                await StorageManager.replaceCloudEntries(entries, epoch);
+                state.localStamp = await this.stamp(); await this.saveState(state);
+                this.emit({ phase: 'success', message: '' });
+                return entries.length;
+            } finally { await this.release(); }
+        },
+        async combine(local, remote) {
+            const map = new Map(local.map(entry => [entry.key, entry]));
+            for (const entry of remote) {
+                const current = map.get(entry.key);
+                if (!current || HistoryCommitStore.compare(entry.version, current.version) > 0) map.set(entry.key, entry);
+            }
+            return [...map.values()];
+        },
+        async resolveChoice(choice) {
+            if (!['local', 'cloud'].includes(choice)) throw new Error('请选择记录来源');
+            if (this._running) throw new Error('同步正在进行，请稍后重试');
+            if (!await this.lease()) throw new Error('另一个标签页正在同步');
+            try {
+                const config = await this.config(), client = new WebDavClient(config), state = await this.state(client.root);
+                const previous = await client.readIndex();
+                if (!previous || previous.index.snapshotId !== state.pendingChoice?.snapshotId)
+                    throw new Error('云端历史已变化，请刷新后重新选择');
+                const cloud = await this.readSnapshot(client, previous.index);
+                const localStamp = await this.stamp(), local = await StorageManager.getCloudEntries();
+                if (localStamp !== await this.stamp()) throw new Error('本地历史已变化，请刷新后重新选择');
+                const localSnapshot = { ...cloud, snapshotId: crypto.randomUUID(), entries: local };
+                await this.backup(client, localSnapshot, 'before-resync-local');
+                await this.backup(client, cloud, 'before-resync-cloud');
+                if ((await client.readIndex())?.index.snapshotId !== previous.index.snapshotId
+                    || localStamp !== await this.stamp()) throw new Error('备份期间历史已变化，请刷新后重新选择');
+                if (choice === 'cloud') {
+                    await StorageManager.replaceCloudEntries(cloud.entries, cloud.epoch);
+                    state.lastAppliedSnapshotId = cloud.snapshotId; state.epoch = cloud.epoch;
+                    state.revision = cloud.revision; state.minSyncRevision = cloud.minSyncRevision;
+                    state.contentDigest = await WebDavWorker.digest(cloud);
+                } else {
+                    const epoch = crypto.randomUUID();
+                    const entries = local.filter(entry => !entry.deleted).map(entry => ({ key: entry.key,
+                        record: { ...entry.record }, deleted: false, version: StorageManager.sampleVersion() }));
+                    const replacement = { ...cloud, snapshotId: crypto.randomUUID(), epoch, revision: 1,
+                        minSyncRevision: 0, createdAt: new Date().toISOString(), kind: 'latest', entries };
+                    await this.publish(client, state, previous, replacement, Date.now(), localStamp);
+                    await StorageManager.replaceCloudEntries(entries, epoch);
+                }
+                state.pendingChoice = null; state.localStamp = await this.stamp();
+                await this.saveState(state);
+                this.emit({ phase: 'success', message: '' });
+            } finally { await this.release(); }
+        }
+    };
 
     // --- UI层 ---
     const FloatingEntry = {
@@ -2157,6 +3054,7 @@
             };
 
             return {
+                message: message => { text.innerText = message; track.setAttribute('aria-label', message); },
                 update: (percent, message) => {
                     el.classList.remove('is-pending');
                     const safePercent = Math.max(0, Math.min(100, Math.round(percent) || 0));
@@ -2452,7 +3350,7 @@
     };
 
     const workbenchIcon = name => {
-        const paths = { settings: '<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/>', history: '<path d="M4 4v5h5M4 9a8 8 0 1 1 0 7M12 7v5l3 2"/>', stats: '<path d="M4 20h16M7 16V9M12 16V4M17 16v-5"/>', close: '<path d="m6 6 12 12M18 6 6 18"/>', mark: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3Z"/>' };
+        const paths = { settings: '<path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3"/><circle cx="15" cy="17" r="3"/>', history: '<path d="M4 4v5h5M4 9a8 8 0 1 1 0 7M12 7v5l3 2"/>', stats: '<path d="M4 20h16M7 16V9M12 16V4M17 16v-5"/>', cloud: '<path d="M6 18h12a4 4 0 0 0 .2-8A6 6 0 0 0 6.4 9.2 4.5 4.5 0 0 0 6 18Z"/><path d="m9 14 3-3 3 3M12 11v7"/>', close: '<path d="m6 6 12 12M18 6 6 18"/>', mark: '<rect x="3" y="5" width="18" height="14" rx="3"/><path d="m10 9 5 3-5 3Z"/>' };
         return `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.mark}</svg>`;
     };
 
@@ -2464,14 +3362,17 @@
         }
         constructor(options) {
             this.options = options; this.draft = { ...CONFIG }; this.saved = { ...CONFIG }; this.tab = options.activeTab || 'settings';
+            this.cloudDraft = null; this.cloudSaved = null; this.cloudBusy = false;
             this.state = { query: '', status: 'all', sort: 'savedAt-desc', page: 1, pageSize: 20, range: 30 };
             this.selected = new Set(); this.generation = 0; this.previewState = 'mid'; this.busy = false; this.disposed = false;
             this.root = document.createElement('div'); this.root.id = 'bvh-modal-mask'; this.root.className = 'bvh-workbench bvh-manager-mask';
             this.root.innerHTML = `<section class="bvh-shell" role="dialog" aria-modal="true" aria-labelledby="bvh-page-title">
-                <aside class="bvh-nav"><div class="bvh-brand">${workbenchIcon('mark')}<span>观看记录<small>YOUR WATCH ARCHIVE</small></span></div><div class="bvh-nav-label">我的工作台</div><nav aria-label="管理面板">${[['settings', '偏好设置'], ['history', '历史管理'], ['stats', '数据统计']].map(([key, label]) => `<button data-tab="${key}">${workbenchIcon(key)}<span>${label}</span></button>`).join('')}</nav><div class="bvh-nav-note"><span class="bvh-dot"></span>记录每一次观看<small>数据保存在当前浏览器</small></div></aside>
-                <div class="bvh-main"><header class="bvh-page-header"><div><div class="bvh-eyebrow">BILIBILI · WATCH HISTORY</div><h1 id="bvh-page-title"></h1><p data-subtitle></p></div><button data-close class="bvh-close" aria-label="关闭管理面板">${workbenchIcon('close')}</button></header><main class="bvh-content"><section data-pane="settings"></section><section data-pane="history" hidden></section><section data-pane="stats" hidden></section></main><footer class="bvh-footer"></footer></div></section>`;
+                <aside class="bvh-nav"><div class="bvh-brand">${workbenchIcon('mark')}<span>观看记录<small>YOUR WATCH ARCHIVE</small></span></div><div class="bvh-nav-label">我的工作台</div><nav aria-label="管理面板">${[['settings', '偏好设置'], ['history', '历史管理'], ['stats', '数据统计'], ['cloud', '云同步']].map(([key, label]) => `<button data-tab="${key}">${workbenchIcon(key)}<span>${label}</span></button>`).join('')}</nav><div class="bvh-nav-note"><span class="bvh-dot"></span>记录每一次观看<small>数据保存在当前浏览器</small></div></aside>
+                <div class="bvh-main"><header class="bvh-page-header"><div><div class="bvh-eyebrow">BILIBILI · WATCH HISTORY</div><h1 id="bvh-page-title"></h1><p data-subtitle></p></div><button data-close class="bvh-close" aria-label="关闭管理面板">${workbenchIcon('close')}</button></header><main class="bvh-content"><section data-pane="settings"></section><section data-pane="history" hidden></section><section data-pane="stats" hidden></section><section data-pane="cloud" hidden></section></main><footer class="bvh-footer"></footer></div></section>`;
             injectWorkbenchStyles(); document.body.append(this.root);
             this.renderSettings(); this.historyShell(); this.renderTab();
+            this.loadCloud().catch(error => UIComponent.toast(error.message, 'error'));
+            this.unsubscribeCloud = WebDavSync.onChange(status => this.updateCloudStatus(status));
             this.closeLayer = WorkbenchLayers.open(this.root, () => this.requestClose());
             this.root.addEventListener('click', event => this.click(event));
             this.root.addEventListener('input', event => this.input(event));
@@ -2479,13 +3380,14 @@
             this.unsubscribe = StorageManager.onDataChange(change => {
                 if (this.disposed) return;
                 for (const key of this.selected) if (!StorageManager.getRecord(key)) this.selected.delete(key);
-                if (this.tab !== 'settings') this.refresh();
+                if (this.tab === 'history' || this.tab === 'stats') this.refresh();
             });
         }
         q(selector) { return this.root.querySelector(selector); }
         get dirty() { return JSON.stringify(this.draft) !== JSON.stringify(this.saved); }
+        get cloudDirty() { return !!this.cloudDraft && JSON.stringify(this.cloudDraft) !== JSON.stringify(this.cloudSaved); }
         renderTab() {
-            const meta = { settings: ['偏好设置', '让观看记录，按照你的习惯呈现。'], history: ['历史管理', '找回看过的视频，继续尚未完成的内容。'], stats: ['数据统计', '从最近保存的记录，了解你的观看概况。'] }[this.tab];
+            const meta = { settings: ['偏好设置', '让观看记录，按照你的习惯呈现。'], history: ['历史管理', '找回看过的视频，继续尚未完成的内容。'], stats: ['数据统计', '从最近保存的记录，了解你的观看概况。'], cloud: ['云同步', '在设备间延续观看记录，按日期找回旧版本。'] }[this.tab];
             this.q('#bvh-page-title').textContent = meta[0]; this.q('[data-subtitle]').textContent = meta[1];
             this.root.querySelectorAll('[data-tab]').forEach(el => { el.setAttribute('aria-current', el.dataset.tab === this.tab ? 'page' : 'false'); });
             this.root.querySelectorAll('[data-pane]').forEach(el => el.hidden = el.dataset.pane !== this.tab);
@@ -2495,10 +3397,93 @@
         renderFooter(message = '') {
             const settingsNav = this.q('[data-tab="settings"]');
             settingsNav.dataset.dirty = String(this.dirty); settingsNav.title = this.dirty ? '偏好设置：有未保存的修改' : '偏好设置';
+            const cloudNav = this.q('[data-tab="cloud"]');
+            cloudNav.dataset.dirty = String(this.cloudDirty); cloudNav.title = this.cloudDirty ? '云同步：有未保存的修改' : '云同步';
             const footer = this.q('.bvh-footer');
             if (this.tab === 'settings') footer.innerHTML = `<button data-action="defaults">恢复默认</button><span class="bvh-save-status" role="status">${Utils.escapeHTML(message || (this.dirty ? '有未保存的修改' : '设置已同步'))}</span><button class="primary" data-action="save" ${this.saving ? 'disabled' : ''}>${this.saving ? '正在保存…' : '保存设置'}</button>`;
             else if (this.tab === 'history') footer.innerHTML = `<span data-page-info>正在准备记录…</span><label class="bvh-page-size">每页 <select data-page-size aria-label="每页记录数量">${[20, 30, 50, 100].map(n => `<option ${n === this.state.pageSize ? 'selected' : ''}>${n}</option>`).join('')}</select> 条</label><button data-action="prev" aria-label="上一页">上一页</button><button data-action="next" aria-label="下一页">下一页</button>`;
+            else if (this.tab === 'cloud') footer.innerHTML = `<span class="bvh-save-status" role="status">${Utils.escapeHTML(message || (this.cloudDirty ? '云同步配置有未保存的修改' : '自动同步在后台安静运行'))}</span><button class="primary" data-action="cloud-save" ${this.cloudBusy || !this.cloudDraft ? 'disabled' : ''}>保存云同步配置</button>`;
             else footer.innerHTML = '<span>统计依据：每个视频 / 分 P 的最近保存记录，不代表累计观看时长。</span>';
+        }
+        async loadCloud() {
+            const config = await WebDavSync.config();
+            if (this.disposed) return;
+            this.cloudSaved = { ...config }; this.cloudDraft = { ...config };
+            this.renderCloud(); this.renderFooter(); this.updateCloudStatus(WebDavSync._status);
+            if (this.tab === 'cloud') this.loadCloudBackups();
+        }
+        renderCloud() {
+            if (!this.cloudDraft) return;
+            const d = this.cloudDraft, esc = Utils.escapeHTML;
+            let path = '/bilibili-history/';
+            try { if (d.url) path = this.cloudPath(d); } catch { path = '请检查地址或保存目录'; }
+            this.q('[data-pane="cloud"]').innerHTML = `<div class="bvh-cloud">
+                <section class="bvh-cloud-hero"><div><div class="bvh-eyebrow">YOUR HISTORY · EVERYWHERE</div><h2>观看记录，跨设备接续</h2><p data-cloud-status role="status">${esc(WebDavSync._status.message || (d.url ? '等待下次同步' : '尚未配置 WebDAV'))}</p><small data-cloud-last>最近成功：${esc(WebDavSync._status.lastSuccess ? new Date(WebDavSync._status.lastSuccess).toLocaleString('zh-CN') : '暂无')}</small></div><button class="primary" data-action="cloud-sync" ${d.url ? '' : 'disabled'}>立即同步</button></section>
+                <div class="bvh-cloud-grid"><section class="bvh-section"><div class="bvh-section-heading"><span>01</span><h2>连接配置</h2></div><p class="bvh-help">填写 WebDAV 地址和保存目录。脚本会在保存目录下自动创建专用子目录，不与其他文件混放。</p>
+                    <label class="bvh-cloud-field">WebDAV 地址<input data-cloud-field="url" type="url" value="${esc(d.url)}" placeholder="https://example.com/dav/" autocomplete="url" spellcheck="false"></label>
+                    <label class="bvh-cloud-field">保存目录<input data-cloud-field="directory" value="${esc(d.directory || '')}" placeholder="例如：脚本备份（可留空）" spellcheck="false"><small class="bvh-help">相对于上方地址；留空则直接在该地址下创建脚本专用目录。</small></label>
+                    <div class="bvh-cloud-path">WebDAV 内保存路径 <code data-cloud-path>${esc(path)}</code></div>
+                    <label class="bvh-cloud-field">用户名<input data-cloud-field="username" value="${esc(d.username)}" autocomplete="username"></label>
+                    <label class="bvh-cloud-field">应用密码<div class="bvh-cloud-password"><input data-cloud-field="password" type="password" value="${esc(d.password)}" autocomplete="current-password"><button type="button" data-action="cloud-password" aria-label="显示密码">显示</button></div></label>
+                    <button data-action="cloud-test" ${d.url ? '' : 'disabled'}>测试连接</button><p class="bvh-help">可直接测试当前填写的配置，无需先保存；测试只操作专用目录内的临时文件。</p></section>
+                <section class="bvh-section"><div class="bvh-section-heading"><span>02</span><h2>同步与备份</h2></div><fieldset class="bvh-cloud-frequency"><legend>自动同步频率</legend><div>${[['off', '关闭'], ['hourly', '每小时'], ['daily', '每天']].map(([value, label]) => `<label><input data-cloud-field="frequency" type="radio" name="bvh-cloud-frequency" value="${value}" ${d.frequency === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset>
+                    <label class="bvh-cloud-field">每日备份保留<input data-cloud-field="backupRetentionDays" type="text" inputmode="numeric" value="${esc(d.backupRetentionDays)}" aria-describedby="bvh-cloud-retention-help"><span class="bvh-cloud-unit">天</span></label>
+                    <div class="bvh-cloud-presets">${[7, 14, 30].map(days => `<button type="button" data-cloud-days="${days}" aria-pressed="${Number(d.backupRetentionDays) === days}">${days} 天</button>`).join('')}</div>
+                    <p class="bvh-help" id="bvh-cloud-retention-help">默认保留 7 天，可改为任意正整数。缩短天数会清理超期备份；删除标记另保留 30 天，两者互不影响。</p><p class="bvh-help">没有可靠条件写入的 WebDAV 也可同步；多设备同时上传时仍可能相互覆盖，请避免同时手动同步。</p></section></div>
+                <section class="bvh-section bvh-cloud-backups"><div class="bvh-cloud-heading"><div><div class="bvh-section-heading"><span>03</span><h2>日期备份</h2></div><p class="bvh-help">按 UTC 日期创建。恢复会影响所有设备，恢复前自动备份当前记录。</p><p class="bvh-help" data-cloud-backup-status role="status"></p></div><button data-action="cloud-reload">刷新列表</button></div><div data-cloud-choice hidden></div><div data-cloud-backups class="bvh-cloud-list">打开此模块后可加载备份列表。</div></section></div>`;
+        }
+        cloudPath(config) {
+            const client = new WebDavClient(config);
+            return `/${[...client.segments, 'bilibili-history'].join('/')}/`;
+        }
+        updateCloudStatus(status) {
+            if (this.disposed) return;
+            if (status.config && this.cloudSaved && !this.cloudDirty
+                && status.config.url === this.cloudSaved.url
+                && (status.config.directory || '') === (this.cloudSaved.directory || '')) {
+                this.cloudSaved = { ...status.config }; this.cloudDraft = { ...status.config };
+                const input = this.q('[data-cloud-field="backupRetentionDays"]'); if (input) input.value = status.config.backupRetentionDays;
+                this.root.querySelectorAll('[data-cloud-days]').forEach(button => button.setAttribute('aria-pressed',
+                    Number(button.dataset.cloudDays) === status.config.backupRetentionDays));
+            }
+            const text = this.q('[data-cloud-status]'); if (text) text.textContent = status.message || '等待下次同步';
+            const last = this.q('[data-cloud-last]'); if (last && status.lastSuccess) last.textContent = `最近成功：${new Date(status.lastSuccess).toLocaleString('zh-CN')}`;
+            const backup = this.q('[data-cloud-backup-status]'); if (backup) backup.textContent = status.backupError
+                ? `备份或维护失败：${status.backupError}` : status.lastBackupCheck
+                    ? `最近备份检查：${new Date(status.lastBackupCheck).toLocaleString('zh-CN')}` : '尚无备份检查结果';
+            this.updateCloudChoice();
+        }
+        updateCloudChoice() {
+            const target = this.q('[data-cloud-choice]'); if (!target) return;
+            const pending = WebDavSync._status.state?.pendingChoice;
+            target.hidden = !pending;
+            if (!pending) { target.replaceChildren(); delete target.dataset.snapshotId; return; }
+            if (target.dataset.snapshotId === pending.snapshotId) return;
+            target.dataset.snapshotId = pending.snapshotId;
+            const differentBatch = pending.reason === 'different-batch';
+            target.innerHTML = `<div class="bvh-cloud-choice"><strong>${differentBatch ? '当前记录与此 WebDAV 目录属于不同批次' : '长期未同步 WebDAV，需要选择记录来源'}</strong><p>${differentBatch ? '连接新目录前，请选择保留哪边的完整记录。' : '云端已清理过旧删除信息。'}选择前会分别备份本地与云端，未选择时不会自动合并或覆盖。</p><div><button class="bvh-cloud-source" data-action="cloud-choose-cloud"><strong>使用云端记录</strong><small>以云端为准，当前设备的独有记录会退出历史。</small></button><button class="bvh-cloud-source" data-action="cloud-choose-local"><strong>使用本地记录</strong><small>以当前设备为准，所有设备将采用新历史。</small></button></div></div>`;
+        }
+        async loadCloudBackups() {
+            const target = this.q('[data-cloud-backups]'); if (!target || !this.cloudSaved?.url) {
+                if (target) target.textContent = '保存 WebDAV 配置后，可在这里查看日期备份。'; return { count: 0 };
+            }
+            target.textContent = '正在读取备份目录…';
+            try {
+                const list = await WebDavSync.backups();
+                if (this.disposed || this.tab !== 'cloud') return { cancelled: true };
+                const esc = Utils.escapeHTML;
+                target.innerHTML = list.length ? list.map(item => {
+                    const daily = item.name.startsWith('daily-'), kind = daily ? '每日备份' : item.name.startsWith('before-restore') ? '恢复前' : item.name.includes('resync-local') ? '本地来源' : '云端来源';
+                    const stamp = item.name.match(/-(\d{8})T/);
+                    const date = daily ? item.name.slice(6, 16)
+                        : stamp ? `${stamp[1].slice(0, 4)}-${stamp[1].slice(4, 6)}-${stamp[1].slice(6)}` : '日期未知';
+                    return `<div class="bvh-cloud-backup"><div><strong>${esc(kind)}</strong><span>UTC ${esc(date)}</span><small>${item.modifiedAt ? new Date(item.modifiedAt).toLocaleString('zh-CN') : '实际时间未知'} · ${item.bytes ? (item.bytes / 1048576).toFixed(1) + ' MB' : '大小未知'}</small></div><button data-cloud-backup="${esc(item.name)}">查看并恢复</button></div>`;
+                }).join('') : '<div class="bvh-empty-inline">暂无日期备份。首次成功同步后会创建当天备份。</div>';
+                return { count: list.length };
+            } catch (error) {
+                if (!this.disposed) target.textContent = `备份列表读取失败：${error.message}`;
+                return { error: error.message };
+            }
         }
         renderTagStyleSettings() {
             const d = this.draft, esc = Utils.escapeHTML;
@@ -2638,6 +3623,7 @@
         }
         async refresh() {
             if (this.tab === 'settings' || this.disposed) return;
+            if (this.tab === 'cloud') { this.updateCloudStatus(WebDavSync._status); this.loadCloudBackups(); return; }
             const generation = ++this.generation, tab = this.tab;
             const target = this.q(tab === 'history' ? '[data-results]' : '[data-pane="stats"]');
             target.innerHTML = '<div class="bvh-empty" role="status"><span class="bvh-loader"></span><h3>正在整理记录…</h3><p>你可以继续搜索、切换页签或关闭面板。</p></div>';
@@ -2674,6 +3660,19 @@
         }
         input(event) {
             const el = event.target;
+            if (el.dataset.cloudField && this.cloudDraft) {
+                if (el.type !== 'radio' || el.checked) this.cloudDraft[el.dataset.cloudField] = el.value;
+                if (el.dataset.cloudField === 'url' || el.dataset.cloudField === 'directory') {
+                    let path = '/bilibili-history/';
+                    try { if (this.cloudDraft.url) path = this.cloudPath(this.cloudDraft); }
+                    catch { path = '请检查地址或保存目录'; }
+                    const preview = this.q('[data-cloud-path]'); if (preview) preview.textContent = path;
+                    const test = this.q('[data-action="cloud-test"]'); if (test) test.disabled = !this.cloudDraft.url;
+                }
+                if (el.dataset.cloudField === 'backupRetentionDays') this.root.querySelectorAll('[data-cloud-days]')
+                    .forEach(button => button.setAttribute('aria-pressed', Number(button.dataset.cloudDays) === Number(el.value)));
+                this.renderFooter(); return;
+            }
             if (el.matches('[data-query]')) { this.state.query = el.value; this.state.page = 1; clearTimeout(this.searchTimer); this.generation++; this.searchTimer = setTimeout(() => this.refresh(), 180); }
             if (el.dataset.setting) {
                 const key = el.dataset.setting, value = el.type === 'checkbox' ? el.checked : el.value;
@@ -2686,6 +3685,7 @@
         }
         change(event) {
             const el = event.target;
+            if (el.dataset.cloudField) this.input(event);
             if (el.dataset.setting) this.input(event);
             if (el.dataset.filter) { this.state[el.dataset.filter] = el.value; this.state.page = 1; this.refresh(); }
             if (el.hasAttribute('data-page-size')) { this.state.pageSize = Number(el.value); this.state.page = 1; if (this.filtered) this.renderHistory(); }
@@ -2698,10 +3698,18 @@
             if (!button) return;
             if (button.dataset.settingsGroup) { this.selectSettingsGroup(button.dataset.settingsGroup); return; }
             if (button.dataset.tab) { this.tab = button.dataset.tab; this.generation++; this.renderTab(); return; }
+            if (button.dataset.cloudDays) {
+                this.cloudDraft.backupRetentionDays = button.dataset.cloudDays;
+                this.q('[data-cloud-field="backupRetentionDays"]').value = button.dataset.cloudDays;
+                this.root.querySelectorAll('[data-cloud-days]').forEach(el => el.setAttribute('aria-pressed', el === button));
+                this.renderFooter(); return;
+            }
+            if (button.dataset.cloudBackup) { await this.restoreCloudBackup(button.dataset.cloudBackup); return; }
             if (button.dataset.preview) { this.previewState = button.dataset.preview; this.renderPreview(); return; }
             if (button.dataset.range) { this.state.range = Number(button.dataset.range); this.refresh(); return; }
             if (button.dataset.delete) { await this.deleteKeys([button.dataset.delete]); return; }
             const action = button.dataset.action;
+            if (action?.startsWith('cloud-')) { await this.cloudAction(action); return; }
             try {
                 if (action === 'save') await this.save();
                 if (action === 'defaults') { this.draft = { ...DEFAULT_CONFIG }; this.renderSettings(); this.renderFooter(); }
@@ -2736,6 +3744,88 @@
                     if (choice === 'confirm') { await StorageManager._enqueue(async () => { if (action === 'cleanup-staging') await StorageManager._store.cleanupStaging({ writersStopped: true }); else await StorageManager.createLegacySnapshot({ writersStopped: true }); }); UIComponent.toast('离线维护完成', 'success'); }
                 }
             } catch (error) { UIComponent.toast(error.message || '操作失败，请重试', 'error', 5000); }
+        }
+        async cloudAction(action) {
+            if (this.cloudBusy) return;
+            if (action === 'cloud-password') {
+                const input = this.q('[data-cloud-field="password"]'); input.type = input.type === 'password' ? 'text' : 'password';
+                this.q('[data-action="cloud-password"]').textContent = input.type === 'password' ? '显示' : '隐藏'; return;
+            }
+            if (action === 'cloud-reload') {
+                const progress = UIComponent.progressToast('正在读取备份列表…', { indeterminate: true });
+                const result = await this.loadCloudBackups();
+                progress.close(result.cancelled ? '已取消读取备份列表' : result.error ? `备份列表读取失败：${result.error}`
+                    : result.count ? `已找到 ${result.count} 份备份` : '暂无日期备份', result.error ? 'error' : 'success');
+                return;
+            }
+            if (action === 'cloud-save') {
+                this.cloudBusy = true; this.renderFooter();
+                try {
+                    const next = await WebDavSync.saveConfig(this.cloudDraft);
+                    this.cloudSaved = { ...next }; this.cloudDraft = { ...next };
+                    this.renderCloud(); UIComponent.toast('云同步配置已保存', 'success');
+                    this.loadCloudBackups();
+                } catch (error) { UIComponent.toast(`保存失败：${error.message}`, 'error', 5000); }
+                finally { this.cloudBusy = false; this.renderFooter(); }
+                return;
+            }
+            if (action !== 'cloud-test' && this.cloudDirty) {
+                UIComponent.toast('请先保存云同步配置，再执行此操作', 'info'); return;
+            }
+            this.cloudBusy = true;
+            const button = this.q(`[data-action="${action}"]`); if (button) button.disabled = true;
+            let progress;
+            try {
+                if (action === 'cloud-test') {
+                    if (button) button.textContent = '正在测试…';
+                    progress = UIComponent.progressToast('正在测试 WebDAV 连接…', { indeterminate: true });
+                    const result = await new WebDavClient({ ...this.cloudDraft }).testConnection();
+                    progress.close(result.conditional ? '连接成功，支持条件写入' : '连接成功，将使用兼容模式');
+                } else if (action === 'cloud-sync') {
+                    progress = UIComponent.progressToast('正在同步历史记录…', { indeterminate: true });
+                    const result = await WebDavSync.sync(true);
+                    const backupError = result.skipped || result.pendingChoice ? null : WebDavSync._status.backupError;
+                    progress.close(result.skipped || result.pendingChoice && '请选择本地或云端记录'
+                        || backupError && `历史已同步，备份失败：${backupError}`
+                        || (result.changed ? '历史记录已同步' : '记录已是最新'), backupError ? 'error' : 'success');
+                    await this.loadCloudBackups();
+                } else if (action === 'cloud-choose-local' || action === 'cloud-choose-cloud') {
+                    const source = action.endsWith('local') ? 'local' : 'cloud';
+                    const answer = await WorkbenchLayers.confirm('选择历史记录来源', source === 'local'
+                        ? '将以本地有效记录为准，并让所有设备下次同步采用新历史。云端独有记录会退出当前历史。操作前会分别备份本地和云端。'
+                        : '当前设备将完整采用云端历史。本地独有记录会退出当前历史。操作前会分别备份本地和云端。',
+                    [{ value: 'cancel', label: '再想想' }, { value: 'confirm', label: '确认采用', primary: true }]);
+                    if (answer !== 'confirm') return;
+                    progress = UIComponent.progressToast('正在备份并切换记录来源…', { indeterminate: true });
+                    await WebDavSync.resolveChoice(source); this.updateCloudChoice(); await this.loadCloudBackups();
+                    progress.close(source === 'cloud' ? '已采用云端记录' : '已将本地记录设为所有设备的新历史');
+                }
+            } catch (error) {
+                const message = action === 'cloud-test' ? `连接失败：${error.message}` : `操作失败：${error.message}`;
+                if (progress) progress.close(message, 'error', 5000);
+                else UIComponent.toast(message, 'error', 5000);
+            } finally {
+                this.cloudBusy = false;
+                if (button) { button.disabled = false; if (action === 'cloud-test') button.textContent = '测试连接'; }
+            }
+        }
+        async restoreCloudBackup(filename) {
+            if (this.cloudBusy || this.cloudDirty) {
+                if (this.cloudDirty) UIComponent.toast('请先保存云同步配置', 'info'); return;
+            }
+            this.cloudBusy = true;
+            const progress = UIComponent.progressToast('正在读取备份详情…', { indeterminate: true });
+            try {
+                const backup = await WebDavSync.loadBackup(filename);
+                const count = backup.entries.filter(entry => !entry.deleted).length;
+                const answer = await WorkbenchLayers.confirm('恢复日期备份', `备份时间：${new Date(backup.createdAt).toLocaleString('zh-CN')}；有效记录 ${count} 条。恢复将影响所有设备；恢复前会自动备份当前本地和云端历史。`,
+                    [{ value: 'cancel', label: '取消' }, { value: 'confirm', label: '恢复到此备份', primary: true }]);
+                if (answer !== 'confirm') { progress.close('已取消恢复'); return; }
+                progress.message('正在备份当前记录并恢复…');
+                await WebDavSync.restore(filename); await this.loadCloudBackups();
+                progress.close('备份已恢复，所有设备下次同步将采用这份记录');
+            } catch (error) { progress.close(`恢复失败：${error.message}`, 'error', 5000); }
+            finally { this.cloudBusy = false; }
         }
         async save() {
             if (this.saving) return false;
@@ -2779,14 +3869,19 @@
         async requestClose() {
             if (this.closing || this.disposed) return; this.closing = true;
             try {
-                if (this.dirty) {
+                if (this.dirty || this.cloudDirty) {
                     const choice = await WorkbenchLayers.confirm('保存这次设置修改？', '你的设置草稿尚未应用。可以保存后关闭，或放弃本次修改。', [{ value: 'cancel', label: '继续编辑' }, { value: 'discard', label: '放弃修改' }, { value: 'save', label: '保存后关闭', primary: true }]);
-                    if (choice === 'cancel' || choice === 'save' && !await this.save()) return;
+                    if (choice === 'cancel') return;
+                    if (choice === 'save') {
+                        if (this.dirty && !await this.save()) return;
+                        if (this.cloudDirty) try { await WebDavSync.saveConfig(this.cloudDraft); }
+                        catch (error) { this.tab = 'cloud'; this.renderTab(); UIComponent.toast(`保存失败：${error.message}`, 'error', 5000); return; }
+                    }
                 }
                 this.dispose();
             } finally { this.closing = false; }
         }
-        dispose() { if (this.disposed) return; this.disposed = true; this.generation++; clearTimeout(this.searchTimer); this.unsubscribe?.(); this.closeLayer?.(); if (HistoryManagerPanel.active === this) HistoryManagerPanel.active = null; }
+        dispose() { if (this.disposed) return; this.disposed = true; this.generation++; clearTimeout(this.searchTimer); this.unsubscribe?.(); this.unsubscribeCloud?.(); this.closeLayer?.(); if (HistoryManagerPanel.active === this) HistoryManagerPanel.active = null; }
         async export() {
             await StorageManager.initialize();
             const data = Object.fromEntries(StorageManager.getAllRecords().map(({ key, record }) => [key, record]));
@@ -2853,6 +3948,12 @@
         @media(max-width:779px){.bvh-manager-mask{padding:12px}.bvh-shell{display:flex;flex-direction:column;height:calc(100dvh - 24px);border-radius:14px}.bvh-nav{padding:12px 16px;flex-direction:row;align-items:center;gap:16px;flex-shrink:0}.bvh-brand{padding:0}.bvh-brand>svg{width:24px}.bvh-brand>span{font-size:12px}.bvh-brand small,.bvh-nav-label,.bvh-nav-note{display:none}.bvh-nav nav{display:flex;gap:4px;flex:1;justify-content:flex-end}.bvh-nav button{padding:8px;gap:5px;min-height:44px;font-size:12px}.bvh-nav button svg{width:16px;height:16px}.bvh-nav button[aria-current=page]{box-shadow:inset 0 -2px #00AEEC}.bvh-main{flex:1}.bvh-page-header{padding:20px}.bvh-content{padding:18px 20px}.bvh-footer{padding:12px 20px}.bvh-settings-layout{grid-template-columns:minmax(0,1fr) 220px}.bvh-setting-row{flex-wrap:wrap}.bvh-stats-grid{grid-template-columns:1fr 1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:span 2}.bvh-workbench button,.bvh-workbench select{min-height:44px}}
         @media(max-width:600px){.bvh-manager-mask{padding:8px}.bvh-shell{height:calc(100dvh - 16px)}.bvh-nav{padding:8px 12px;gap:8px}.bvh-brand>span{display:none}.bvh-nav nav{justify-content:space-between}.bvh-nav button{font-size:11px;padding:8px 9px}.bvh-nav button svg{display:none}.bvh-page-header{padding:18px 16px}.bvh-page-header h1{font-size:22px}.bvh-page-header p{font-size:11px}.bvh-eyebrow{font-size:8px}.bvh-content{padding:16px}.bvh-settings-layout{display:flex;flex-direction:column}.bvh-setting-groups{width:100%}.bvh-preview-panel{position:static;order:-1;width:100%;padding:16px;background:#EAEFEC;border-radius:10px}.bvh-preview-cover{margin-top:12px;aspect-ratio:16/8}.bvh-preview-note{margin-top:14px;padding-top:10px}.bvh-preview-panel>h3,.bvh-preview-caption{display:none}.bvh-preview-states{margin-top:12px;gap:5px}.bvh-preview-states button{min-height:44px;font-size:10px;padding:6px 8px}.bvh-setting-row{flex-wrap:nowrap}.bvh-setting-row select{max-width:132px}.bvh-opacity input[type=range]{width:48px}.bvh-footer{padding:12px 16px;gap:8px;flex-wrap:wrap;font-size:10px}.bvh-footer button{font-size:11px;padding:8px 10px}.bvh-save-status{font-size:10px}.bvh-footer:has([data-page-info])>span{width:100%}.bvh-history-tools{gap:8px}.bvh-history-tools label{font-size:10px}.bvh-history-tools select{font-size:11px;padding:7px}.bvh-tool-spacer{display:none}.bvh-selection-bar{flex-wrap:wrap}.bvh-selection-bar>span{width:100%}.bvh-selection-bar button{min-height:44px}.bvh-stat-summary{grid-template-columns:1fr 1fr;gap:10px}.bvh-stat-summary strong{font-size:28px}.bvh-stats-grid{grid-template-columns:1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:auto}.bvh-chart-card .bvh-help{text-align:center}.bvh-distribution{margin-top:18px}.bvh-trend-heading{flex-wrap:wrap}.bvh-confirm{padding:22px}.bvh-dialog-mask{padding:16px}.bvh-dialog-actions{justify-content:stretch}.bvh-dialog-actions button{flex:1}}
         .bvh-nav button[data-dirty=true]:after{content:"";width:6px;height:6px;border-radius:50%;background:#F0BD62;margin-left:auto;flex-shrink:0}
+        .bvh-cloud{display:grid;gap:20px}.bvh-cloud-hero{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:28px;background:linear-gradient(122deg,#233541,#304B59 62%,#226786);border-radius:14px;color:white;box-shadow:0 16px 32px #1C344522}.bvh-cloud-hero h2{font-size:23px;line-height:1.35}.bvh-cloud-hero p{margin:10px 0 4px;font-size:13px;color:#DBEDF5}.bvh-cloud-hero small{color:#B9D5E1}.bvh-cloud-hero .bvh-eyebrow{color:#89CBE5}.bvh-cloud-hero button.primary{background:#E4F7FF;color:#164A64;border-color:#E4F7FF}.bvh-cloud-hero button.primary:hover{background:white}.bvh-cloud-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px;align-items:stretch}.bvh-cloud-grid>.bvh-section{min-width:0;display:flex;flex-direction:column;gap:13px}.bvh-cloud-grid .bvh-section-heading{margin-bottom:0}.bvh-cloud-field{display:block;position:relative;font-size:12px;font-weight:600;color:#344652}.bvh-cloud-field>input,.bvh-cloud-password{display:block;width:100%;margin-top:6px}.bvh-workbench .bvh-cloud-field>input{width:100%;font-weight:400}.bvh-cloud-password{display:flex;border:1px solid var(--bvh-line);border-radius:8px;overflow:hidden;background:white}.bvh-workbench .bvh-cloud-password input{flex:1;min-width:0;border:0;border-radius:0;background:transparent}.bvh-workbench .bvh-cloud-password button{border:0;border-radius:0;min-width:58px;background:#F0F5F7;font-size:11px}.bvh-cloud-path{padding:10px 12px;background:#EFF5F7;border:1px solid #DCE9EF;border-radius:8px;color:#526B77;font-size:11px;overflow-wrap:anywhere}.bvh-cloud-path code{display:block;color:#24516A;font-family:ui-monospace,monospace;margin-top:2px}.bvh-cloud-frequency{border:0;padding:0;margin:0}.bvh-cloud-frequency legend{font-size:12px;font-weight:600;padding:0 0 7px}.bvh-cloud-frequency>div{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px}.bvh-cloud-frequency label{position:relative;cursor:pointer}.bvh-cloud-frequency input{position:absolute;inset:0;opacity:0;width:100%;height:100%;cursor:pointer;margin:0}.bvh-cloud-frequency span{display:block;text-align:center;padding:9px 4px;border:1px solid var(--bvh-line);border-radius:8px;background:#F8FAFA;font-size:12px}.bvh-cloud-frequency input:checked+span{border-color:#008CBF;background:#E9F7FC;color:#006C96;font-weight:650}.bvh-cloud-frequency input:focus-visible+span{outline:3px solid #007EAD;outline-offset:2px}.bvh-cloud-unit{position:absolute;right:14px;bottom:10px;color:#667986;font-size:12px;font-weight:400}.bvh-workbench .bvh-cloud-field input[data-cloud-field=backupRetentionDays]{padding-right:40px}.bvh-cloud-presets{display:flex;gap:7px}.bvh-workbench .bvh-cloud-presets button{font-size:11px;min-height:32px;padding:5px 11px}.bvh-cloud-heading{display:flex;align-items:start;justify-content:space-between;gap:12px}.bvh-cloud-heading .bvh-section-heading{margin:0}.bvh-cloud-list{margin-top:15px}.bvh-cloud-backup{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-top:1px solid #E8EEF0}.bvh-cloud-backup>div{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;min-width:0}.bvh-cloud-backup strong{font-size:12px}.bvh-cloud-backup span{font-size:11px;color:#557285}.bvh-cloud-backup small{font-size:10px;color:var(--bvh-muted)}.bvh-workbench .bvh-cloud-backup button{font-size:11px;min-height:34px;flex-shrink:0}.bvh-cloud-choice{padding:18px;margin-top:18px;background:#FFF7E9;border:1px solid #F2D8A8;border-radius:10px}.bvh-cloud-choice strong{font-size:13px}.bvh-cloud-choice p{font-size:11px;color:#785D3D;margin:6px 0 12px}.bvh-cloud-choice>div{display:flex;gap:8px;flex-wrap:wrap}.bvh-workbench .bvh-cloud-choice button{font-size:11px;min-height:34px}.bvh-workbench [data-cloud-days][aria-pressed=true]{border-color:var(--bvh-blue);color:var(--bvh-blue);background:#EAF5F9}
+        @media(max-width:780px){.bvh-cloud-grid{grid-template-columns:1fr}.bvh-cloud-hero{padding:22px}.bvh-cloud-hero h2{font-size:20px}}
+        .bvh-cloud-choice>div{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.bvh-workbench .bvh-cloud-source{display:flex;min-width:0;min-height:88px;white-space:normal;text-align:left;align-items:flex-start;justify-content:center;flex-direction:column;padding:13px 15px;background:#FFFCF7;border:1px solid #E8CC9E;border-radius:9px}.bvh-cloud-source strong{color:#523B20;font-size:12px}.bvh-cloud-source small{display:block;color:#785D3D;font-size:11px;margin-top:4px;line-height:1.5}.bvh-workbench .bvh-cloud-source:hover,.bvh-workbench .bvh-cloud-source:focus-visible{border-color:#C3924C;background:#FFF5E1}
+        .bvh-workbench .bvh-cloud-hero h2{color:#F7FBFD}.bvh-cloud-path code{font-size:12px}
+        @media(max-width:600px){.bvh-nav nav{flex-wrap:wrap;justify-content:flex-start}.bvh-nav button{flex:1 1 auto;justify-content:center;min-width:0}.bvh-cloud-hero{align-items:stretch;flex-direction:column}.bvh-cloud-hero button{align-self:flex-start}.bvh-cloud-backup{align-items:flex-start;flex-direction:column}.bvh-cloud-backup>div{gap:4px 10px}.bvh-cloud-backup button{align-self:flex-start}}
+        @media(max-width:600px){.bvh-cloud-choice>div{grid-template-columns:1fr}}
         .bvh-table-scroll{max-height:calc(100dvh - 390px);min-height:180px}
         .bvh-settings-nav{display:flex;gap:6px;padding:12px 32px;background:var(--bvh-paper);border-bottom:1px solid var(--bvh-line);flex-shrink:0}
         .bvh-settings-nav button{font-size:12px;min-height:36px;padding:8px 14px;background:transparent;border-color:transparent;transition:none}
@@ -4376,8 +5477,9 @@
             }
             Utils.log('启动历史读取完成', `耗时=${Math.round(performance.now() - storageStarted)}ms`, `提交数=${StorageManager._store.commits.size}`);
 
+            StorageManager.startPresence().catch(error => Utils.warn('跨标签页状态登记失败', error));
             this.initMenuCommands();
-            window.addEventListener('pagehide', event => { if (!event.persisted) StorageManager.dispose(); });
+            window.addEventListener('pagehide', event => { if (!event.persisted) { WebDavSync.stop(); StorageManager.dispose(); } });
             this.deferDomStart();
             // 备份按原版本条件恢复，不再阻塞当前视频界面与媒体监听。
             const restoreStarted = performance.now();
@@ -4486,12 +5588,14 @@
             UIComponent.showQuickEntry();
             HistoryPageSync.refreshControl();
             this.hijackRouter();
+            WebDavSync.start();
             done('initialized watchers/player/router');
 
             // 标签页切回时基于版本号判断是否需要同步（避免盲目全量刷新）
             document.addEventListener('visibilitychange', async () => {
                 Utils.log('visibilitychange', document.visibilityState);
                 if (document.visibilityState === 'visible') {
+                    WebDavSync.check().catch(error => Utils.warn('云同步可见性检查失败', error));
                     const stale = await StorageManager._syncIfStale().catch(error => { Utils.warn('历史同步失败', error); return false; });
                     if (stale) {
                         StorageManager._notifyChange();
@@ -4520,6 +5624,7 @@
             GM_registerMenuCommand('打开设置与历史管理', () => {
                 UIComponent.showManagerPanel({ activeTab: 'settings' });
             });
+            GM_registerMenuCommand('打开云同步', () => UIComponent.showManagerPanel({ activeTab: 'cloud' }));
 
             GM_registerMenuCommand('导出历史记录', async () => {
                 await StorageManager.initialize();

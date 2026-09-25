@@ -13,7 +13,9 @@ export function instrument(text = source) {
         EpisodeResolver, HistoryPageSync, SettingsManager, CONFIG, DEFAULT_CONFIG, Utils, injectStyles, AppController,
         ...(typeof FloatingEntry === 'undefined' ? {} : { FloatingEntry }),
         ...(typeof HistoryCommitStore === 'undefined' ? {} : { HistoryCommitStore, HistoryStoreIO }),
-        ...(typeof HistoryQueries === 'undefined' ? {} : { HistoryQueries, HistoryManagerPanel, WorkbenchLayers }) };
+        ...(typeof HistoryQueries === 'undefined' ? {} : { HistoryQueries, HistoryManagerPanel, WorkbenchLayers }),
+        ...(typeof WebDavFormat === 'undefined' ? {} : { WebDavFormat, WebDavCodec, WebDavWorker,
+            ...(typeof WebDavClient === 'undefined' ? {} : { WebDavClient, WebDavSync }) }) };
 })();`;
 }
 export function memoryLocalStorage() {
@@ -54,7 +56,8 @@ export function instance(shared = sharedStorage(), owner = 'www', text = source)
     class Clock extends Date { constructor(...args) { super(...(args.length ? args : [epoch])); } static now() { return epoch; } }
     const window = { addEventListener() {}, removeEventListener() {} };
     const context = vm.createContext({ ...shared.api(owner), console, URL, crypto: webcrypto, Date: Clock,
-        performance, structuredClone, TextEncoder, queueMicrotask, window, unsafeWindow: window,
+        performance, structuredClone, TextEncoder, ReadableStream, CompressionStream, DecompressionStream, Response,
+        queueMicrotask, window, unsafeWindow: window,
         location: { href: `https://${owner}.bilibili.com/video/BV0000000001` },
         document: { title: '合成页面', querySelector: () => null, querySelectorAll: () => [], getElementById: () => null },
         localStorage: memoryLocalStorage(), sessionStorage: memoryLocalStorage(),
