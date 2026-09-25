@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.1.0
+// @version      4.2.0
 // @description  记录并提示Bilibili已观看或已访问但未观看视频记录。支持历史搜索、统计图表、历史页同步和保留周期清理。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -47,6 +47,21 @@
     };
     const FLOATING_BUTTON_VISIBILITY_VALUES = Object.values(FLOATING_BUTTON_VISIBILITY);
 
+    const FLOATING_STYLE_DEFAULTS = {
+        floatingTheme: 'light', floatingAccentColor: '#00aeec', floatingSize: 100,
+        floatingOpacity: 100, floatingMode: 'detailed'
+    };
+    const isFloatingStyleValid = (key, value) => {
+        if (key === 'floatingSize') return /^\d+$/.test(String(value ?? '')) && Number(value) >= 80 && Number(value) <= 160;
+        if (key === 'floatingOpacity') return /^(?:\d+)$/.test(String(value ?? '')) && Number(value) >= 60 && Number(value) <= 100;
+        if (key === 'floatingAccentColor') return /^#[0-9a-f]{6}$/i.test(value);
+        return ({ floatingTheme: ['light', 'dark'], floatingMode: ['compact', 'detailed'] }[key] || []).includes(value);
+    };
+    const normalizeFloatingStyle = settings => Object.fromEntries(Object.entries(FLOATING_STYLE_DEFAULTS).map(([key, fallback]) => {
+        const value = key === 'floatingSize' ? ({ small: 92, medium: 100, large: 108 }[settings[key]] ?? settings[key]) : settings[key];
+        return [key, isFloatingStyleValid(key, value) ? (['floatingOpacity', 'floatingSize'].includes(key) ? Number(value) : value) : fallback];
+    }));
+
     const TAG_STYLE_DEFAULTS = {
         coverStyle: 'label', episodeStyle: 'label',
         coverRingSize: 36, episodeRingSize: 27,
@@ -70,6 +85,7 @@
         return [key, valid ? (range ? Number(value) : value) : fallback];
     }));
     const DEFAULT_CONFIG = {
+        ...FLOATING_STYLE_DEFAULTS,
         ...TAG_STYLE_DEFAULTS,
         showProgressBar: true,
         showVisitedTag: true,
@@ -84,6 +100,7 @@
 
     const CONFIG = Object.assign({}, DEFAULT_CONFIG, GM_getValue('bvh_settings', {}));
     Object.assign(CONFIG, normalizeTagStyle(CONFIG));
+    Object.assign(CONFIG, normalizeFloatingStyle(CONFIG));
 
     const getFloatingButtonVisibility = () => (
         FLOATING_BUTTON_VISIBILITY_VALUES.includes(CONFIG.floatingButtonVisibility)
@@ -351,8 +368,29 @@
         .bvh-progress-toast.is-pending .bvh-toast-progress-fill { width: 35%; animation: bvh-undo-pending 1.2s ease-in-out infinite alternate; }
         @keyframes bvh-undo-pending { from { transform: translateX(0); } to { transform: translateX(185%); } }
         @media (prefers-reduced-motion: reduce) { .bvh-progress-toast.is-pending .bvh-toast-progress-fill { animation: none; } }
-        .bvh-view-panel { position: fixed; text-align: center; border-left: 6px solid #2196F3; background-color: #aeffff; font-family: 'Segoe UI', sans-serif; font-weight: 600; padding: 5px; z-index: 9999; cursor: move; color: #000; box-shadow: 0 2px 8px rgba(0,0,0,0.2); border-radius: 0 4px 4px 0; user-select: none; }
-        .bvh-quick-entry { position: fixed; left: 15px; bottom: 15px; z-index: 9998; border: 1px solid #00aeec; background: #fff; color: #00aeec; border-radius: 6px; padding: 7px 10px; cursor: pointer; font-weight: 700; box-shadow: 0 2px 8px rgba(0,0,0,.16); }
+        .bvh-floating-entry { position: fixed; left: 15px; bottom: 15px; z-index: 9999; box-sizing: border-box; width: max-content; max-width: min(12em, calc(100vw - 16px)); min-width: 44px; min-height: 36px; margin: 0; padding: .7em .8em; border: 1px solid var(--bvh-float-line); border-radius: .9em; background: var(--bvh-float-bg); color: var(--bvh-float-ink); font: 500 var(--bvh-float-font)/1.35 "HarmonyOS Sans SC","Microsoft YaHei",sans-serif; font-variant-numeric: tabular-nums; text-align: left; box-shadow: 0 3px 12px #14253618, 0 1px 2px #14253612; cursor: pointer; user-select: none; touch-action: none; appearance: none; transition: box-shadow .16s ease; }
+        .bvh-floating-entry *, .bvh-floating-entry *::before { box-sizing: border-box; }
+        .bvh-floating-entry [hidden] { display: none !important; }
+        .bvh-floating-entry:hover { box-shadow: 0 4px 16px #1425362b, 0 1px 3px #14253618; }
+        .bvh-floating-entry:focus-visible { outline: 3px solid var(--bvh-float-ink); outline-offset: 3px; }
+        .bvh-floating-entry[data-dragging=true] { cursor: grabbing; transition: none; }
+        .bvh-float-heading { display: flex; align-items: center; gap: .5em; min-width: 0; }
+        .bvh-float-icon { display: grid; place-items: center; color: var(--bvh-float-accent); flex: 0 0 auto; }
+        .bvh-float-icon svg { width: 1.25em; height: 1.25em; }
+        .bvh-float-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .85em; font-weight: 500; color: var(--bvh-float-muted); }
+        .bvh-float-page { margin-left: auto; font-size: .8em; color: var(--bvh-float-muted); flex: 0 1 auto; max-width: 45%; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+        .bvh-float-progress { display: flex; align-items: baseline; justify-content: flex-start; gap: .75em; margin-top: .65em; }
+        .bvh-float-time { font-size: 1.85em; font-weight: 700; line-height: 1.1; letter-spacing: -.5px; }
+        .bvh-float-percent { color: var(--bvh-float-muted); font-size: .85em; }
+        .bvh-float-track { display: block; height: 2px; margin-top: .55em; background: var(--bvh-float-line); border-radius: 3px; overflow: hidden; }
+        .bvh-float-fill { display: block; height: 100%; background: var(--bvh-float-accent); border-radius: inherit; }
+        .bvh-float-saved { display: block; color: var(--bvh-float-muted); font-size: .75em; margin-top: .7em; overflow-wrap: anywhere; }
+        .bvh-floating-entry[data-kind=quick] { width: max-content; border-radius: 999px; padding: .6em .85em; }
+        .bvh-floating-entry[data-mode=compact] { width: max-content; border-radius: 999px; padding: .6em .8em; }
+        .bvh-floating-entry[data-mode=compact] .bvh-float-heading { flex-wrap: nowrap; }
+        .bvh-float-compact-percent { font-size: .92em; margin-left: 3px; color: var(--bvh-float-muted); flex-shrink: 0; }
+        .bvh-floating-entry.bvh-floating-preview { position: relative; inset: auto; z-index: auto; max-width: 100%; cursor: default; touch-action: auto; }
+        @media(prefers-reduced-motion:reduce) { .bvh-floating-entry { transition: none; } }
         .bvh-history-sync-float { position: fixed; right: 22px; bottom: 86px; z-index: 9998; border: 1px solid #00aeec; background: #00aeec; color: #fff; border-radius: 6px; padding: 9px 13px; cursor: pointer; font-weight: 800; font-size: 13px; line-height: 1.2; box-shadow: 0 4px 16px rgba(0,174,236,.28); transition: opacity .18s ease, transform .18s ease, background .18s ease; }
         .bvh-history-sync-float:hover { background: #0097d8; transform: translateY(-1px); }
         .bvh-history-sync-float.loading, .bvh-history-sync-float:disabled { opacity: .72; cursor: wait; transform: none; }
@@ -926,6 +964,7 @@
         save: async (patch = {}) => {
             const next = Object.assign({}, CONFIG, patch);
             Object.assign(next, normalizeTagStyle(next));
+            Object.assign(next, normalizeFloatingStyle(next));
             await HistoryStoreIO.set('bvh_settings', next);
             Object.assign(CONFIG, next);
             if (patch.debug) Utils.installIssueHooks();
@@ -1923,6 +1962,120 @@
     VideoKey.latestRelatedRecord = (base) => EpisodeResolver.getLatestRecord(base);
 
     // --- UI层 ---
+    const FloatingEntry = {
+        current: null,
+        render(el, record, key = '', settings = CONFIG) {
+            const d = normalizeFloatingStyle(settings), dark = d.floatingTheme === 'dark', compact = d.floatingMode === 'compact';
+            const fontSize = 13 * d.floatingSize / 100;
+            const vars = {
+                accent: d.floatingAccentColor, bg: `rgba(${dark ? '32,38,49' : '255,253,249'},${d.floatingOpacity / 100})`,
+                ink: dark ? '#f3f6fa' : '#243040', muted: dark ? '#b7c3d1' : '#5e6c7a',
+                line: dark ? '#ffffff26' : '#24304020', font: `${fontSize}px`
+            };
+            for (const [name, value] of Object.entries(vars)) el.style.setProperty(`--bvh-float-${name}`, value);
+            el.classList.add('bvh-floating-entry'); el.dataset.mode = d.floatingMode; el.dataset.theme = d.floatingTheme; el.dataset.kind = record ? 'video' : 'quick';
+            if (!el.querySelector('[data-float-status]')) el.innerHTML = `<span class="bvh-float-heading"><span class="bvh-float-icon">${workbenchIcon('history')}</span><span class="bvh-float-status" data-float-status></span><span class="bvh-float-page" data-float-page></span><span class="bvh-float-compact-percent" data-float-compact></span></span><span class="bvh-float-progress" data-float-progress><span class="bvh-float-time" data-float-time></span><span class="bvh-float-percent" data-float-percent></span></span><span class="bvh-float-track" data-float-track><span class="bvh-float-fill" data-float-fill></span></span><span class="bvh-float-saved" data-float-saved></span>`;
+            const text = value => typeof value === 'string' ? value.trim() : '';
+            const status = record ? text(record.status) || '观看记录' : '观看记录';
+            const time = text(record?.currentTime), saved = text(record?.savedAt);
+            const rawPercent = text(record?.percent), number = /^\d+(?:\.\d+)?%$/.test(rawPercent) ? Number(rawPercent.slice(0, -1)) : NaN;
+            const percent = Number.isFinite(number) && number >= 0 && number <= 100 ? rawPercent : '';
+            const page = key && VideoKey.page(key) > 1 ? EpisodeResolver.getPageLabel(key) : '';
+            const set = (slot, value, visible = true) => { const node = el.querySelector(`[data-float-${slot}]`); node.textContent = value; node.hidden = !visible; };
+            set('status', status); set('page', page, !!page && !compact); set('compact', percent, compact && !!percent);
+            set('time', time, !!time); set('percent', percent, !!percent);
+            el.querySelector('[data-float-progress]').hidden = compact || (!time && !percent);
+            el.querySelector('[data-float-track]').hidden = compact || !percent;
+            el.querySelector('[data-float-fill]').style.width = `${percent ? number : 0}%`;
+            set('saved', saved, !compact && !!saved);
+
+            const description = [key, page, status, time, percent, saved, '打开设置与历史管理'].filter(Boolean).join(' · ');
+            el.setAttribute('aria-label', description); el.title = `${description}\n拖拽以移动入口`;
+        },
+        readPosition() {
+            const pos = GM_getValue('bvh_panel_position');
+            return pos && ['left', 'top'].every(key => typeof pos[key] === 'string' && /^-?\d+(?:\.\d+)?px$/.test(pos[key]) && Number.isFinite(parseFloat(pos[key])))
+                ? { left: parseFloat(pos.left), top: parseFloat(pos.top) } : null;
+        },
+        place() {
+            const state = this.current;
+            if (!state || !state.el.isConnected) return;
+            const { el, position } = state, rect = el.getBoundingClientRect();
+            const width = document.documentElement.clientWidth, height = window.innerHeight;
+            const limit = (value, extent, size) => Math.max(8, Math.min(value, Math.max(8, extent - size - 8)));
+            if (position) Object.assign(el.style, { left: `${limit(position.left, width, rect.width)}px`, top: `${limit(position.top, height, rect.height)}px`, bottom: 'auto' });
+            else Object.assign(el.style, { left: `${limit(15, width, rect.width)}px`, top: 'auto', bottom: `${Math.min(15, Math.max(8, height - rect.height - 8))}px` });
+        },
+        resetPosition() {
+            GM_deleteValue('bvh_panel_position');
+            if (this.current) { this.current.cancelDrag?.(); this.current.position = null; this.place(); }
+        },
+        remove() {
+            const state = this.current;
+            if (!state) return;
+            state.cancelDrag?.(); state.cleanup?.(); state.el.remove(); this.current = null;
+        },
+        show(record, key = '') {
+            const id = record ? 'bvh-view-panel' : 'bvh-quick-entry';
+            if (this.current && (this.current.el.id !== id || !this.current.el.isConnected)) this.remove();
+            if (!this.current) {
+                const el = document.createElement('button'); el.id = id; el.type = 'button'; el.className = record ? 'bvh-view-panel' : 'bvh-quick-entry';
+                this.current = { el, position: this.readPosition(), key };
+                this.render(el, record, key); document.body.append(el); this.bind(this.current);
+            }
+            const state = this.current;
+            if (state.key !== key) state.cancelDrag?.();
+            state.key = key; state.el.dataset.bvhKey = key;
+            this.render(state.el, record, key); this.place();
+        },
+        bind(state) {
+            const { el } = state;
+            let drag = null, suppressClick = false;
+            const finish = cancelled => {
+                if (!drag) return;
+                const previous = drag; drag = null;
+                if (previous.moved) {
+                    suppressClick = true;
+                    if (cancelled) state.position = previous.position;
+                    else {
+                        const rect = el.getBoundingClientRect(); state.position = { left: rect.left, top: rect.top };
+                        GM_setValue('bvh_panel_position', { left: `${rect.left}px`, top: `${rect.top}px` });
+                    }
+                }
+                el.removeAttribute('data-dragging');
+                if (el.hasPointerCapture(previous.id)) el.releasePointerCapture(previous.id);
+                this.place();
+            };
+            const down = event => {
+                if (event.button !== 0 || !event.isPrimary) return;
+                suppressClick = false;
+                const rect = el.getBoundingClientRect();
+                drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top, moved: false, position: state.position && { ...state.position } };
+                el.setPointerCapture(event.pointerId);
+            };
+            const move = event => {
+                if (!drag || event.pointerId !== drag.id) return;
+                const dx = event.clientX - drag.x, dy = event.clientY - drag.y;
+                if (!drag.moved && Math.max(Math.abs(dx), Math.abs(dy)) <= 5) return;
+                drag.moved = true; el.dataset.dragging = 'true';
+                state.position = { left: drag.left + dx, top: drag.top + dy }; this.place();
+            };
+            const up = event => { if (event.pointerId === drag?.id) finish(false); };
+            const cancel = event => { if (event.pointerId === drag?.id) finish(true); };
+            const click = event => {
+                if (suppressClick && event.detail !== 0) { suppressClick = false; event.preventDefault(); return; }
+                suppressClick = false;
+                UIComponent.showManagerPanel({ activeTab: 'settings', ...(state.key ? { currentKey: state.key } : {}) });
+            };
+            const resize = () => this.place();
+            const events = { pointerdown: down, pointermove: move, pointerup: up, pointercancel: cancel, lostpointercapture: cancel, click };
+            for (const [type, handler] of Object.entries(events)) el.addEventListener(type, handler);
+            window.addEventListener('resize', resize);
+            state.cancelDrag = () => finish(true);
+            state.cleanup = () => { for (const [type, handler] of Object.entries(events)) el.removeEventListener(type, handler); window.removeEventListener('resize', resize); };
+        }
+    };
+
     const UIComponent = {
         toastContainer: null,
         initToastContainer: () => {
@@ -2036,160 +2189,29 @@
             return el;
         },
         showViewPanel: (record, bvId) => {
-            const existing = document.getElementById('bvh-view-panel');
-            if (existing) existing.remove();
-
-            if (shouldHideVideoPageFloat()) return;
-            if (!record) return;
-
-            const el = document.createElement('div');
-            el.id = 'bvh-view-panel';
-            el.className = 'bvh-view-panel';
-            el.dataset.bvhKey = bvId;
-
-            // 恢复上次保存的位置
-            const savedPos = GM_getValue('bvh_panel_position');
-            if (savedPos) {
-                el.style.left = savedPos.left;
-                el.style.top = savedPos.top;
-            } else {
-                el.style.left = '15px';
-                el.style.bottom = '15px';
-            }
-
-            let titleText = bvId;
-            if (record.currentTime) {
-                titleText += '\n左键单击打开设置与历史管理\n拖拽以移动面板';
-            } else {
-                titleText += '\n左键单击打开设置与历史管理\n拖拽以移动面板';
-            }
-            el.title = titleText;
-
-            const p1 = document.createElement('p');
-            p1.style.cssText = "margin:5px 10px 5px 10px; pointer-events:none;";
-            let currentStr = record.currentTime ? ` \n${record.currentTime}(${record.percent})` : '';
-            const pagePrefix = VideoKey.page(bvId) > 1 ? `${EpisodeResolver.getPageLabel(bvId)} ` : '';
-            p1.innerText = `${pagePrefix}${record.status}${currentStr}`;
-
-            const p2 = document.createElement('p');
-            p2.style.cssText = "margin:0 10px 5px 10px; pointer-events:none;";
-            const timeParts = record.savedAt ? record.savedAt.split(" ") : ["", ""];
-            p2.innerText = `${timeParts[0]}\n${timeParts[1] || ''}`;
-
-            el.appendChild(p1);
-            el.appendChild(p2);
-
-            // 拖拽与点击事件处理
-            el.addEventListener('mousedown', (e) => {
-                if (e.button !== 0) return; // 仅左键触发
-                let isDragging = false;
-                const startX = e.clientX;
-                const startY = e.clientY;
-                const rect = el.getBoundingClientRect();
-                const offsetX = e.clientX - rect.left;
-                const offsetY = e.clientY - rect.top;
-
-                const onMouseMove = (moveEvent) => {
-                    if (Math.abs(moveEvent.clientX - startX) > 5 || Math.abs(moveEvent.clientY - startY) > 5) {
-                        isDragging = true;
-                    }
-                    if (isDragging) {
-                        el.style.left = `${moveEvent.clientX - offsetX}px`;
-                        el.style.bottom = 'auto'; // 取消 bottom 以免互相冲突
-                        el.style.top = `${moveEvent.clientY - offsetY}px`;
-                    }
-                };
-
-                const onMouseUp = (upEvent) => {
-                    document.removeEventListener('mousemove', onMouseMove);
-                    document.removeEventListener('mouseup', onMouseUp);
-
-                    if (isDragging) {
-                        GM_setValue('bvh_panel_position', {
-                            left: el.style.left,
-                            top: el.style.top
-                        });
-                    } else {
-                        UIComponent.showManagerPanel({ activeTab: 'settings', currentKey: bvId });
-                    }
-                };
-
-                document.addEventListener('mousemove', onMouseMove);
-                document.addEventListener('mouseup', onMouseUp);
-            });
-
-            document.body.appendChild(el);
-            const quickEntry = document.getElementById('bvh-quick-entry');
-            if (quickEntry) quickEntry.remove();
+            if (shouldHideVideoPageFloat()) { FloatingEntry.remove(); return; }
+            if (record) FloatingEntry.show(record, bvId);
         },
-        updateViewPanelProgress: (record) => {
-            const panel = document.getElementById('bvh-view-panel');
-            if (!panel || !record) return;
-
-            const p1 = panel.querySelector('p:first-child');
-            if (p1) {
-                let currentStr = record.currentTime ? ` \n${record.currentTime}(${record.percent})` : '';
-                const key = panel.dataset.bvhKey || '';
-                const pagePrefix = VideoKey.page(key) > 1 ? `${EpisodeResolver.getPageLabel(key)} ` : '';
-                p1.innerText = `${pagePrefix}${record.status}${currentStr}`;
-            }
-            const p2 = panel.querySelector('p:nth-child(2)');
-            if (p2) {
-                const timeParts = record.savedAt ? record.savedAt.split(" ") : ["", ""];
-                p2.innerText = `${timeParts[0]}\n${timeParts[1] || ''}`;
-            }
+        updateViewPanelProgress: record => {
+            const state = FloatingEntry.current;
+            if (!state || state.el.id !== 'bvh-view-panel' || !record) return;
+            FloatingEntry.render(state.el, record, state.key); FloatingEntry.place();
         },
         showQuickEntry: () => {
-            let el = document.getElementById('bvh-quick-entry');
-            const isVideoPage = isVideoPageRoute();
-            if (shouldHideNonVideoPageFloat() || (isVideoPage && shouldHideVideoPageFloat())) {
-                if (el) el.remove();
-                return;
-            }
-
-            const panel = document.getElementById('bvh-view-panel');
-            if (panel) {
-                if (el) el.remove();
-                return;
-            }
-            if (!el) {
-                el = document.createElement('button');
-                el.id = 'bvh-quick-entry';
-                el.className = 'bvh-quick-entry';
-                el.type = 'button';
-                el.innerText = '脚本设置';
-                el.title = '打开 Bilibili 观看历史记录设置与历史管理';
-                el.addEventListener('click', () => UIComponent.showManagerPanel({ activeTab: 'settings' }));
-                document.body.appendChild(el);
-            }
+            const videoPage = isVideoPageRoute();
+            if (videoPage ? shouldHideVideoPageFloat() : shouldHideNonVideoPageFloat()) { FloatingEntry.remove(); return; }
+            const key = videoPage ? EpisodeResolver.getCurrentKey() || VideoKey.fromUrl(location.href) || '' : '';
+            if (videoPage && FloatingEntry.current?.el.id === 'bvh-view-panel' && FloatingEntry.current.key === key) return;
+            FloatingEntry.show(null, key);
         },
         refreshFloatingButtons: () => {
-            const panel = document.getElementById('bvh-view-panel');
-            const quickEntry = document.getElementById('bvh-quick-entry');
-            const isVideoPage = isVideoPageRoute();
-
-            if (isVideoPage) {
-                if (shouldHideVideoPageFloat()) {
-                    if (panel) panel.remove();
-                    if (quickEntry) quickEntry.remove();
-                    return;
-                }
-
-                const currentKey = EpisodeResolver.getCurrentKey()
-                    || VideoKey.fromUrl(location.href)
-                    || VideoKey.normalize(window.__INITIAL_STATE__?.bvid);
-                const record = currentKey ? StorageManager.getRecord(currentKey) : null;
-                if (record) UIComponent.showViewPanel(record, currentKey);
-                else UIComponent.showQuickEntry();
-                return;
-            }
-
-            if (panel) panel.remove();
-            if (shouldHideNonVideoPageFloat()) {
-                if (quickEntry) quickEntry.remove();
-                return;
-            }
-            UIComponent.showQuickEntry();
+            const videoPage = isVideoPageRoute();
+            if (videoPage ? shouldHideVideoPageFloat() : shouldHideNonVideoPageFloat()) { FloatingEntry.remove(); return; }
+            if (videoPage) {
+                const key = EpisodeResolver.getCurrentKey() || VideoKey.fromUrl(location.href) || VideoKey.normalize(window.__INITIAL_STATE__?.bvid);
+                const record = key ? StorageManager.getRecord(key) : null;
+                FloatingEntry.show(record, key || '');
+            } else FloatingEntry.show(null);
         },
         jumpToProgress: (record) => {
             if (!record?.currentTime) {
@@ -2467,6 +2489,7 @@
             this.q('#bvh-page-title').textContent = meta[0]; this.q('[data-subtitle]').textContent = meta[1];
             this.root.querySelectorAll('[data-tab]').forEach(el => { el.setAttribute('aria-current', el.dataset.tab === this.tab ? 'page' : 'false'); });
             this.root.querySelectorAll('[data-pane]').forEach(el => el.hidden = el.dataset.pane !== this.tab);
+            this.q('.bvh-settings-nav').hidden = this.tab !== 'settings';
             this.renderFooter(); this.refresh();
         }
         renderFooter(message = '') {
@@ -2483,6 +2506,18 @@
             const scope = (prefix, label) => `<fieldset class="bvh-tag-dimensions"><legend>${label}</legend><div class="bvh-setting-row"><label for="bvh-${prefix}-style">外观</label><select id="bvh-${prefix}-style" data-setting="${prefix}Style">${[['label', '经典标签'], ['ring', '圆环进度']].map(([value, text]) => `<option value="${value}" ${d[`${prefix}Style`] === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div><div class="bvh-tag-size-fields">${number(`${prefix}FontSize`, '字号')}${number(`${prefix}Radius`, '圆角')}${number(`${prefix}Padding`, '左右留白')}${number(`${prefix}RingSize`, '圆环直径')}</div><div class="bvh-setting-row"><label for="bvh-${prefix}-mode">显示内容</label><select id="bvh-${prefix}-mode" data-setting="${prefix}LabelMode">${[['full', '完整 · 已观看80%'], ['compact', '精简 · 80% / 访']].map(([value, text]) => `<option value="${value}" ${d[`${prefix}LabelMode`] === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div></fieldset>`;
             return `<section class="bvh-section"><div class="bvh-section-heading"><span>04</span><h2>颜色与尺寸</h2></div><p class="bvh-help">封面与合集分别调整大小，四种状态共用配色。</p><div class="bvh-tag-colors"><div class="bvh-color-heading"><span>记录状态</span><span>背景</span><span>文字</span></div>${[['Visited', '已访问'], ['Low', '低进度'], ['Mid', '中进度'], ['High', '高进度']].map(([state, label]) => `<div class="bvh-color-row"><span>${label}</span>${[['Bg', '背景'], ['Text', '文字']].map(([suffix, name]) => `<input type="color" data-setting="tag${state}${suffix}" value="${esc(d[`tag${state}${suffix}`])}" aria-label="${label}${name}颜色">`).join('')}</div>`).join('')}</div>${scope('cover', '视频封面')}${scope('episode', '合集列表')}<p class="bvh-help">圆环底色和文字随系统深浅色模式切换，背景色用作进度环颜色；圆环直径可单独调整，小封面最多 36px，合集网格最多 27px。圆角、留白和显示内容仅影响经典标签。圆环替代封面底部进度条。无进度记录仍显示文字。小封面略微缩小，合集网格始终精简显示；多 P 汇总保留“已记录 多P”。</p><button class="bvh-style-reset" data-action="style-defaults">恢复标签样式默认值</button></section>`;
         }
+        renderFloatingSettings() {
+            const d = this.draft, esc = Utils.escapeHTML;
+            const field = (key, label, options) => `<div class="bvh-setting-row"><label for="bvh-${key}">${label}</label><div><select id="bvh-${key}" data-setting="${key}" aria-describedby="bvh-error-${key}">${options.map(([value, text]) => `<option value="${value}" ${d[key] === value ? 'selected' : ''}>${text}</option>`).join('')}</select><small class="bvh-field-error" id="bvh-error-${key}"></small></div></div>`;
+            return `<details class="bvh-settings-details bvh-floating-settings"><summary>悬浮入口外观</summary><p class="bvh-help">左下角的小入口，按你的习惯呈现。</p>
+                ${field('floatingTheme', '明暗主题', [['light', '浅色 · 暖白'], ['dark', '深色 · 石墨']])}
+                <div class="bvh-setting-row"><label for="bvh-floatingAccentColor">强调色<small>用于图标与进度线。</small></label><div class="bvh-floating-color"><input type="color" data-setting="floatingAccentColor" value="${esc(d.floatingAccentColor)}" aria-label="选择悬浮入口强调色"><input id="bvh-floatingAccentColor" data-setting="floatingAccentColor" value="${esc(d.floatingAccentColor)}" maxlength="7" spellcheck="false" aria-describedby="bvh-error-floatingAccentColor"><small class="bvh-field-error" id="bvh-error-floatingAccentColor"></small></div></div>
+                <div class="bvh-setting-row"><label for="bvh-floatingSize">入口大小<small>按比例调整文字与留白。</small></label><div><div class="bvh-opacity"><input type="range" data-setting="floatingSize" min="80" max="160" value="${esc(d.floatingSize)}" aria-label="悬浮入口大小滑块"><input id="bvh-floatingSize" type="number" data-setting="floatingSize" min="80" max="160" step="1" value="${esc(d.floatingSize)}" aria-describedby="bvh-error-floatingSize"><span>%</span></div><small class="bvh-field-error" id="bvh-error-floatingSize"></small></div></div>
+                <div class="bvh-setting-row"><label for="bvh-floatingOpacity">背景不透明度<small>文字始终保持清晰。</small></label><div><div class="bvh-opacity"><input type="range" data-setting="floatingOpacity" min="60" max="100" value="${esc(d.floatingOpacity)}" aria-label="悬浮背景不透明度滑块"><input id="bvh-floatingOpacity" type="number" data-setting="floatingOpacity" min="60" max="100" step="1" value="${esc(d.floatingOpacity)}" aria-describedby="bvh-error-floatingOpacity"><span>%</span></div><small class="bvh-field-error" id="bvh-error-floatingOpacity"></small></div></div>
+                ${field('floatingMode', '信息模式', [['compact', '简洁 · 胶囊'], ['detailed', '详细 · 小卡片']])}
+                <div class="bvh-floating-samples" aria-label="悬浮入口外观预览"><div><span class="bvh-help">视频页 · 示例</span><div class="bvh-floating-preview" data-floating-preview="video"></div></div><div><span class="bvh-help">其他页面</span><div class="bvh-floating-preview" data-floating-preview="quick"></div></div></div>
+                <p class="bvh-help">预览不会改变页面入口，保存后生效。实际入口可拖拽移动。</p><button data-action="floating-defaults">恢复悬浮外观默认</button></details>`;
+        }
         organizeSettings() {
             const groups = this.q('.bvh-setting-groups');
             const [common, marks, placement, appearance, diagnostics] = [...groups.children];
@@ -2497,7 +2532,22 @@
             };
             heading(common, '01', '常用设置');
             common.append(...[...marks.children].slice(1)); marks.remove();
+            const floating = document.createElement('section'); floating.className = 'bvh-section';
+            floating.innerHTML = this.renderFloatingSettings();
+            const disclosureContent = floating.firstElementChild;
+            disclosureContent.querySelector('summary').remove();
+            const controls = document.createElement('div'); controls.className = 'bvh-floating-settings';
+            controls.append(...disclosureContent.childNodes); floating.replaceChildren(controls);
+            controls.insertAdjacentHTML('afterbegin', '<div class="bvh-section-heading"><h2>悬浮入口</h2></div>');
+            controls.querySelector('.bvh-help').after(common.querySelector('[data-setting="floatingButtonVisibility"]').closest('.bvh-setting-row'));
+            common.after(floating);
             heading(appearance, '02', '标签外观');
+            appearance.querySelectorAll('.bvh-tag-dimensions').forEach((fieldset, index) => {
+                const title = fieldset.querySelector('legend').textContent;
+                fieldset.querySelector('legend').remove(); fieldset.setAttribute('aria-label', title);
+                const section = disclosure(title, []); section.classList.add('bvh-scope-settings'); section.open = index === 0;
+                fieldset.before(section); section.append(fieldset);
+            });
             const colors = appearance.querySelector('.bvh-tag-colors');
             const palette = disclosure('状态配色', [colors]);
             const position = disclosure('位置、透明度与进度分界', [...placement.children].slice(1));
@@ -2509,7 +2559,29 @@
             const diagnosticDetails = disclosure('诊断与维护', [...diagnostics.children].slice(1));
             diagnostics.replaceChildren(diagnosticDetails);
             diagnostics.classList.add('bvh-diagnostics');
+            diagnosticDetails.open = true;
+            for (const [group, section] of [['common', common], ['floating', floating], ['marks', appearance], ['maintenance', diagnostics]]) {
+                section.dataset.settingsGroup = group; section.id = `bvh-settings-${group}`;
+            }
+            const floatPreview = document.createElement('aside'); floatPreview.className = 'bvh-floating-preview-panel';
+            floatPreview.innerHTML = '<div class="bvh-eyebrow">效果预览</div><h2>左下角入口</h2><p class="bvh-help">修改外观，即时查看两种页面的效果。</p>';
+            floatPreview.append(controls.querySelector('.bvh-floating-samples'));
+            groups.parentElement.append(floatPreview);
+            this.q('.bvh-settings-nav')?.remove();
+            const nav = document.createElement('nav'); nav.className = 'bvh-settings-nav'; nav.setAttribute('aria-label', '设置分类');
+            nav.innerHTML = [['common', '常用设置'], ['floating', '悬浮入口'], ['marks', '观看标记'], ['maintenance', '维护']].map(([key, title]) => `<button type="button" data-settings-group="${key}" aria-controls="bvh-settings-${key}">${title}</button>`).join('');
+            this.q('.bvh-content').before(nav);
+            this.selectSettingsGroup(this.settingsGroup || 'common', false);
             this.syncStyleFields();
+        }
+        selectSettingsGroup(group, resetScroll = true) {
+            this.settingsGroup = group;
+            this.root.querySelectorAll('.bvh-setting-groups > [data-settings-group]').forEach(section => section.hidden = section.dataset.settingsGroup !== group);
+            this.root.querySelectorAll('.bvh-settings-nav button').forEach(button => button.setAttribute('aria-pressed', String(button.dataset.settingsGroup === group)));
+            this.q('.bvh-settings-layout').dataset.group = group;
+            this.q('.bvh-preview-panel').hidden = group !== 'marks';
+            this.q('.bvh-floating-preview-panel').hidden = group !== 'floating';
+            if (resetScroll) this.q('.bvh-content').scrollTop = 0;
         }
         syncStyleFields() {
             for (const scope of ['cover', 'episode']) {
@@ -2537,6 +2609,11 @@
         }
         renderPreview() {
             this.syncStyleFields();
+            for (const el of this.root.querySelectorAll('[data-floating-preview]')) {
+                const video = el.dataset.floatingPreview === 'video';
+                FloatingEntry.render(el, video ? { status: '已观看', currentTime: '07:04', percent: '55%', savedAt: '2026-09-25 14:32' } : null, '', this.draft);
+                el.removeAttribute('title');
+            }
             const d = this.draft, state = this.previewState, p = { low: 15, mid: 55, high: 95, multi: 55 }[state];
             const tag = this.q('[data-preview-tag]'), bar = this.q('[data-preview-bar]');
             const record = { status: state === 'visited' ? RECORD_STATUS.VISITED : RECORD_STATUS.WATCHED, percent: p ? `${p}%` : '' };
@@ -2603,7 +2680,7 @@
                 // input 已更新草稿时，失焦触发的 change 不再重建页脚，避免吞掉保存点击。
                 if (this.draft[key] === value) return;
                 this.draft[key] = value;
-                if (key === 'tagOpacity') this.root.querySelectorAll('[data-setting="tagOpacity"]').forEach(other => { if (other !== el) other.value = el.value; });
+                if (['tagOpacity', 'floatingOpacity', 'floatingSize', 'floatingAccentColor'].includes(key)) this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(other => { if (other !== el) other.value = el.value; });
                 this.renderPreview(); this.renderFooter();
             }
         }
@@ -2619,6 +2696,7 @@
             const button = event.target.closest('button');
             if (event.target === this.root || button?.hasAttribute('data-close')) { await this.requestClose(); return; }
             if (!button) return;
+            if (button.dataset.settingsGroup) { this.selectSettingsGroup(button.dataset.settingsGroup); return; }
             if (button.dataset.tab) { this.tab = button.dataset.tab; this.generation++; this.renderTab(); return; }
             if (button.dataset.preview) { this.previewState = button.dataset.preview; this.renderPreview(); return; }
             if (button.dataset.range) { this.state.range = Number(button.dataset.range); this.refresh(); return; }
@@ -2631,6 +2709,12 @@
                     for (const key of [...Object.keys(TAG_STYLE_DEFAULTS), 'tagPosition', 'tagOpacity']) this.draft[key] = DEFAULT_CONFIG[key];
                     this.renderSettings(); this.renderFooter();
                 }
+                if (action === 'floating-defaults') {
+                    Object.assign(this.draft, FLOATING_STYLE_DEFAULTS);
+                    for (const [key, value] of Object.entries(FLOATING_STYLE_DEFAULTS)) this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(input => { input.value = value; input.removeAttribute('aria-invalid'); });
+                    this.q('.bvh-floating-settings').querySelectorAll('.bvh-field-error').forEach(el => el.textContent = '');
+                    this.renderPreview(); this.renderFooter();
+                }
                 if (action === 'retry') this.refresh();
                 if ((action === 'prev' || action === 'next') && this.filtered) { this.state.page += action === 'prev' ? -1 : 1; this.renderHistory(); }
                 if (action === 'clear-selection') { this.selected.clear(); this.renderHistory(); }
@@ -2641,7 +2725,7 @@
                 if (action === 'import') this.import();
                 if (action === 'download-log') Utils.downloadDebugLog();
                 if (action === 'clear-log') { Utils.clearDebugLogs(); UIComponent.toast('日志已清空', 'success'); }
-                if (action === 'reset-position') { GM_deleteValue('bvh_panel_position'); const panel = document.getElementById('bvh-view-panel'); if (panel) Object.assign(panel.style, { left: '15px', bottom: '15px', top: 'auto' }); UIComponent.toast('悬浮位置已恢复', 'success'); }
+                if (action === 'reset-position') { FloatingEntry.resetPosition(); UIComponent.toast('悬浮位置已恢复', 'success'); }
                 if (action === 'jump') {
                     if (EpisodeResolver.getCurrentKey() === this.options.currentKey) UIComponent.jumpToProgress(StorageManager.getRecord(this.options.currentKey));
                     else UIComponent.toast('视频已切换，请重新打开当前视频的管理面板', 'info');
@@ -2662,16 +2746,23 @@
                 else next[key] = number;
             }
             if (!errors.lowThreshold && !errors.highThreshold && next.lowThreshold >= next.highThreshold) errors.highThreshold = '高分界必须大于低分界';
+            for (const key of Object.keys(FLOATING_STYLE_DEFAULTS)) {
+                if (!isFloatingStyleValid(key, next[key])) errors[key] = key === 'floatingSize' ? '请输入 80–160 的整数' : key === 'floatingOpacity' ? '请输入 60–100 的整数' : key === 'floatingAccentColor' ? '请输入 #RRGGBB 格式的颜色' : '请选择有效的悬浮外观';
+                else if (['floatingOpacity', 'floatingSize'].includes(key)) next[key] = Number(next[key]);
+            }
             for (const key of Object.keys(TAG_STYLE_DEFAULTS).filter(key => !TAG_STYLE_RANGES[key])) {
                 if (key.endsWith('Style') ? !['label', 'ring'].includes(next[key]) : key.endsWith('Mode') ? !['full', 'compact'].includes(next[key]) : !/^#[0-9a-f]{6}$/i.test(next[key])) errors[key] = '请选择有效的标签样式';
             }
-            for (const key of ['lowThreshold', 'highThreshold', 'tagOpacity', ...Object.keys(TAG_STYLE_DEFAULTS)]) {
+            for (const key of ['lowThreshold', 'highThreshold', 'tagOpacity', ...Object.keys(TAG_STYLE_DEFAULTS), ...Object.keys(FLOATING_STYLE_DEFAULTS)]) {
                 this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(input => input.setAttribute('aria-invalid', !!errors[key]));
                 const error = this.q(`#bvh-error-${key}`); if (error) error.textContent = errors[key] || '';
             }
             if (Object.keys(errors).length) {
                 this.tab = 'settings'; this.renderTab(); this.renderFooter(Object.values(errors)[0]);
-                const input = this.q(`[data-setting="${Object.keys(errors)[0]}"]`);
+                const errorSelector = `[data-setting="${Object.keys(errors)[0]}"]`;
+                const input = this.q(`${errorSelector}:not([type=range]):not([type=color])`) || this.q(errorSelector);
+                const category = input.closest('[data-settings-group]');
+                if (category) this.selectSettingsGroup(category.dataset.settingsGroup);
                 for (let parent = input.parentElement; parent && parent !== this.root; parent = parent.parentElement) {
                     if (parent.tagName === 'DETAILS') parent.open = true;
                     if (parent.hidden) parent.hidden = false;
@@ -2742,6 +2833,13 @@
     function injectWorkbenchStyles() {
         if (workbenchStylesInjected) return; workbenchStylesInjected = true;
         GM_addStyle(`
+        .bvh-floating-settings .bvh-field-error:empty { display:none; }
+        .bvh-floating-color { display:grid;grid-template-columns:36px 100px;gap:6px;align-items:center; }
+        .bvh-workbench .bvh-floating-color input[type=color] { width:36px;min-height:36px;padding:3px; }
+        .bvh-workbench .bvh-floating-color input:not([type=color]) { width:100px;padding:7px;font-size:12px; }
+        .bvh-floating-color .bvh-field-error { grid-column:1/-1;max-width:142px; }
+        .bvh-floating-samples { display:grid;gap:20px;margin:20px 0 14px;padding:18px 14px;border:1px solid #dfe4e8;border-radius:12px;background:repeating-linear-gradient(135deg,#e8eceb 0 12px,#eef1ef 12px 24px); }
+        .bvh-floating-samples>div { min-width:0;display:grid;justify-items:start;gap:9px; }
         .bvh-workbench{--bvh-ink:#20262E;--bvh-muted:#626D78;--bvh-line:#DFE4E8;--bvh-blue:#007EAD;--bvh-paper:#F5F4F0;color:var(--bvh-ink);font:14px/1.6 "HarmonyOS Sans SC","Source Han Sans SC","Microsoft YaHei",sans-serif;font-variant-numeric:tabular-nums;text-align:left;color-scheme:light}
         .bvh-workbench *{box-sizing:border-box}.bvh-workbench [hidden]{display:none!important}.bvh-workbench h1,.bvh-workbench h2,.bvh-workbench h3,.bvh-workbench p{margin:0}.bvh-workbench h1{font-size:24px;line-height:1.4;font-weight:650}.bvh-workbench h2{font-size:15px;font-weight:650}.bvh-workbench h3{font-size:14px;font-weight:600}.bvh-workbench small{font-size:12px}.bvh-workbench button,.bvh-workbench input,.bvh-workbench select{font:inherit;color:inherit}.bvh-workbench button,.bvh-workbench select,.bvh-workbench input:not([type=checkbox]):not([type=radio]):not([type=range]){border:1px solid var(--bvh-line);border-radius:8px;background:white;min-height:40px;padding:8px 12px;line-height:1.4}.bvh-workbench button{cursor:pointer;transition:background .15s,border-color .15s;white-space:nowrap}.bvh-workbench button:hover{background:#EBF3F6;border-color:#B5CFDA}.bvh-workbench button:disabled{opacity:.45;cursor:default}.bvh-workbench button.primary{background:var(--bvh-blue);border-color:var(--bvh-blue);color:white}.bvh-workbench button.primary:hover{background:#00698F}.bvh-workbench button.danger{color:#BF414B;border-color:#E8BEC2;background:#FFF8F8}.bvh-workbench :focus-visible{outline:3px solid #007EAD;outline-offset:3px}.bvh-workbench input[type=checkbox],.bvh-workbench input[type=radio],.bvh-workbench input[type=range]{accent-color:var(--bvh-blue)}.bvh-workbench input[type=checkbox]{width:17px;height:17px;cursor:pointer}.bvh-workbench input[type=number]{width:80px}.bvh-workbench a{color:inherit;text-decoration:none}.bvh-workbench a:hover{color:var(--bvh-blue)}
         .bvh-manager-mask,.bvh-dialog-mask{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(21,30,39,.48);z-index:2147483000;isolation:isolate}.bvh-shell{display:grid;grid-template-columns:184px minmax(0,1fr);width:min(1120px,100%);height:min(840px,calc(100dvh - 48px));background:var(--bvh-paper);border-radius:18px;overflow:hidden;box-shadow:0 24px 100px #0D192D55}.bvh-nav{padding:32px 16px 24px;background:#20262E;color:#F7F8FA;display:flex;flex-direction:column}.bvh-brand{display:flex;align-items:center;gap:10px;padding:0 8px;font-size:17px;font-weight:600}.bvh-brand>svg{width:28px;height:28px;color:#56CCF3}.bvh-brand small{display:block;font-size:8px;letter-spacing:1.3px;color:#AAB4BD;margin-top:3px}.bvh-nav-label{font-size:10px;letter-spacing:2px;color:#9BA7B1;margin:44px 12px 12px}.bvh-nav nav{display:grid;gap:8px}.bvh-nav button{display:flex;align-items:center;gap:12px;text-align:left;background:transparent;border-color:transparent;color:#C0C9D0;border-radius:8px;padding:12px;min-height:46px}.bvh-nav button:hover{color:white;background:#2B3540;border-color:transparent}.bvh-nav button[aria-current=page]{color:#F7F8FA;background:#344551;box-shadow:inset 3px 0 #00AEEC}.bvh-nav button[aria-current=page] svg{color:#72D4F6}.bvh-nav-note{margin-top:auto;padding:20px 8px 0;font-size:11px;color:#C0C9D0}.bvh-nav-note small{display:block;font-size:10px;color:#9AA7B2;margin-top:6px}.bvh-dot{display:inline-block;width:6px;height:6px;background:#58C19D;border-radius:50%;margin-right:7px;vertical-align:middle}.bvh-main{display:flex;min-width:0;min-height:0;flex-direction:column}.bvh-page-header{display:flex;justify-content:space-between;gap:20px;padding:28px 32px 24px;border-bottom:1px solid var(--bvh-line);flex-shrink:0}.bvh-eyebrow{font-size:9px;font-weight:600;letter-spacing:2px;color:var(--bvh-muted);margin-bottom:8px}.bvh-page-header p{font-size:12px;color:var(--bvh-muted);margin-top:8px}.bvh-workbench .bvh-close{border-color:transparent;background:transparent;width:36px;min-height:36px;height:36px;display:grid;place-items:center;padding:8px}.bvh-content{overflow-y:auto;min-height:0;padding:24px 32px;flex:1;scrollbar-width:thin;overscroll-behavior:contain}.bvh-footer{padding:16px 32px;min-height:73px;border-top:1px solid var(--bvh-line);background:#FFFEFC;display:flex;align-items:center;gap:12px;flex-shrink:0;font-size:12px}.bvh-footer>span:first-child{margin-right:auto}.bvh-save-status{margin-left:auto;color:var(--bvh-muted)}.bvh-settings-layout{display:grid;grid-template-columns:minmax(0,1fr) 246px;gap:24px;align-items:start}.bvh-setting-groups{min-width:0;display:grid;gap:20px}.bvh-section{padding:20px;background:white;border:1px solid var(--bvh-line);border-radius:12px}.bvh-section-heading{display:flex;gap:10px;align-items:center;margin-bottom:8px}.bvh-section-heading>span{font-size:10px;color:#8C9BA5;letter-spacing:1px}.bvh-setting-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 0;border-bottom:1px solid #EEF0F2}.bvh-setting-row:last-child{border-bottom:0;padding-bottom:0}.bvh-setting-row label{font-size:13px;flex:1;min-width:0}.bvh-setting-row label small{display:block;color:var(--bvh-muted);font-size:11px;margin-top:4px}.bvh-setting-row select{max-width:160px;font-size:12px}.bvh-workbench input.bvh-switch{appearance:none;width:36px;height:21px;border:0;border-radius:14px;background:#C7CFD5;position:relative;flex-shrink:0;margin:0;transition:background .15s}.bvh-switch:before{content:"";position:absolute;width:15px;height:15px;top:3px;left:3px;border-radius:50%;background:#fff;box-shadow:0 1px 3px #0002;transition:transform .15s}.bvh-workbench input.bvh-switch:checked{background:var(--bvh-blue)}.bvh-switch:checked:before{transform:translateX(15px)}.bvh-position{border:0;padding:12px 0;margin:0}.bvh-position legend{font-size:12px;padding:0;margin:0 0 8px}.bvh-position>div{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.bvh-position label{cursor:pointer;position:relative}.bvh-position input{position:absolute;opacity:0;width:100%;height:100%;margin:0}.bvh-position span{display:block;text-align:center;border:1px solid var(--bvh-line);border-radius:7px;padding:9px 2px;font-size:12px}.bvh-position input:checked+span{border-color:var(--bvh-blue);color:var(--bvh-blue);background:#EFF8FB}.bvh-position input:focus-visible+span{outline:3px solid var(--bvh-blue);outline-offset:2px}.bvh-opacity{display:flex;align-items:center;gap:7px}.bvh-opacity input[type=range]{width:74px}.bvh-opacity input[type=number]{width:64px!important;padding:8px!important}.bvh-thresholds{display:grid;grid-template-columns:1fr 1fr;gap:16px;padding-top:16px}.bvh-number-field{font-size:12px}.bvh-number-field>div{display:flex;align-items:center;gap:8px;margin-top:8px}.bvh-field-error{display:block;color:#BF414B;min-height:16px;padding-top:3px}.bvh-workbench [aria-invalid=true]{border-color:#BF414B!important}.bvh-help{font-size:11px;color:var(--bvh-muted);line-height:1.7}.bvh-maintenance-links{display:flex;flex-wrap:wrap;gap:8px;margin-top:16px}.bvh-maintenance-links button{font-size:11px;padding:7px 10px;min-height:34px}.bvh-storage-tools{font-size:11px;margin-top:16px}.bvh-storage-tools button{font-size:11px;margin:8px 4px 0 0}.bvh-workbench summary{cursor:pointer;padding:8px 0}.bvh-preview-panel{position:sticky;top:0;min-width:0;padding-top:4px}.bvh-preview-panel>p{font-size:11px;color:var(--bvh-muted);margin-top:8px}.bvh-preview-cover{position:relative;aspect-ratio:16/10;border-radius:10px;overflow:hidden;background:#DDE6E9;margin:20px 0 12px}.bvh-preview-art{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column;background:linear-gradient(135deg,#D9E5E8,#EAEDEA);color:#576C76}.bvh-preview-art:before,.bvh-preview-art:after{content:"";position:absolute;border:1px solid #FFF8;border-radius:50%;width:190px;height:190px;right:-65px;top:-100px}.bvh-preview-art:after{width:140px;height:140px;right:-40px;top:-74px}.bvh-preview-art svg{width:36px;height:36px;margin-bottom:12px;color:#64818D}.bvh-preview-art span{font-size:11px}.bvh-preview-art small{font-size:7px;letter-spacing:2px;margin-top:7px}.bvh-preview-tag{position:absolute;border-radius:4px;font-size:10px;color:white;padding:4px 7px}.bvh-preview-bar{position:absolute;left:0;bottom:0;height:4px}.bvh-preview-duration{position:absolute;bottom:10px;right:10px;font-size:9px;color:#54636B}.bvh-preview-caption{font-size:10px!important}.bvh-preview-states{display:flex;flex-wrap:wrap;gap:6px;margin-top:18px}.bvh-preview-states button{font-size:10px;padding:6px 9px;min-height:30px;background:transparent}.bvh-workbench button[aria-pressed=true]{border-color:var(--bvh-blue);color:var(--bvh-blue);background:#EAF5F9}.bvh-preview-note{border-top:1px solid var(--bvh-line);font-size:11px;color:var(--bvh-muted);margin-top:24px;padding-top:16px;line-height:2}.bvh-preview-note small{font-size:10px;margin-left:13px}
@@ -2756,7 +2854,16 @@
         @media(max-width:600px){.bvh-manager-mask{padding:8px}.bvh-shell{height:calc(100dvh - 16px)}.bvh-nav{padding:8px 12px;gap:8px}.bvh-brand>span{display:none}.bvh-nav nav{justify-content:space-between}.bvh-nav button{font-size:11px;padding:8px 9px}.bvh-nav button svg{display:none}.bvh-page-header{padding:18px 16px}.bvh-page-header h1{font-size:22px}.bvh-page-header p{font-size:11px}.bvh-eyebrow{font-size:8px}.bvh-content{padding:16px}.bvh-settings-layout{display:flex;flex-direction:column}.bvh-setting-groups{width:100%}.bvh-preview-panel{position:static;order:-1;width:100%;padding:16px;background:#EAEFEC;border-radius:10px}.bvh-preview-cover{margin-top:12px;aspect-ratio:16/8}.bvh-preview-note{margin-top:14px;padding-top:10px}.bvh-preview-panel>h3,.bvh-preview-caption{display:none}.bvh-preview-states{margin-top:12px;gap:5px}.bvh-preview-states button{min-height:44px;font-size:10px;padding:6px 8px}.bvh-setting-row{flex-wrap:nowrap}.bvh-setting-row select{max-width:132px}.bvh-opacity input[type=range]{width:48px}.bvh-footer{padding:12px 16px;gap:8px;flex-wrap:wrap;font-size:10px}.bvh-footer button{font-size:11px;padding:8px 10px}.bvh-save-status{font-size:10px}.bvh-footer:has([data-page-info])>span{width:100%}.bvh-history-tools{gap:8px}.bvh-history-tools label{font-size:10px}.bvh-history-tools select{font-size:11px;padding:7px}.bvh-tool-spacer{display:none}.bvh-selection-bar{flex-wrap:wrap}.bvh-selection-bar>span{width:100%}.bvh-selection-bar button{min-height:44px}.bvh-stat-summary{grid-template-columns:1fr 1fr;gap:10px}.bvh-stat-summary strong{font-size:28px}.bvh-stats-grid{grid-template-columns:1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:auto}.bvh-chart-card .bvh-help{text-align:center}.bvh-distribution{margin-top:18px}.bvh-trend-heading{flex-wrap:wrap}.bvh-confirm{padding:22px}.bvh-dialog-mask{padding:16px}.bvh-dialog-actions{justify-content:stretch}.bvh-dialog-actions button{flex:1}}
         .bvh-nav button[data-dirty=true]:after{content:"";width:6px;height:6px;border-radius:50%;background:#F0BD62;margin-left:auto;flex-shrink:0}
         .bvh-table-scroll{max-height:calc(100dvh - 390px);min-height:180px}
-        @media(max-width:600px){.bvh-settings-layout>.bvh-setting-groups{display:contents}.bvh-setting-groups>.bvh-section{width:100%}.bvh-setting-groups>.bvh-section:nth-child(1){order:0}.bvh-setting-groups>.bvh-section:nth-child(2){order:1}.bvh-settings-layout>.bvh-preview-panel{order:2}.bvh-setting-groups>.bvh-diagnostics{order:3}.bvh-table-scroll{max-height:calc(100dvh - 460px)}}
+        .bvh-settings-nav{display:flex;gap:6px;padding:12px 32px;background:var(--bvh-paper);border-bottom:1px solid var(--bvh-line);flex-shrink:0}
+        .bvh-settings-nav button{font-size:12px;min-height:36px;padding:8px 14px;background:transparent;border-color:transparent;transition:none}
+        .bvh-settings-nav button[aria-pressed=true]{background:#e5f3f7;color:#007ead;border-color:#c7dce3;box-shadow:inset 0 -2px #007ead;font-weight:600}
+        .bvh-scope-settings .bvh-tag-dimensions{border-top:0;margin-top:0;padding-top:0}
+        .bvh-settings-layout[data-group=common],.bvh-settings-layout[data-group=maintenance]{grid-template-columns:minmax(0,1fr)}
+        .bvh-setting-groups>.bvh-section>.bvh-section-heading>span{display:none}
+        .bvh-floating-preview-panel{position:sticky;top:0;min-width:0;padding:4px 0}
+        .bvh-floating-preview-panel h2{margin-bottom:8px}.bvh-floating-preview-panel .bvh-floating-samples{margin-top:16px}
+        .bvh-floating-settings .bvh-setting-row{padding:12px 0}.bvh-floating-settings>button{margin-top:12px}
+        @media(max-width:600px){.bvh-settings-nav{padding:8px 16px;gap:4px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr))}.bvh-settings-nav button{padding:8px 3px;font-size:11px;min-height:40px}.bvh-settings-layout>.bvh-setting-groups{display:grid;width:100%}.bvh-settings-layout>.bvh-preview-panel,.bvh-floating-preview-panel{position:static;order:1;width:100%}.bvh-floating-preview-panel .bvh-floating-samples{display:flex;flex-wrap:wrap;gap:16px}.bvh-table-scroll{max-height:calc(100dvh - 460px)}}
         @media(prefers-reduced-motion:reduce){.bvh-workbench *{animation:none!important;transition:none!important}.bvh-loader{border-color:#007EAD}}
         `);
     }
@@ -4428,13 +4535,7 @@
             });
 
             GM_registerMenuCommand('恢复面板默认位置', () => {
-                GM_deleteValue('bvh_panel_position');
-                const panel = document.getElementById('bvh-view-panel');
-                if (panel) {
-                    panel.style.left = '15px';
-                    panel.style.bottom = '15px';
-                    panel.style.top = 'auto';
-                }
+                FloatingEntry.resetPosition();
                 UIComponent.toast('面板位置已恢复默认', 'success', 2000);
             });
 

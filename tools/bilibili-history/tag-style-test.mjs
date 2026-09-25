@@ -42,9 +42,11 @@ try {
         window.panel = testAPI.HistoryManagerPanel.show({});
     });
     const setting = key => page.locator(`[data-setting="${key}"]`);
-    assert.equal(await page.locator('.bvh-setting-groups > .bvh-section').count(), 3);
+    assert.equal(await page.locator('.bvh-setting-groups > .bvh-section').count(), 4);
     assert.equal(await setting('debug').isVisible(), false);
     assert.equal(await setting('coverRingSize').isVisible(), false);
+    await page.locator('.bvh-settings-nav [data-settings-group=marks]').click();
+    await page.locator('.bvh-scope-settings > summary').filter({ hasText: '合集列表' }).click();
     await page.getByText('状态配色', { exact: true }).click();
     await setting('tagMidBg').fill('#123456');
     await setting('tagMidText').fill('#fedcba');
@@ -138,7 +140,9 @@ try {
     assert.equal(await setting('coverFontSize').getAttribute('aria-invalid'), 'true');
     assert.equal(await page.evaluate(() => savedSettings.coverFontSize), 20);
     await setting('coverFontSize').fill('20');
+    await page.locator('.bvh-settings-nav [data-settings-group=common]').click();
     await setting('showProgressBar').uncheck();
+    await page.locator('.bvh-settings-nav [data-settings-group=marks]').click();
     await page.locator('[data-action="style-defaults"]').click();
     assert.equal(await setting('coverFontSize').inputValue(), '12');
     assert.equal(await setting('episodeFontSize').inputValue(), '10');
@@ -162,7 +166,7 @@ try {
     await page.locator('[data-action="save"]').click();
     await page.waitForFunction(() => !panel.saving);
     await advanced.click();
-    console.log('通过：三组设置、按样式隐藏无关选项、保留草稿，折叠项出错自动展开并聚焦');
+    console.log('通过：四类设置、按样式隐藏无关选项、保留草稿，折叠项出错自动展开并聚焦');
 
     for (const [name, text] of [['visited', '已访问'], ['low', '已观看15%'], ['high', '已观看95%'], ['multi', '已记录 多P']]) {
         await page.locator(`[data-preview="${name}"]`).click();
@@ -172,6 +176,7 @@ try {
     await page.evaluate(() => { panel.q('.bvh-content').scrollTop = 650; });
     await page.screenshot({ path: path.join(os.tmpdir(), 'bvh-tag-style-desktop.png') });
     await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator('.bvh-settings-nav [data-settings-group=marks]').click();
     await page.getByText('状态配色', { exact: true }).click();
     await page.locator('.bvh-tag-colors').scrollIntoViewIfNeeded();
     await page.screenshot({ path: path.join(os.tmpdir(), 'bvh-tag-style-mobile.png') });

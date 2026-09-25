@@ -11,6 +11,7 @@ export function instrument(text = source) {
     return text.slice(0, text.indexOf(marker)) + `
     globalThis.testAPI = { StorageManager, VideoKey, VideoPlayerObserver, DOMWatcher, UIComponent,
         EpisodeResolver, HistoryPageSync, SettingsManager, CONFIG, DEFAULT_CONFIG, Utils, injectStyles, AppController,
+        ...(typeof FloatingEntry === 'undefined' ? {} : { FloatingEntry }),
         ...(typeof HistoryCommitStore === 'undefined' ? {} : { HistoryCommitStore, HistoryStoreIO }),
         ...(typeof HistoryQueries === 'undefined' ? {} : { HistoryQueries, HistoryManagerPanel, WorkbenchLayers }) };
 })();`;
