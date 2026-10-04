@@ -252,6 +252,7 @@
 - 控制台入口：`https://limestart.cn/*`、`https://www.limestart.cn/*`。
 - 自动签到站点：脚本头部 `@match` 中列出的论坛与资源站页面。
 - 司机社：`https://sjs96.com/*`。
+- 搜书吧：`https://sp6m.fwsefwef66s.com/*`，控制台后台打开首页，确认登录态后记录当日完成。
 - GalgameX 新站：`https://www.galgamex.net/*`。
 - 2dfan `https://2dfan.com/*` / `https://2dfan.org/*` 采用前台签到流程，控制台默认打开新版 `/checkin` 页面；脚本自动打开人机验证弹窗，人工完成 Cloudflare Turnstile 或阿里云验证、确认按钮启用后自动点击“确认”，并根据签到按钮的“今日已签到”状态确认成功。保留旧版 `recheckin` 页面的 Cloudflare Turnstile / 阿里云验证码自动提交逻辑。
 - 老王论坛 `https://laowang.vip/*` 采用前台签到流程，人工完成站点点击验证后会自动点击签到并确认状态。
