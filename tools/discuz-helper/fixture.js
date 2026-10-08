@@ -39,18 +39,78 @@ document.querySelector('#fixture-tests').onclick = async () => {
 
         const lightboxImage = document.querySelector('.dh-lightbox-stage > img');
         const rect = lightboxImage.getBoundingClientRect();
-        lightboxImage.dispatchEvent(new PointerEvent('pointermove', { clientX: rect.left + 10 }));
-        const leftCursor = getComputedStyle(lightboxImage).cursor;
-        lightboxImage.dispatchEvent(new PointerEvent('pointermove', { clientX: rect.right - 10 }));
-        const rightCursor = getComputedStyle(lightboxImage).cursor;
+        const overlay = document.querySelector('.dh-lightbox');
+        const clickImage = () =>
+            lightboxImage.dispatchEvent(new MouseEvent('click', {
+                bubbles: true,
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top + rect.height / 2,
+            }));
+        const wheel = (deltaY, target = overlay) =>
+            target.dispatchEvent(new WheelEvent('wheel', {
+                bubbles: true,
+                cancelable: true,
+                deltaY,
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top + rect.height / 2,
+            }));
+        clickImage();
         check(
-            '灯箱左右半区显示不同方向光标',
-            leftCursor.includes('w-resize') && rightCursor.includes('e-resize') && leftCursor !== rightCursor,
+            '点击图片放大且不翻页或关闭',
+            lightboxImage.getBoundingClientRect().width > rect.width &&
+                lightboxImage.alt === '第 1 张图片' &&
+                overlay.isConnected,
         );
-        lightboxImage.dispatchEvent(new MouseEvent('click', { clientX: rect.right - 10 }));
+        const zoomWidth = lightboxImage.getBoundingClientRect().width;
+        wheel(120);
+        check(
+            '放大后滚轮缩小且不翻页',
+            lightboxImage.getBoundingClientRect().width < zoomWidth && lightboxImage.alt === '第 1 张图片',
+        );
+        for (let i = 0; i < 30; i++) wheel(-120);
+        check(
+            '缩放上限为适应尺寸的八倍',
+            Math.abs(lightboxImage.getBoundingClientRect().width / rect.width - 8) < 0.01,
+        );
+        clickImage();
+        check('再次点击还原适应窗口', Math.abs(lightboxImage.getBoundingClientRect().width - rect.width) < 1);
+        // 缩放手势尚未结束，残余滚轮不能立即变成翻页。
+        wheel(120);
+        check('缩放手势残余滚动不会翻页', lightboxImage.alt === '第 1 张图片' && !lightboxImage.hidden);
+        await sleep(220);
+        wheel(120);
         await until(() => lightboxImage.alt === '第 2 张图片' && !lightboxImage.hidden);
-        check('灯箱右半区点击切到下一张', lightboxImage.alt === '第 2 张图片');
-        document.querySelector('.dh-lightbox-top button').click();
+        check('任意位置向下滚轮切到下一张', lightboxImage.alt === '第 2 张图片');
+        wheel(60);
+        wheel(30);
+        await sleep(70);
+        check('同一串惯性不会连续翻页', lightboxImage.alt === '第 2 张图片' && !lightboxImage.hidden);
+        await sleep(220);
+        wheel(-120, document.querySelector('.dh-lightbox-top button'));
+        await until(() => lightboxImage.alt === '第 1 张图片' && !lightboxImage.hidden);
+        check('按钮上方滚轮也能返回上一张', lightboxImage.alt === '第 1 张图片');
+        clickImage();
+        overlay.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+        await until(() => lightboxImage.alt === '第 2 张图片' && !lightboxImage.hidden);
+        check('方向键翻页重置缩放', getComputedStyle(lightboxImage).cursor === 'zoom-in');
+        const contextMenu = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 });
+        lightboxImage.dispatchEvent(contextMenu);
+        check('图片右键菜单没有被取消且灯箱保持打开', !contextMenu.defaultPrevented && overlay.isConnected);
+        const middleDown = new MouseEvent('mousedown', { bubbles: true, cancelable: true, button: 1 });
+        overlay.dispatchEvent(middleDown);
+        check('中键按下阻止浏览器自动滚动', middleDown.defaultPrevented && overlay.isConnected);
+        lightboxImage.dispatchEvent(new MouseEvent('auxclick', { bubbles: true, cancelable: true, button: 1 }));
+        check(
+            '中键在图片上关闭灯箱并恢复焦点',
+            !overlay.isConnected && document.activeElement.classList.contains('dh-card'),
+        );
+        [...first.images.values()].find((i) => i.status === 'ready').card.click();
+        await until(() => document.querySelector('.dh-lightbox-stage > img:not([hidden])'));
+        const blankOverlay = document.querySelector('.dh-lightbox'),
+            navRect = blankOverlay.querySelector('.dh-lightbox-next').getBoundingClientRect();
+        check('翻页按钮点击区域至少为 56 × 96 像素', navRect.width >= 56 && navRect.height >= 96);
+        blankOverlay.querySelector('.dh-lightbox-stage').dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        check('点击图片外的舞台空白关闭灯箱', !blankOverlay.isConnected);
         first.intent = null;
         api.history.reset('1', 'viewedImages');
         first.maybeMark();

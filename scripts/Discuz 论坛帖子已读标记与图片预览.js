@@ -2,7 +2,7 @@
 // @name              Discuz 论坛帖子已读标记与图片预览
 // @name:en           Discuz Visited Thread Marker with Image Preview
 // @namespace         http://tampermonkey.net/
-// @version           5.0.0
+// @version           5.1.0
 // @description       自动记录并标记 Discuz! 论坛中已访问过的帖子，支持列表页静默并发图片预览、可选后续分页抓取、已读样式配置、帖子列表宽度控制和可拖动设置入口。
 // @description:en    Marks visited threads in Discuz! forum lists, with silent concurrent image previews, optional extra-page fetching, configurable visited styles, thread list width control, and a draggable settings entry.
 // @author            Ice_wilderness
@@ -1281,7 +1281,7 @@
     .dh-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:16px 0}.dh-stat{padding:12px;background:var(--dh-bg);border-radius:8px;color:var(--dh-muted);font-size:11px}.dh-stat strong{display:block;font-size:23px;line-height:1.5;color:var(--dh-ink);font-weight:500}.dh-data-actions{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}.dh-danger-zone{border-top:1px solid var(--dh-border);padding-top:20px;margin-top:24px}.dh-site-id{overflow-wrap:anywhere;font-size:11px;color:var(--dh-muted)}
     .dh-toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:100010;max-width:calc(100% - 32px);padding:12px 18px;background:var(--dh-surface);border:1px solid var(--dh-border);border-radius:10px;box-shadow:0 8px 32px #0003;display:flex;align-items:center;gap:16px}
     .dh-floating{position:fixed;right:18px;bottom:86px;z-index:99990;width:46px;height:46px;border-radius:14px!important;box-shadow:0 6px 24px #0002!important;touch-action:none;user-select:none}.dh-floating svg{width:21px;height:21px}
-    .dh-lightbox{background:#111b19ed;backdrop-filter:blur(8px);color:#e7eeeb}.dh-lightbox-stage{width:100%;height:100%;display:flex;align-items:center;justify-content:center;position:relative}.dh-lightbox-stage>img{width:100%;height:calc(100% - 100px);object-fit:contain;cursor:pointer}.dh-lightbox-top{position:absolute;top:5px;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px}.dh-lightbox .dh-btn{background:#263b34;color:#e7eeeb;border-color:#506158}.dh-lightbox-prev,.dh-lightbox-next{position:absolute;top:50%;font-size:24px!important}.dh-lightbox-prev{left:0}.dh-lightbox-next{right:0}.dh-lightbox-state{position:absolute;bottom:8px;left:60px;right:60px;text-align:center;font-size:12px}.dh-hidden-toggle{margin:12px 0;display:block}
+    .dh-lightbox{background:#111b19ed;backdrop-filter:blur(8px);color:#e7eeeb;overscroll-behavior:contain}.dh-lightbox-stage{width:100%;height:100%;position:relative;overflow:hidden}.dh-lightbox-stage>img{position:absolute;left:50%;top:50%;max-width:none;max-height:none;margin:0;transform-origin:center;cursor:zoom-in;user-select:none;touch-action:none}.dh-lightbox-top{position:absolute;z-index:2;top:5px;left:0;right:0;display:flex;align-items:center;justify-content:space-between;gap:12px;pointer-events:none}.dh-lightbox-top>*{pointer-events:auto}.dh-lightbox .dh-btn{background:#263b34;color:#e7eeeb;border-color:#506158;min-width:44px;min-height:44px}.dh-lightbox-prev,.dh-lightbox-next{position:absolute;z-index:2;top:50%;transform:translateY(-50%);width:clamp(56px,6vw,88px);height:clamp(96px,18vh,160px);padding:0!important;font-size:40px!important}.dh-lightbox-prev{left:0}.dh-lightbox-next{right:0}.dh-lightbox-state{position:absolute;z-index:2;bottom:8px;left:60px;right:60px;text-align:center;font-size:12px;background:#111b19cc;border-radius:6px;padding:4px 8px}.dh-hidden-toggle{margin:12px 0;display:block}
     @media(max-width:600px){.dh-overlay{padding:10px}.dh-dialog{max-height:94vh;border-radius:12px}.dh-dialog-header{padding:18px}.dh-settings-layout{display:flex;flex-direction:column;min-height:0}.dh-nav{flex-direction:row;flex-wrap:wrap;padding:8px;border-right:0;border-bottom:1px solid var(--dh-border);gap:2px}.dh-root .dh-nav .dh-btn{padding:6px 8px;font-size:12px}.dh-settings-content{padding:18px}.dh-dialog-footer{padding:12px 18px}.dh-dialog-footer small{display:none}.dh-field{gap:8px}.dh-field select{width:145px}.dh-preview{padding:8px}.dh-grid{grid-template-columns:repeat(auto-fill,minmax(min(140px,100%),1fr))}.dh-root .dh-card{max-width:190px!important;height:120px!important}.dh-tools{margin-left:0}.dh-preview-row>td{padding:8px 6px!important}}
     @media(prefers-reduced-motion:no-preference){.dh-root .dh-btn{transition:background .15s,border-color .15s}.dh-dialog{animation:dh-enter .16s ease-out}@keyframes dh-enter{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}}
     `);
@@ -1340,9 +1340,8 @@
         refreshVisitedVisibility();
     }
     const dialogStack = [];
-    function modal(title, lightbox = false) {
-        const opener = document.activeElement,
-            overlay = own(el('div', `dh-root dh-overlay${lightbox ? ' dh-lightbox' : ''}`));
+    function modal(title, lightbox = false, opener = document.activeElement) {
+        const overlay = own(el('div', `dh-root dh-overlay${lightbox ? ' dh-lightbox' : ''}`));
         overlay.setAttribute('role', 'dialog');
         overlay.setAttribute('aria-modal', 'true');
         overlay.setAttribute('aria-label', title);
@@ -1400,7 +1399,7 @@
         };
         document.addEventListener('keydown', keys, true);
         overlay.addEventListener('click', (e) => {
-            if (e.target === overlay) close();
+            if (!lightbox && e.target === overlay) close();
         });
         applyTheme();
         overlay.focus();
@@ -1414,19 +1413,79 @@
     }
     function openLightbox(controller, src, opener) {
         const items = [...controller.images.values()].filter((i) => i.status === 'ready');
-        let index = items.findIndex((i) => i.src === src),
+        if (!items.length) return;
+        let index = Math.max(0, items.findIndex((i) => i.src === src)),
             token = 0,
-            abort;
-        const box = modal('图片查看器', true),
+            abort,
+            dimensions,
+            fitWidth = 0,
+            fitHeight = 0,
+            scale = 1,
+            offsetX = 0,
+            offsetY = 0,
+            drag = null,
+            suppressClick = false,
+            wheelLastTime = -Infinity,
+            wheelDistance = 0,
+            wheelUsed = false;
+        const box = modal('图片查看器', true, opener),
             stage = el('div', 'dh-lightbox-stage'),
             top = el('div', 'dh-lightbox-top'),
             counter = el('span'),
             status = el('div', 'dh-lightbox-state');
         const image = el('img');
         image.alt = '正在加载图片';
+        image.draggable = false;
         const owner = {};
+        const render = () => {
+            const maxX = Math.max(0, (fitWidth * scale - stage.clientWidth) / 2),
+                maxY = Math.max(0, (fitHeight * scale - Math.max(1, stage.clientHeight - 100)) / 2);
+            offsetX = Math.max(-maxX, Math.min(maxX, offsetX));
+            offsetY = Math.max(-maxY, Math.min(maxY, offsetY));
+            image.style.width = `${fitWidth}px`;
+            image.style.height = `${fitHeight}px`;
+            image.style.transform = `translate(-50%, -50%) translate(${offsetX}px, ${offsetY}px) scale(${scale})`;
+            image.style.cursor = scale === 1 ? 'zoom-in' : drag?.moved ? 'grabbing' : 'grab';
+            status.textContent =
+                scale === 1
+                    ? '滚轮 / ← → 翻页 · 点击图片放大 · 点击空白 / 中键 / Esc 关闭'
+                    : `${Math.round(scale * 100)}% · 滚轮缩放 · 拖动查看 · 点击图片还原 · 点击空白 / 中键 / Esc 关闭`;
+        };
+        const layout = () => {
+            if (!dimensions) return;
+            const ratio = Math.min(
+                1,
+                stage.clientWidth / dimensions.width,
+                Math.max(1, stage.clientHeight - 100) / dimensions.height,
+            );
+            fitWidth = dimensions.width * ratio;
+            fitHeight = dimensions.height * ratio;
+            render();
+        };
+        const zoom = (next, clientX, clientY) => {
+            const rect = stage.getBoundingClientRect(),
+                x = clientX - rect.left - rect.width / 2,
+                y = clientY - rect.top - rect.height / 2;
+            next = Math.max(1, Math.min(8, next));
+            offsetX = x - (x - offsetX) * (next / scale);
+            offsetY = y - (y - offsetY) * (next / scale);
+            scale = next;
+            render();
+        };
+        const endDrag = () => {
+            if (!drag) return;
+            const previous = drag;
+            drag = null;
+            if (previous.moved) suppressClick = true;
+            if (image.hasPointerCapture(previous.id)) image.releasePointerCapture(previous.id);
+            if (dimensions) render();
+        };
         const show = async () => {
             const current = ++token;
+            endDrag();
+            dimensions = null;
+            scale = 1;
+            offsetX = offsetY = 0;
             abort?.abort();
             imageQueue.cancel(owner);
             abort = new AbortController();
@@ -1439,28 +1498,41 @@
                 });
                 if (current !== token || !controller.live()) return;
                 image.src = result.src;
+                await image.decode();
+                if (current !== token || !controller.live()) return;
+                dimensions = { width: result.naturalWidth, height: result.naturalHeight };
                 image.alt = `第 ${index + 1} 张图片`;
                 image.hidden = false;
-                status.textContent = '← → 切换图片 · Esc 关闭';
+                layout();
                 controller.maybeMark(true);
             } catch (error) {
                 if (current !== token || error.kind === 'cancel') return;
-                status.replaceChildren(el('span', '', error.message + ' '), button('重试', show));
+                status.replaceChildren(el('span', '', (error.message || '图片解码失败') + ' '), button('重试', show));
             }
         };
         const move = (delta) => {
+            if (items.length < 2) return;
             index = (index + delta + items.length) % items.length;
             show();
         };
         top.append(counter, button('关闭', box.close));
-        stage.append(
-            image,
-            top,
-            button('‹', () => move(-1), 'dh-btn dh-lightbox-prev'),
-            button('›', () => move(1), 'dh-btn dh-lightbox-next'),
-            status,
-        );
+        const prev = button('‹', () => move(-1), 'dh-btn dh-lightbox-prev'),
+            next = button('›', () => move(1), 'dh-btn dh-lightbox-next');
+        prev.setAttribute('aria-label', '上一张图片');
+        next.setAttribute('aria-label', '下一张图片');
+        prev.hidden = next.hidden = items.length < 2;
+        stage.append(image, top, prev, next, status);
         box.overlay.append(stage);
+        box.overlay.addEventListener(
+            'pointerdown',
+            (e) => {
+                if (e.button === 0 && e.isPrimary) suppressClick = false;
+            },
+            true,
+        );
+        box.overlay.addEventListener('click', (e) => {
+            if (e.button === 0 && !suppressClick && (e.target === stage || e.target === box.overlay)) box.close();
+        });
         box.overlay.addEventListener('keydown', (e) => {
             if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
                 e.preventDefault();
@@ -1468,22 +1540,97 @@
                 move(e.key === 'ArrowLeft' ? -1 : 1);
             }
         });
-        const direction = (e) => (e.clientX < image.getBoundingClientRect().left + image.clientWidth / 2 ? -1 : 1);
-        const cursors = [-1, 1].map((d) => {
-            const path = d < 0 ? 'M22 9L14 17L22 25' : 'M12 9L20 17L12 25';
-            const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="34" height="34"><circle cx="17" cy="17" r="16" fill="#172b26" stroke="white"/><path d="${path}" fill="none" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
-            return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 17 17, ${d < 0 ? 'w-resize' : 'e-resize'}`;
+        box.overlay.addEventListener(
+            'wheel',
+            (e) => {
+                if (dialogStack.at(-1) !== box.overlay || e.ctrlKey || e.metaKey) return;
+                e.preventDefault();
+                e.stopPropagation();
+                if (!e.deltaY) return;
+                const now = performance.now(),
+                    delta = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? stage.clientHeight : 1);
+                // 同一串触控板惯性只翻一张；缩回适应窗口时也不把残余滚动当作翻页。
+                if (now - wheelLastTime > 180) {
+                    wheelDistance = 0;
+                    wheelUsed = false;
+                }
+                wheelLastTime = now;
+                if (!dimensions || drag) {
+                    wheelUsed = true;
+                    return;
+                }
+                if (scale > 1) {
+                    wheelUsed = true;
+                    zoom(scale * Math.exp(-Math.max(-120, Math.min(120, delta)) * 0.002), e.clientX, e.clientY);
+                } else if (!wheelUsed && items.length > 1) {
+                    if (wheelDistance * delta < 0) wheelDistance = 0;
+                    wheelDistance += delta;
+                    if (Math.abs(wheelDistance) >= 40) {
+                        wheelUsed = true;
+                        move(wheelDistance > 0 ? 1 : -1);
+                    }
+                }
+            },
+            { passive: false },
+        );
+        box.overlay.addEventListener(
+            'mousedown',
+            (e) => {
+                if (e.button !== 1) return;
+                e.preventDefault();
+                e.stopPropagation();
+            },
+            true,
+        );
+        box.overlay.addEventListener(
+            'auxclick',
+            (e) => {
+                if (e.button !== 1) return;
+                e.preventDefault();
+                e.stopPropagation();
+                box.close();
+            },
+            true,
+        );
+        image.addEventListener('dragstart', (e) => e.preventDefault());
+        image.addEventListener('pointerdown', (e) => {
+            if (e.button !== 0 || !e.isPrimary) return;
+            if (!dimensions || drag) return;
+            drag = { id: e.pointerId, x: e.clientX, y: e.clientY, offsetX, offsetY, moved: false };
+            image.setPointerCapture(e.pointerId);
         });
-        image.style.cursor = cursors[1];
         image.addEventListener('pointermove', (e) => {
-            image.style.cursor = cursors[direction(e) < 0 ? 0 : 1];
+            if (!drag || e.pointerId !== drag.id) return;
+            const dx = e.clientX - drag.x,
+                dy = e.clientY - drag.y;
+            if (Math.hypot(dx, dy) > 5) drag.moved = true;
+            if (!drag.moved || scale === 1) return;
+            offsetX = drag.offsetX + dx;
+            offsetY = drag.offsetY + dy;
+            render();
         });
-        image.addEventListener('click', (e) => move(direction(e)));
+        image.addEventListener('pointerup', (e) => {
+            if (e.pointerId === drag?.id) endDrag();
+        });
+        image.addEventListener('pointercancel', (e) => {
+            if (e.pointerId !== drag?.id) return;
+            suppressClick = true;
+            endDrag();
+        });
+        image.addEventListener('lostpointercapture', endDrag);
+        image.addEventListener('click', (e) => {
+            if (e.button !== 0) return;
+            e.stopPropagation();
+            if (suppressClick || !dimensions) return;
+            zoom(scale > 1 ? 1 : Math.max(2, dimensions.width / fitWidth), e.clientX, e.clientY);
+        });
+        window.addEventListener('resize', layout);
         box.onClose = () => {
             token++;
+            endDrag();
+            window.removeEventListener('resize', layout);
             abort?.abort();
             imageQueue.cancel(owner);
-            if (opener.isConnected) opener.focus();
         };
         show();
     }
