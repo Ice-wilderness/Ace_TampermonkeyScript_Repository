@@ -9,7 +9,7 @@
 ```powershell
 node --check 'scripts/自用论坛辅助签到自写.js'
 node tools/forum-signin/run.mjs
-openspec validate improve-forum-signin-reliability-and-experience --strict
+openspec validate --specs --strict
 git diff --check
 ```
 
@@ -99,4 +99,4 @@ South-Plus和夜世界现有适配只掌握会执行领取/签到的接口；缺
 
 维护站点时优先更新最小DOM/响应样例，同时补正反例和提交计数断言。不能用普通全文成功、其他用户排行或编辑器草稿放宽完成条件。在线验证需逐站核对登录、当日完成/未完成、人工验证与提交后刷新，并记录实际页面日期；勿将构造样例称为真实签到成功。
 
-本次按用户提交要求收尾，脚本版本统一更新为2.20.0，根README和CHANGELOG已同步整理。OpenSpec实施任务已完成，尚未同步或归档。
+本次按用户提交要求收尾，脚本版本统一更新为2.20.0，根README和CHANGELOG已同步整理。OpenSpec实施任务及主规范同步均已完成，变更已归档至 `openspec/changes/archive/2026-10-09-improve-forum-signin-reliability-and-experience/`。
