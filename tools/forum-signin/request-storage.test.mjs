@@ -1,0 +1,141 @@
+import assert from 'node:assert/strict';
+import { createFixture } from './fixture.mjs';
+
+let late, aborted = 0;
+const timeout = await createFixture({ request: details => { late = details; return { abort() { aborted++; } }; } });
+const request = timeout.run("gmRequest({url:'https://feixueacg.org/check'})");
+const rejected = assert.rejects(request, error => error.reasonCode === 'timeout');
+await timeout.tick(20001);
+await rejected;
+assert.equal(aborted, 1);
+late.onload({ status: 200, responseText: '迟到', responseHeaders: '' });
+assert.equal(timeout.timers.size, 0);
+const hangingBody = await createFixture();
+const bodyPromise = hangingBody.run("fetchBuffered(async()=>({status:200,headers:new Headers(),arrayBuffer:()=>new Promise(()=>{})}),'https://example.test/',{})");
+const bodyRejected = assert.rejects(bodyPromise, error => error.reasonCode === 'timeout');
+await hangingBody.tick(20001); await bodyRejected;
+assert.equal(hangingBody.timers.size, 0);
+const throwing = await createFixture({ request: () => { throw new Error('网络不可用'); } });
+await assert.rejects(throwing.run("gmRequest({url:'https://example.test/'})"), /网络不可用/);
+assert.equal(throwing.timers.size, 0);
+for (const [status, text, code] of [[401, '', 'login'], [403, 'captcha', 'captcha'], [403, '', 'permission'], [429, '', 'temporary'], [500, '', 'temporary'], [404, '', 'adaptation']]) {
+    assert.equal(timeout.run(`classifyHttpResponse(${status},${JSON.stringify(text)}).reasonCode`), code);
+}
+assert.equal(timeout.run("classifyHttpResponse(429,'','Retry-After: 99999').retryAfterMs"), 60000);
+
+const retry = await createFixture();
+retry.run(`globalThis.calls=[];
+    siteConfigs.find(s=>s.key==='fxacg').directRun=async ctx=>{ calls.push(Date.now()); if(calls.length<3)throw signRequestError('network','暂时离线'); return taskActions(ctx).completeSign('fxacg','接口明确今日完成'); };
+    globalThis.job=runDirectTarget(getBuiltInTargets().find(t=>t.id==='fxacg'));`);
+await retry.tick(1);
+assert.equal(retry.run('calls.length'), 1);
+await retry.tick(3000);
+assert.equal(retry.run('calls.length'), 2);
+await retry.tick(6000);
+assert.equal(await retry.run('job'), true);
+const times = retry.run('calls');
+assert.equal(times[1] - times[0], 3000);
+assert.equal(times[2] - times[1], 6000);
+assert.equal(retry.run("buildSignDebugExport('fxacg').logs.length"), 2);
+for (const code of ['login', 'captcha', 'adaptation']) {
+    const one = await createFixture();
+    one.run(`globalThis.calls=0; siteConfigs.find(s=>s.key==='fxacg').directRun=async()=>{calls++;throw signRequestError('${code}','需要人工处理')}; globalThis.job=runDirectTarget(getBuiltInTargets().find(t=>t.id==='fxacg'));`);
+    await one.tick(1); await one.run('job');
+    assert.equal(one.run('calls'), 1);
+    assert.equal(one.run("getRawTargetStatus('fxacg').reasonCode"), code);
+}
+const submitted = await createFixture();
+submitted.run(`globalThis.submitCount=0; globalThis.checkCount=0;
+    siteConfigs.find(s=>s.key==='fxacg').directRun=async ctx=>{submitCount++;ctx.submitted=true;throw signRequestError('timeout','提交回包丢失')};
+    checkSiteResult=async()=>{checkCount++;return {outcome:'unknown'}};
+    globalThis.job=runDirectTarget(getBuiltInTargets().find(t=>t.id==='fxacg'));`);
+await submitted.tick(1); await submitted.run('job');
+assert.equal(submitted.run('submitCount'), 1);
+assert.equal(submitted.run('checkCount'), 1);
+assert.equal(submitted.run("getRawTargetStatus('fxacg').status"), 'result-unknown');
+
+// 显式任务日志归属和旧日志再次脱敏，含数字 nonce、HTML 表单和 Cookie 头。
+const logs = await createFixture();
+logs.run(`globalThis.a=startSignDebugCapture('fxacg','飞雪','direct'); globalThis.b=startSignDebugCapture('sl-asmr','ASMR','direct');
+    addSignDebugEntry({type:'test',url:'https://example.test/?_nonce=URL_SECRET'},a);
+    addSignDebugEntry({type:'test',requestBody:'{"nonce":1234567,"_nonce":"BODY_SECRET"}',response:'<input name="formhash" value="HTML_SECRET">'},b);
+    persistSignDebugFailure(a,{message:'Cookie: COOKIE_SECRET'});persistSignDebugFailure(b,{message:'token=ERROR_SECRET'});`);
+assert.equal(logs.run("buildSignDebugExport('fxacg').logs.length"), 1);
+assert.equal(logs.run("buildSignDebugExport('sl-asmr').logs[0].entries[0].type"), 'test');
+logs.storage.set('BBSSignHelperDebugLogs', [{ siteKey: 'old', startedAt: logs.run('getLocalDateTimeWithOffset()'), entries: [{ requestBody: '{"_nonce":"OLD_SECRET"}', requestHeaders: { Authorization: 'OLD_AUTH' } }] }]);
+const exported = JSON.stringify(logs.run('buildSignDebugExport()'));
+for (const secret of ['OLD_SECRET', 'OLD_AUTH']) assert.ok(!exported.includes(secret));
+logs.run("clearSignDebugLogs(); globalThis.c=startSignDebugCapture('test','测试','test'); addSignDebugEntry({requestBody:'nonce=FORM_SECRET&_nonce=OTHER_SECRET',response:'Authorization: HEADER_SECRET\\nSet-Cookie: COOKIE_SECRET'},c); persistSignDebugFailure(c)");
+const sanitized = JSON.stringify([...logs.storage.values()]);
+for (const secret of ['FORM_SECRET', 'OTHER_SECRET', 'HEADER_SECRET', 'COOKIE_SECRET']) assert.ok(!sanitized.includes(secret), secret);
+
+// 配置/状态往返、非法输入不写、瞬态归一化。
+const backup = await createFixture();
+backup.run("saveCustomTarget({id:'custom-a',name:'自定义',url:'https://example.test/check',enabled:true,openMode:'foreground',resultMode:'manual',note:'备注'}); completeSign('wcccc','本人今日已签到'); recordTargetStatus('fxacg','running'); globalThis.backup=createBackup(true)");
+const value = backup.run('backup');
+assert.equal(value.schemaVersion, 1);
+assert.equal(value.config.customTargets[0].name, '自定义');
+assert.ok(!JSON.stringify(value).includes('taskId'));
+assert.equal(value.states.dailyStatus[backup.run('getToday()')].fxacg.status, 'result-unknown');
+const other = await createFixture();
+other.context.inputBackup = value;
+other.run('applyBackup(inputBackup,{config:true,states:true})');
+assert.equal(other.run("getRawTargetStatus('wcccc').confirmationSource"), 'automatic');
+assert.equal(other.run("getData('wcccc')"), backup.run('getToday()'));
+assert.equal(other.run('getCustomTargets()[0].name'), '自定义');
+assert.equal(other.run('previewBackup(inputBackup,{config:true,states:true}).configTargets'), other.run('getAllTargets().length'));
+other.storage.set('BBSSignHelperData:wcccc', '2026-10-08');
+other.run('applyBackup(inputBackup,{config:true,states:false})');
+assert.equal(other.run("getData('wcccc')"), '2026-10-08', '未选状态分区保持原值');
+other.run("saveCustomTarget({id:'custom-b',name:'保留配置',url:'https://b.test/',enabled:true,openMode:'manual',resultMode:'manual'}); applyBackup(inputBackup,{config:false,states:true})");
+assert.equal(other.run('getCustomTargets().length'), 2, '只恢复状态不替换配置');
+assert.equal(other.run('validateBackup(JSON.stringify(createBackup(true, GM_getValue(STORAGE_KEYS.recovery).entries))).schemaVersion'), 1);
+for (const mutate of [v => { v.schemaVersion = 99; }, v => { v.config.customTargets[0].url = 'javascript:alert(1)'; }, v => { v.config.customTargets.push(v.config.customTargets[0]); }, v => { v.states.successDates.wcccc = '2026-02-30'; }, v => { v.config.preferences.autoClosePageAfterSign = 'yes'; }]) {
+    const invalid = structuredClone(value); mutate(invalid);
+    const before = JSON.stringify([...other.storage]);
+    other.context.invalidText = JSON.stringify(invalid);
+    assert.throws(() => other.run('validateBackup(invalidText)'));
+    assert.equal(JSON.stringify([...other.storage]), before);
+}
+assert.throws(() => other.run("validateBackup('{')"));
+other.context.large = ' '.repeat(5 * 1024 * 1024 + 1);
+assert.throws(() => other.run('validateBackup(large)'));
+let failOnce = true;
+const rollback = await createFixture({ beforeWrite: key => { if (key === 'BBSSignHelperDashboardConfig' && failOnce) { failOnce = false; throw new Error('注入写入失败'); } } });
+rollback.storage.set('BBSSignHelperData', { wcccc: '2026-10-08' });
+rollback.context.backup = value;
+assert.throws(() => rollback.run('applyBackup(backup,{config:true,states:true})'), /已恢复导入前数据/);
+assert.equal(rollback.run("getData('wcccc')"), '2026-10-08');
+let failRestore = true;
+const recoveryFailure = await createFixture({ beforeWrite: key => { if (key === 'BBSSignHelperData' && failRestore) throw new Error('存储持续失败'); } });
+recoveryFailure.storage.set('BBSSignHelperData', { wcccc: '2026-10-08' });
+recoveryFailure.context.backup = value;
+assert.throws(() => recoveryFailure.run('applyBackup(backup,{config:true,states:true})'), /自动恢复也失败/);
+assert.ok(recoveryFailure.storage.get('BBSSignHelperRecovery'));
+assert.ok(recoveryFailure.storage.get('BBSSignHelperImportPending'));
+assert.throws(() => recoveryFailure.run('applyBackup(backup,{config:true,states:true})'), /先恢复上次/);
+failRestore = false;
+assert.equal(recoveryFailure.run('recoverPendingImport()'), true);
+assert.equal(recoveryFailure.run("getData('wcccc')"), '2026-10-08');
+assert.equal(rollback.storage.get('BBSSignHelperImportPending'), null);
+rollback.storage.set('BBSSignHelperImportPending', { startedAt: 'test' });
+rollback.storage.set('BBSSignHelperData', { wcccc: '2026-10-09' });
+assert.equal(rollback.run('recoverPendingImport()'), true);
+assert.equal(rollback.run("getData('wcccc')"), '2026-10-08');
+
+const history = await createFixture();
+history.storage.set('BBSSignHelperDashboardStatus', { '2026-01-01': { wcccc: { status: 'success' } }, '2026-10-09': { wcccc: { status: 'success' } } });
+history.storage.set('BBSSignHelperDashboardStatus:2026-01-01:wcccc', { status: 'success' });
+history.storage.set('OtherScript:2026-01-01', '保留');
+history.storage.set('BBSSignHelperData:wcccc', '2026-10-09');
+history.run("acquireTaskLease('fxacg')");
+assert.equal(history.run('previewHistoryCleanup().records'), 0);
+assert.equal(history.run('previewHistoryCleanup(7).records'), 1);
+assert.equal(history.run('cleanHistory(previewHistoryCleanup(7))'), 1);
+assert.ok(!history.storage.has('BBSSignHelperDashboardStatus:2026-01-01:wcccc'));
+assert.equal(history.storage.get('OtherScript:2026-01-01'), '保留');
+assert.equal(history.run("getData('wcccc')"), '2026-10-09');
+assert.equal(history.run("hasActiveTask('fxacg')"), true);
+history.storage.set('BBSSignHelperDashboardStatus', { '2026-10-02': { wcccc: { status: 'success' } }, '2026-10-03': { wcccc: { status: 'success' } } });
+assert.equal(history.run('JSON.stringify(previewHistoryCleanup(7).dates)'), '["2026-10-02"]');
+console.log('通过：GM/fetch响应体超时、迟到回包、分类及3/6秒重试、提交只检查、日志归属脱敏、备份往返/校验/回滚/启动恢复与历史清理。');

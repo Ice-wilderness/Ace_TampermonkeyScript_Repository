@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import { createFixture } from './fixture.mjs';
+
+const fixture = await createFixture();
+assert.equal(fixture.run('siteConfigs.length'), 17);
+fixture.storage.set('BBSSignHelperData', { wcccc: '2026-10-08' });
+assert.equal(fixture.run("getData('wcccc')"), '2026-10-08');
+console.log('通过：隔离加载、17 站配置与旧成功日期读取；没有真实网络请求。');
+
+const state = await createFixture();
+state.storage.set('BBSSignHelperDashboardConfig', { customTargets: [{ id: 'custom-a', name: '自定义', url: 'https://example.test/' }], preferences: { autoClosePageAfterSign: true } });
+assert.equal(state.run('getCustomTargets()[0].name'), '自定义');
+state.storage.set('BBSSignHelperDashboardStatus', { [state.run('getToday()')]: { wcccc: { status: 'failed', message: '旧记录' } } });
+assert.equal(state.run("getNormalizedTargetStatus(getBuiltInTargets().find(t => t.id === 'wcccc')).message"), '旧记录');
+state.storage.set('BBSSignHelperDashboardStatus:' + state.run('getToday()') + ':wcccc', { status: 'invalid' });
+assert.equal(state.run("getRawTargetStatus('wcccc').status"), 'failed');
+state.run("recordTargetStatus('wcccc', 'opened'); recordTargetStatus('fxacg', 'needs-login');");
+assert.equal(state.run("getRawTargetStatus('wcccc').status"), 'opened');
+assert.equal(state.run("getRawTargetStatus('fxacg').status"), 'needs-login');
+state.run("globalThis.oldOperation = captureOperation('wcccc'); completeSign('wcccc', '页面显示今日已签到'); resetTargetStatus(getBuiltInTargets().find(t => t.id === 'wcccc'));");
+assert.equal(state.run("markSignSuccess('wcccc', '迟到结果', { context: oldOperation })"), false);
+assert.notEqual(state.run("getData('wcccc')"), state.run('getToday()'));
+state.run("globalThis.target = getBuiltInTargets().find(t => t.id === 'wcccc'); setManualTargetStatus(target, 'success');");
+assert.equal(state.run("getRawTargetStatus('wcccc').confirmationSource"), 'manual');
+assert.equal(state.run('undoManualStatus().restored'), 1);
+assert.equal(state.run("getRawTargetStatus('wcccc').status"), 'result-unknown');
+state.run("setManualTargetStatus(target, 'success'); completeSign('wcccc', '新自动结果');");
+assert.equal(state.run('undoManualStatus().changed'), 1);
+state.run("setManualTargetStatus(target, 'failed');");
+assert.notEqual(state.run("getData('wcccc')"), state.run('getToday()'));
+console.log('通过：旧/拆分/异常记录、目标隔离、重置迟到结果、来源及条件撤销。');

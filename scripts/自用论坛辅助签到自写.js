@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.19.0
-// @description  论坛辅助签到工具 - 支持 limestart 签到控制台、控制台直签与多站点自动签到
+// @version      2.20.0
+// @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
 // @match        https://limestart.cn/*
@@ -33,6 +33,10 @@
 // @connect      www.galgamex.net
 // @grant        unsafeWindow
 // @grant        GM_getValue
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
+// @grant        GM_listValues
+// @grant        GM_deleteValue
 // @grant        GM_setValue
 // @grant        GM.deleteValue
 // @grant        GM_notification
@@ -61,29 +65,32 @@
         dashboardStatus: 'BBSSignHelperDashboardStatus',
         signDebugLogs: 'BBSSignHelperDebugLogs',
         pageToastSuppressed: 'BBSSignHelperPageToastSuppressed',
-        autoClosePending: 'BBSSignHelperAutoClosePending'
+        autoClosePending: 'BBSSignHelperAutoClosePending',
+        mutation: 'BBSSignHelperMutation',
+        task: 'BBSSignHelperTask',
+        recovery: 'BBSSignHelperRecovery',
+        importPending: 'BBSSignHelperImportPending'
     };
 
     const DEBUG_LOG_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
     const DEBUG_LOG_TEXT_LIMIT = 6000;
     const DEBUG_LOG_MAX_SESSIONS = 80;
     const DEBUG_LOG_MAX_ENTRIES_PER_SESSION = 50;
-    const DEBUG_SENSITIVE_KEY_RE = /authorization|cookie|set-cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey/i;
+    const DEBUG_SENSITIVE_KEY_RE = /authorization|cookie|set-cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey|_?nonce/i;
     const DEBUG_TEXT_RESPONSE_RE = /json|text|xml|html|javascript|form|plain|gbk|gb2312/i;
     const PAGE_COMPLETED_TOAST_AUTO_CLOSE_MS = 3000;
     const PAGE_COMPLETED_TOAST_DAILY_LIMIT = 3;
-    const DASHBOARD_AUTO_REFRESH_INTERVAL_MS = 2000;
-    const DASHBOARD_AUTO_REFRESH_DURATION_MS = 2 * 60 * 1000;
     const DIRECT_SIGN_RETRY_ATTEMPTS = 3;
     const DIRECT_SIGN_RETRY_DELAY_MS = 3000;
+    const REQUEST_TIMEOUT_MS = 20000;
     const AUTO_CLOSE_PENDING_TTL_MS = 10 * 60 * 1000;
     const CLOSE_PAGE_AFTER_SIGN_ACTION = { closePageAfterSignAction: true };
-    const AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS = new Set(['uugg', 'soushuba', 'ZodGame', 'laowang']);
-    const TRACK_LAUNCHED_AUTO_CLOSE_SITE_KEYS = new Set([...AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS, 'sstm']);
 
     const STATUS_META = {
         'not-started': { label: '待开始', tone: 'neutral', message: '今日尚未处理' },
         running: { label: '执行中', tone: 'pending', message: '正在执行签到请求' },
+        queued: { label: '排队中', tone: 'pending', message: '等待执行名额' },
+        'result-unknown': { label: '待检查', tone: 'warning', message: '已提交但结果未确认，请重新检查' },
         opened: { label: '已打开', tone: 'pending', message: '已打开，等待确认' },
         success: { label: '成功', tone: 'success', message: '今日已完成' },
         failed: { label: '失败', tone: 'danger', message: '本次未确认成功' },
@@ -123,15 +130,306 @@
     let autoOpenCountdownLeft = 0;
     let autoOpenReminderSignature = '';
     let autoOpenSuppressedSignature = '';
-    let dashboardAutoRefreshTimer = null;
-    let dashboardAutoRefreshUntil = 0;
     let launchedAutoCloseMonitorTimer = null;
     const launchedAutoCloseTabs = new Map();
-    let activeSignDebugContext = null;
     let dismissedPageSignToastSignature = '';
     let pageSignToastAutoCloseTimer = null;
     let uuGgPageSubmitAttempted = false;
     const captchaAutoSubmitStates = new Map();
+    const pageObserverStops = new Set();
+    const pageOperations = new Map();
+    const requestContexts = new Map();
+    const executionOwnerId = newOperationId();
+    const directTasks = new Map();
+    let manualUndo = null;
+    let manualUndoTimer = null;
+    let reminderDismissedDay = '';
+    let dashboardMounted = null;
+    let syncListenerIds = [];
+    let syncPollTimer = null;
+    let midnightTimer = null;
+    let syncRefreshTimer = null;
+    let syncDay = '';
+    let syncStarted = false;
+
+    function newOperationId() {
+        return typeof crypto?.randomUUID === 'function' ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
+
+    function captureOperation(key) {
+        return { key, date: getToday(), mutationId: GM_getValue(getScopedStorageKey(STORAGE_KEYS.mutation, key), '') };
+    }
+
+    function isOperationCurrent(context, allowFinished = false) {
+        return !context || (context.date === getToday() && context.mutationId === GM_getValue(getScopedStorageKey(STORAGE_KEYS.mutation, context.key), '') &&
+            (!context.taskId || (getTaskLease(context.key)?.taskId === context.taskId && (getTaskLease(context.key).expiresAt > Date.now() || (allowFinished && getTaskLease(context.key).expiresAt === 0)))));
+    }
+
+    function taskActions(debugContext) {
+        return {
+            completeSign: (key, message, options = {}) => completeSign(key, message, { ...options, evidence: { kind: 'site-result', date: (debugContext?.operation || pageOperations.get(key))?.date || getToday(), summary: message }, context: debugContext?.operation || pageOperations.get(key) }),
+            recordTargetStatus: (key, status, options = {}) => recordTargetStatus(key, status, { ...options, context: debugContext?.operation || pageOperations.get(key) })
+        };
+    }
+
+    function requestContextForUrl(url) {
+        try {
+            const host = new URL(url, location.href).hostname;
+            const site = siteConfigs.find(item => item.matches.some(domain => host === domain || host.endsWith('.' + domain)));
+            return site ? requestContexts.get(site.key) : null;
+        } catch (err) { return null; }
+    }
+
+    function getSstmUser() {
+        const link = document.querySelector('#elUserLink');
+        const profileLink = document.querySelector('#elUserLink_menu a[href*="/profile/"], [data-role="replyArea"] a.ipsUserPhoto[href*="/profile/"]');
+        const href = profileLink?.getAttribute('href') || link?.getAttribute('href') || '';
+        const profile = href.match(/\/profile\/(\d+)(?:-|\/|$)/)?.[1] || '';
+        return { id: profile, profile: href.match(/\/profile\/[^?#]+/)?.[0].replace(/\/$/, '') || '', name: link?.textContent.trim() || profileLink?.querySelector('img')?.getAttribute('alt') || '' };
+    }
+
+    function findSstmDailyComment(root = document, user = getSstmUser()) {
+        if (!user.id && !user.name) return null;
+        const now = new Date();
+        const title = root.querySelector('h1.ipsType_pageTitle')?.textContent || '';
+        const today = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}`;
+        if (!new RegExp(today + '(?![0-9])').test(title)) return null;
+        return Array.from(root.querySelectorAll('article.ipsComment, [data-role="commentFeed"] article')).find(comment => {
+            const author = comment.querySelector('aside.cAuthorPane h3 a, .cAuthorPane_author a, .ipsComment_author a');
+            if (!author) return false;
+            const authorId = (author.getAttribute('href') || '').match(/\/profile\/(\d+)(?:-|\/|$)/)?.[1];
+            const authorProfile = (author.getAttribute('href') || '').match(/\/profile\/[^?#]+/)?.[0].replace(/\/$/, '');
+            const isMine = user.id && authorId ? user.id === authorId : (user.profile && user.profile === authorProfile) || (user.name && author.textContent.trim() === user.name);
+            if (!isMine) return false;
+            const content = comment.querySelector('[data-role="commentContent"], .ipsComment_content') || comment;
+            const published = content.cloneNode(true);
+            published.querySelectorAll('.ipsComposeArea, [contenteditable], .cke, iframe, form, textarea, .ipsComment_edit').forEach(node => node.remove());
+            const postedAt = comment.querySelector('time[datetime]')?.getAttribute('datetime');
+            const date = postedAt ? new Date(postedAt) : null;
+            return published.textContent.includes(`${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日`) ||
+                Boolean(date && date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate());
+        }) || null;
+    }
+
+    function isSstmSignedToday() {
+        return Boolean(findSstmDailyComment());
+    }
+
+    async function checkSstmPublished(debugContext, user = getSstmUser()) {
+        if (findSstmDailyComment(document, user)) return true;
+        // 论坛提供“只看该作者”，一次过滤请求即可检查本人评论，不逐页遍历。
+        const authorLink = document.querySelector('a[href*="view_author="]');
+        if (!user.id || !authorLink) return false;
+        const url = new URL(authorLink.href, location.href);
+        url.pathname = url.pathname.replace(/\/page\/\d+\/?$/, '/');
+        url.searchParams.set('view_author', user.id);
+        url.searchParams.delete('page');
+        url.hash = '';
+        if (url.origin !== location.origin) return false;
+        const pageFetch = typeof unsafeWindow !== 'undefined' && unsafeWindow.fetch ? unsafeWindow.fetch.bind(unsafeWindow) : fetch.bind(window);
+        const response = await debugPageFetch('SS同盟检查本人今日评论', pageFetch, url.href, { credentials: 'same-origin', cache: 'no-store' }, debugContext);
+        const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
+        const now = new Date();
+        const today = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}`;
+        if (!new RegExp(today + '(?![0-9])').test(doc.querySelector('h1.ipsType_pageTitle')?.textContent || '')) throw signRequestError('adaptation', '本人评论检查未返回当前签到帖');
+        return Boolean(findSstmDailyComment(doc, user));
+    }
+
+    async function runSstmPageSign(debugContext) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
+        const now = new Date();
+        const today = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}`;
+        const datePattern = new RegExp(today + '(?![0-9])');
+        const forumUrl = 'https://sstm.moe/forum/72-%E5%90%8C%E7%9B%9F%E7%AD%BE%E5%88%B0%E5%8C%BA/';
+        const visible = node => Boolean(node?.isConnected && node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
+        const waitFor = async (read, timeout = 12000) => {
+            const deadline = Date.now() + timeout;
+            do {
+                if (!isOperationCurrent(debugContext.operation)) return null;
+                const value = read();
+                if (value) return value;
+                await delay(200);
+            } while (Date.now() < deadline);
+            return null;
+        };
+        const status = (state, stage, message) => recordTargetStatus('sstm', state, { stage, message, url: location.href });
+        const retry = message => {
+            const count = Math.max(0, Number(GM_getValue('sstm_retry_count', 0)) || 0);
+            if (count >= 3) {
+                GM_setValue('sstm_retry_count', 0);
+                status('needs-foreground', 'retry', `${message}；已重试3次，请检查页面或回帖权限`);
+            } else {
+                GM_setValue('sstm_retry_count', count + 1);
+                status('needs-foreground', 'editor', `${message}，正在刷新重试（${count + 1}/3）`);
+                location.reload();
+            }
+            return false;
+        };
+
+        // 等待 IPS 页面初始化；登录入口可能在已登录页面的隐藏弹窗中，不能全页搜“登入”。
+        await waitFor(() => document.querySelector('h1.ipsType_pageTitle, [data-role="replyArea"], #elUserLink'));
+        const user = await waitFor(() => { const value = getSstmUser(); return value.id || value.name ? value : null; }, 8000);
+        if (!user) {
+            status('needs-login', 'login', 'SS同盟需要先登录账号');
+            return false;
+        }
+        if (/\/forum\/72-/.test(location.pathname)) {
+            status('running', 'find-thread', '正在查找今日签到帖');
+            const link = await waitFor(() => Array.from(document.querySelectorAll('.ipsDataItem_title a, a[href*="/topic/"]')).find(a => /签到/.test(a.textContent) && datePattern.test(a.textContent) && new URL(a.href, location.href).hostname === location.hostname));
+            if (!link) { status('failed', 'find-thread', `未找到 ${today} 的签到帖`); return false; }
+            status('opened', 'navigate', '已找到今日签到帖，正在进入');
+            location.href = link.href;
+            return false;
+        }
+        if (!/\/topic\//.test(location.pathname) || !datePattern.test(document.querySelector('h1.ipsType_pageTitle')?.textContent || '')) {
+            status('opened', 'navigate', '正在前往签到区寻找今日帖子');
+            location.href = forumUrl;
+            return false;
+        }
+
+        const topic = location.pathname.match(/\/topic\/([^/]+)/)?.[1] || '';
+        const receiptKey = 'BBSSignHelperSstmSubmission';
+        let receipt;
+        try { receipt = JSON.parse(sessionStorage.getItem(receiptKey) || 'null'); } catch (err) { /* 兼容损坏的旧标签记录。 */ }
+        const pending = receipt?.date === getToday() && receipt.topic === topic && receipt.user === (user.id || user.name);
+        const finish = () => {
+            sessionStorage.removeItem(receiptKey);
+            GM_setValue('sstm_retry_count', 0);
+            return completeSign('sstm', '已确认本人今日发布的签到评论', CLOSE_PAGE_AFTER_SIGN_ACTION);
+        };
+        if (findSstmDailyComment(document, user)) return finish();
+
+        status('running', 'verify', '正在检查本人今日是否已经回帖');
+        if (await checkSstmPublished(debugContext, user)) return finish();
+        if (pending) {
+            status('result-unknown', 'verify', '本标签已提交过评论，尚未查到发布结果；重新检查不会重复发帖');
+            return false;
+        }
+
+        let area = await waitFor(() => document.querySelector('[data-role="replyArea"], #elReplyForm, form[data-role="replyForm"], .ipsComposeArea, form:has(iframe.cke_wysiwyg_frame), form:has([contenteditable="true"])'));
+        const findEditor = () => {
+            area = document.querySelector('[data-role="replyArea"], #elReplyForm, form[data-role="replyForm"]') || area;
+            const form = area?.matches('form') ? area : area?.closest('form') || area?.querySelector('form');
+            const scope = area || form;
+            if (!scope) return null;
+            const instances = typeof unsafeWindow !== 'undefined' ? unsafeWindow.CKEDITOR?.instances : window.CKEDITOR?.instances;
+            for (const api of Object.values(instances || {})) {
+                if (api.status !== 'ready' || api.readOnly) continue;
+                const field = api.editable?.()?.$;
+                const textarea = api.element?.$;
+                if (visible(field) && (scope.contains(field) || scope.contains(textarea))) return { api, field, textarea, form: textarea?.form || form, scope };
+            }
+            const field = Array.from(scope.querySelectorAll('[contenteditable="true"]')).find(visible);
+            if (field) return { field, form: field.closest('form') || form, scope };
+            for (const frame of scope.querySelectorAll('iframe.cke_wysiwyg_frame, iframe')) {
+                if (!visible(frame)) continue;
+                try {
+                    const body = frame.contentDocument?.body;
+                    if (body && (body.isContentEditable || body.getAttribute('contenteditable') === 'true' || frame.matches('.cke_wysiwyg_frame'))) return { field: body, form, scope };
+                } catch (err) { /* 不读取跨域 iframe。 */ }
+            }
+            return null;
+        };
+        status('running', 'editor', '正在激活回复编辑器');
+        const dummy = area?.querySelector('.ipsComposeArea_dummy');
+        if (visible(dummy)) {
+            dummy.scrollIntoView({ block: 'center' });
+            dummy.focus();
+            dummy.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+            dummy.click();
+        }
+        const editor = await waitFor(findEditor);
+        if (!editor) return retry('回复编辑器尚未就绪');
+
+        const message = `${now.getFullYear()}年${now.getMonth() + 1}月${now.getDate()}日 ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+        const html = `<p>${message}</p>`;
+        status('running', 'fill', '正在填写并同步签到评论');
+        editor.field.focus();
+        if (editor.api) {
+            // CKEditor 的 setData 是异步操作，必须等回调后再同步隐藏 textarea。
+            let timer;
+            try {
+                await new Promise((resolve, reject) => {
+                    timer = setTimeout(() => reject(signRequestError('adaptation', '回复编辑器写入超时')), 6000);
+                    editor.api.setData(html, { callback: resolve });
+                });
+                editor.api.fire('change');
+                editor.api.updateElement();
+            } finally { clearTimeout(timer); }
+            if (!editor.api.getData().includes(message) || (editor.textarea?.matches('textarea') && !editor.textarea.value.includes(message))) return retry('编辑器内容未同步到回复表单');
+        } else {
+            editor.field.innerHTML = html;
+        }
+        const EventType = editor.field.ownerDocument.defaultView.Event;
+        editor.field.dispatchEvent(new EventType('input', { bubbles: true }));
+        editor.field.dispatchEvent(new EventType('change', { bubbles: true }));
+
+        const button = await waitFor(() => Array.from((editor.form || editor.scope).querySelectorAll('button[type="submit"], input[type="submit"], [data-action="submitReply"]')).find(node => visible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true'), 6000);
+        if (!button) return retry('回复提交按钮尚未就绪');
+        if (!isOperationCurrent(debugContext.operation) || !markPendingAutoCloseAfterSignAction('sstm', 'reply-submit')) return false;
+        // 新记录只代表本逻辑真正点击过可用的回复按钮；旧版泛用动作标记不阻断本次执行。
+        sessionStorage.setItem(receiptKey, JSON.stringify({ date: getToday(), topic, user: user.id || user.name, message }));
+        status('running', 'submit', '已提交签到评论，正在确认发布结果');
+        button.click();
+        if (await waitFor(() => findSstmDailyComment(document, user), 8000)) return finish();
+        if (await checkSstmPublished(debugContext, user)) return finish();
+        status('result-unknown', 'verify', '回复已提交，尚未获得本人已发布评论；请重新检查结果');
+        return false;
+    }
+
+    function getFufugalNotice() {
+        const texts = Array.from(document.querySelectorAll('.el-notification__content, .el-message__content, .el-dialog__body, .el-message-box__message, [role="dialog"]'))
+            .filter(node => node.getClientRects().length > 0 && !node.closest('#bbs-sign-page-toast, #bbs-sign-dashboard-overlay'))
+            .map(node => (node.innerText || node.textContent || '').trim()).filter(Boolean);
+        // 站点自绘的寻宝报告没有 role="dialog"；恢复原有的有界正文提取。
+        let body = document.body?.innerText || '';
+        for (const node of document.querySelectorAll('#bbs-sign-page-toast, #bbs-sign-dashboard-overlay, #bbs-sign-dashboard-button')) {
+            const ownText = node.innerText || '';
+            if (ownText) body = body.replace(ownText, '');
+        }
+        const report = body.match(/寻宝报告[\s\S]{0,700}?(?:确定|$)/)?.[0];
+        const done = body.match(/今日已完成寻宝[^\n。]*(?:[。！!])?/)?.[0];
+        const result = report || done;
+        if (result && !texts.includes(result)) texts.push(result.trim());
+        return texts.join('\n');
+    }
+
+    function isFufugalConfirmed(text) {
+        // 探险中途的战斗失败不代表签到失败，以已结束的寻宝报告为准。
+        if (/寻宝报告/.test(text) && /寻宝结束|进入休息状态/.test(text) && !/请求失败|接口错误|系统异常|error/i.test(text)) return true;
+        return !/失败|错误|异常|无法|error/i.test(text) && /今日已完成寻宝|请明日再来|明天再来|寻宝成功|寻宝结束|(?:最终携带回了|携带回了)[^\n]*积分/.test(text);
+    }
+
+    async function checkSiteResult(site, debugContext) {
+        debugContext = debugContext || { operation: pageOperations.get(site.key) || captureOperation(site.key) };
+        debugContext.unsignedConfirmed = false;
+        const actions = taskActions(debugContext);
+        const text = selector => document.querySelector(selector)?.textContent || '';
+        let signed = false;
+        switch (site.key) {
+            case 'sstm': signed = await checkSstmPublished(debugContext); break;
+            case 'wcccc':
+            case 'laowang': signed = Boolean(document.querySelector('.qdleft .btnvisted, #JD_sign.btnvisted, .btnvisted'));
+                debugContext.unsignedConfirmed = !signed && !debugContext.submitted && !hasPageSubmittedAction(site.key, debugContext.operation) && /今日未签到|今天未签到/.test(text('#JD_sign, .qdleft .btn')); break;
+            case 'ZodGame': signed = /已经签到过了|今日已签到/.test(text('#ct > div.mn > h1:nth-child(1)')); debugContext.unsignedConfirmed = !signed && !debugContext.submitted && !hasPageSubmittedAction(site.key, debugContext.operation) && Boolean(document.querySelector('#qiandao')) && /今天签到了吗/.test(document.body?.innerText || ''); break;
+            case '2dfan': signed = Array.from(document.querySelectorAll('.checkin-action button')).some(button => button.textContent.trim() === '今日已签到') || /今日已签到|今天已签到/.test(text('.checkin-info .pull-right')); break;
+            case 'sehuatang': signed = isSehuatangSignPage() && getSehuatangSignControlState().isSigned; break;
+            case 'fufugal': signed = isFufugalConfirmed(getFufugalNotice()); break;
+            case 'uugg': signed = await runUuGgPageSign(debugContext, true); break;
+            case 'acgndog': signed = await runAcgndogApiSign(debugContext, true); break;
+            case 'vik': signed = await runVikApiSign(debugContext, true); break;
+            case 'kfpromax': signed = await runKfpromaxApiSign(debugContext, true); break;
+            case 'sijishe': signed = await runSijisheApiSign(debugContext, true); break;
+            case 'fxacg': signed = await runFeixueApiSign(debugContext, true); break;
+            case 'galGameXNew': signed = Boolean(getGalgameXNewSignedText()); break;
+            case 'southplus':
+            case 'sl-asmr': actions.recordTargetStatus(site.key, 'result-unknown', { stage: 'verify', reasonCode: 'readonly-unavailable', message: '此站点暂无可靠的只读结果入口；请前台核对并人工确认，不重复领取奖励' }); break;
+            case 'soushuba': signed = Boolean(document.querySelector('a[href*="member.php?mod=logging"][href*="action=logout"]')) || Number(unsafeWindow.discuz_uid) > 0; break;
+        }
+        if (signed && !(getRawTargetStatus(site.key)?.status === 'success' && getRawTargetStatus(site.key)?.confirmationSource === 'automatic' && getRawTargetStatus(site.key)?.taskId === (debugContext.operation?.taskId || ''))) actions.completeSign(site.key, '重新检查确认今日已完成');
+        else if (debugContext.unsignedConfirmed) actions.recordTargetStatus(site.key, 'not-started', { stage: 'verify', reasonCode: 'confirmed-unsigned', message: '已确认今日尚未完成，可再次执行签到' });
+        return { outcome: signed ? 'success' : debugContext.unsignedConfirmed ? 'not-completed' : 'unknown', evidenceDate: getToday() };
+    }
 
     // 获取格式化后的今天日期 (yyyy-MM-dd)
     function getToday() {
@@ -193,21 +491,29 @@
     }
 
     // 设置数据并标记今日已签到
-    function markSignSuccess(key, message = '今日签到已确认') {
+    function markSignSuccess(key, message, options = {}) {
+        const context = options.context || pageOperations.get(key);
+        if (!isOperationCurrent(context)) return false;
         const today = getToday();
+        if (options.source !== 'manual' && (!options.evidence || options.evidence.date !== today || !options.evidence.summary || options.evidence.kind !== 'site-result')) return false;
         const data = readObject(STORAGE_KEYS.successData);
         data[key] = today;
         GM_setValue(getScopedStorageKey(STORAGE_KEYS.successData, key), today);
         writeObject(STORAGE_KEYS.successData, data);
         recordTargetStatus(key, 'success', {
-            stage: 'verify',
+            stage: options.source === 'manual' ? 'manual' : 'verify',
+            confirmationSource: options.source || 'automatic',
+            evidence: options.evidence?.summary || message,
+            context,
             message,
             url: location.href
         });
         console.log(`[签到助手] ${key} 签到状态已更新为：${data[key]}`);
+        return true;
     }
 
-    function clearSignSuccess(key, message = '已清除错误的今日成功记录') {
+    function clearSignSuccess(key, message = '已清除错误的今日成功记录', context = pageOperations.get(key)) {
+        if (!isOperationCurrent(context)) return false;
         const data = readObject(STORAGE_KEYS.successData);
         delete data[key];
         GM_setValue(getScopedStorageKey(STORAGE_KEYS.successData, key), '');
@@ -216,20 +522,24 @@
     }
 
     function completeSign(key, message, options = {}) {
-        markSignSuccess(key, message);
+        if (!markSignSuccess(key, message, { ...options, evidence: options.evidence || (message ? { kind: 'site-result', date: options.context?.date || pageOperations.get(key)?.date || getToday(), summary: message } : null) })) return false;
         maybeAutoClosePageAfterSign(key, options);
         return true;
     }
 
     function getDashboardConfig() {
-        const config = readObject(STORAGE_KEYS.dashboardConfig, DEFAULT_DASHBOARD_CONFIG);
+        return normalizeDashboardConfig(readObject(STORAGE_KEYS.dashboardConfig, DEFAULT_DASHBOARD_CONFIG));
+    }
+
+    function normalizeDashboardConfig(config) {
         const preferences = config.preferences && typeof config.preferences === 'object' ? config.preferences : {};
         return {
             targetSettings: config.targetSettings && typeof config.targetSettings === 'object' ? config.targetSettings : {},
             customTargets: Array.isArray(config.customTargets) ? config.customTargets : [],
             preferences: {
                 autoOpenDashboardOnAttention: preferences.autoOpenDashboardOnAttention === true,
-                autoClosePageAfterSign: preferences.autoClosePageAfterSign === true
+                autoClosePageAfterSign: preferences.autoClosePageAfterSign === true,
+                historyRetentionDays: [7, 30, 90].includes(preferences.historyRetentionDays) ? preferences.historyRetentionDays : 0
             }
         };
     }
@@ -240,7 +550,8 @@
             customTargets: Array.isArray(config.customTargets) ? config.customTargets : [],
             preferences: {
                 autoOpenDashboardOnAttention: config.preferences?.autoOpenDashboardOnAttention === true,
-                autoClosePageAfterSign: config.preferences?.autoClosePageAfterSign === true
+                autoClosePageAfterSign: config.preferences?.autoClosePageAfterSign === true,
+                historyRetentionDays: [7, 30, 90].includes(config.preferences?.historyRetentionDays) ? config.preferences.historyRetentionDays : 0
             }
         });
         updateDashboardReminderButton();
@@ -309,16 +620,25 @@
 
     function recordTargetStatus(key, status, options = {}) {
         if (!key) return;
+        const context = options.context || pageOperations.get(key);
+        if (!isOperationCurrent(context)) return null;
         const today = getToday();
         const store = getStatusStore();
         const dayStatus = store[today] || {};
-        const previous = dayStatus[key] || {};
+        const previous = getRawTargetStatus(key) || {};
         const nextStatus = {
+            schemaVersion: 1,
+            confirmationSource: options.confirmationSource || (status === 'success' ? previous.confirmationSource || 'legacy' : ''),
+            mutationId: GM_getValue(getScopedStorageKey(STORAGE_KEYS.mutation, key), ''),
+            writeId: newOperationId(),
+            taskId: options.taskId || context?.taskId || '',
+            reasonCode: options.reasonCode || '',
+            evidence: truncateDebugText(redactDebugText(options.evidence || ''), 500),
             status,
             stage: options.stage || previous.stage || '',
-            message: options.message || STATUS_META[status]?.message || previous.message || '',
+            message: truncateDebugText(redactDebugText(options.message || STATUS_META[status]?.message || previous.message || ''), 1000),
             updatedAt: new Date().toISOString(),
-            url: options.url || previous.url || location.href,
+            url: sanitizeDebugUrl(options.url || previous.url || location.href),
             attemptCount: options.incrementAttempt ? (previous.attemptCount || 0) + 1 : (previous.attemptCount || 0)
         };
         dayStatus[key] = nextStatus;
@@ -331,6 +651,7 @@
             countCompletedToast: options.countCompletedPageSignToast === true
         });
         updateDashboardReminderButton();
+        return nextStatus;
     }
 
     function addPageSignToastStyles() {
@@ -459,7 +780,10 @@
         if (status === 'running') return '签到中';
         if (status === 'success') return '签到成功';
         if (status === 'opened') return '等待确认';
-        if (status === 'failed' || status === 'needs-login' || status === 'needs-foreground') return '签到失败';
+        if (status === 'needs-login') return '等待登录';
+        if (status === 'needs-foreground') return '等待人工验证';
+        if (status === 'result-unknown') return '等待检查结果';
+        if (status === 'failed') return '签到失败';
         return STATUS_META[status]?.label || '签到状态';
     }
 
@@ -554,12 +878,13 @@
     function getRawTargetStatus(key) {
         const today = getToday();
         const scopedValue = GM_getValue(getTargetStatusStorageKey(today, key));
-        if (scopedValue && typeof scopedValue === 'object' && !Array.isArray(scopedValue)) {
+        if (scopedValue && typeof scopedValue === 'object' && !Array.isArray(scopedValue) && STATUS_META[scopedValue.status]) {
             return scopedValue;
         }
         const store = getStatusStore();
         const todayStatus = store[today] || {};
-        return todayStatus[key] || null;
+        const value = todayStatus[key];
+        return value && STATUS_META[value.status] ? value : null;
     }
 
     function getNormalizedTargetStatus(target) {
@@ -574,12 +899,16 @@
         }
 
         const raw = getRawTargetStatus(target.id);
-        if (raw?.stage === 'manual' && raw.status !== 'success') return raw;
+        if (raw && ['running', 'queued', 'opened'].includes(raw.status) && !hasActiveTask(target.id) && !directTasks.has(target.id) && !(target.siteKey && getData(target.siteKey) === getToday() && !raw.schemaVersion)) return { ...raw, status: 'result-unknown', message: '上次任务已结束或超期，请先检查结果', reasonCode: 'expired' };
+        if (raw?.schemaVersion === 1 || raw?.stage === 'manual') {
+            return raw;
+        }
 
         if (target.siteKey && getData(target.siteKey) === getToday()) {
             const rawSuccess = raw?.status === 'success' ? raw : null;
             return {
                 status: 'success',
+                confirmationSource: rawSuccess?.confirmationSource || 'legacy',
                 stage: rawSuccess?.stage || 'legacy',
                 message: rawSuccess?.message || '从既有签到记录同步为成功',
                 updatedAt: rawSuccess?.updatedAt || raw?.updatedAt || '',
@@ -609,64 +938,55 @@
         return Boolean(site && site.matches.some(domain => location.hostname.includes(domain)));
     }
 
-    function getAutoClosePendingStorageKey(key) {
-        return getScopedStorageKey(STORAGE_KEYS.autoClosePending, key);
+    function bindPageTask(key) {
+        const url = new URL(location.href);
+        const token = url.searchParams.get('__bbs_task');
+        const sessionKey = `BBSSignHelperPageTask:${key}`;
+        const stored = sessionStorage.getItem(sessionKey);
+        const lease = getTaskLease(key);
+        if (token && lease?.taskId === token && lease.date === getToday() && lease.expiresAt > Date.now()) {
+            sessionStorage.setItem(sessionKey, token);
+            url.searchParams.delete('__bbs_task');
+            try { history.replaceState(history.state, '', url.href); } catch (err) { /* 管理器可能禁止改写 URL。 */ }
+        }
+        const taskId = token || stored;
+        if (!taskId || lease?.taskId !== taskId || lease.date !== getToday() || lease.expiresAt <= Date.now()) return null;
+        // 旧版会把结果未知或页面跳转隐式改成只读；升级后恢复正常页面流程。
+        const checkOnly = lease.checkOnly === true && ['explicit', 'manual'].includes(lease.checkOnlySource);
+        return { ...captureOperation(key), taskId, pageTask: true, checkOnly };
     }
 
     function markPendingAutoCloseAfterSignAction(key, source = 'action') {
-        const config = getDashboardConfig();
-        if (!config.preferences.autoClosePageAfterSign) return;
-        if (isLimestartHost() || !isCurrentPageForSite(key)) return;
-        GM_setValue(getAutoClosePendingStorageKey(key), {
-            date: getToday(),
-            source,
-            url: location.href,
-            expiresAt: Date.now() + AUTO_CLOSE_PENDING_TTL_MS
-        });
+        if (!isCurrentPageForSite(key)) return false;
+        const operation = pageOperations.get(key);
+        if (!operation || !isOperationCurrent(operation)) return false;
+        // 动作和关闭许可只属于当前标签的任务，不能由同站其他页面消费。
+        sessionStorage.setItem(`BBSSignHelperPageAction:${key}`, JSON.stringify({ ...operation, source }));
+        const context = requestContexts.get(key);
+        if (context?.operation?.mutationId === operation.mutationId && context?.operation?.taskId === operation.taskId) context.submitted = true;
+        return true;
     }
 
-    function markPendingAutoCloseAfterDashboardLaunch(target) {
-        const key = target?.siteKey;
-        if (!key || !AUTO_CLOSE_AFTER_LAUNCH_SITE_KEYS.has(key)) return;
-        const config = getDashboardConfig();
-        if (!config.preferences.autoClosePageAfterSign) return;
-        GM_setValue(getAutoClosePendingStorageKey(key), {
-            date: getToday(),
-            source: 'dashboard-launch',
-            url: target.url,
-            expiresAt: Date.now() + AUTO_CLOSE_PENDING_TTL_MS
-        });
-    }
-
-    function consumePendingAutoCloseAfterSignAction(key) {
-        const storageKey = getAutoClosePendingStorageKey(key);
-        const pending = GM_getValue(storageKey);
-        if (!pending || typeof pending !== 'object' || Array.isArray(pending)) {
-            if (pending) GM_setValue(storageKey, '');
-            return false;
-        }
-
-        const isValid = pending.date === getToday() &&
-            Number(pending.expiresAt || 0) > Date.now();
-        GM_setValue(storageKey, '');
-        return isValid;
+    function hasPageSubmittedAction(key, operation) {
+        try {
+            const value = JSON.parse(sessionStorage.getItem(`BBSSignHelperPageAction:${key}`) || 'null');
+            return Boolean(operation && value?.date === operation.date && value?.taskId === operation.taskId && value?.mutationId === operation.mutationId);
+        } catch (err) { return false; }
     }
 
     function maybeAutoClosePageAfterSign(key, options = {}) {
-        const hasPendingAction = consumePendingAutoCloseAfterSignAction(key);
-        const shouldClose = options.closePageAfterSignAction === true || hasPendingAction;
-        if (!shouldClose) return;
-        const config = getDashboardConfig();
-        if (!config.preferences.autoClosePageAfterSign) return;
-        if (isLimestartHost() || !isCurrentPageForSite(key)) return;
-
-        console.log(`[签到助手] ${key} 本次签到动作已完成，准备自动关闭页面。`);
+        if (options.source === 'manual' || !getDashboardConfig().preferences.autoClosePageAfterSign || !isCurrentPageForSite(key)) return;
+        const operation = options.context || pageOperations.get(key);
+        if (!operation || !isOperationCurrent(operation)) return;
+        let action;
+        try { action = JSON.parse(sessionStorage.getItem(`BBSSignHelperPageAction:${key}`) || 'null'); } catch (err) { return; }
+        if (!operation.pageTask && (!action || action.date !== operation.date || action.mutationId !== operation.mutationId)) return;
+        if (operation.pageTask && sessionStorage.getItem(`BBSSignHelperPageTask:${key}`) !== operation.taskId) return;
+        sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
         setTimeout(() => {
-            try {
-                window.close();
-            } catch (err) {
-                console.log('[签到助手] 自动关闭页面失败，可能是浏览器限制。', err);
-            }
+            if (!isOperationCurrent(operation, true) || getRawTargetStatus(key)?.confirmationSource !== 'automatic') return;
+            try { window.close(); } catch (err) { /* 下方提示手动关闭。 */ }
+            showPageSignToast(key, 'success', { message: '已确认成功；若页面未关闭，可手动关闭' });
         }, 800);
     }
 
@@ -688,10 +1008,21 @@
 
     function redactDebugText(value) {
         return String(value || '')
-            .replace(/(^|\r?\n)(set-cookie\s*:\s*)[^\r\n]*/gi, '$1$2[REDACTED]')
-            .replace(/("(?:[^"\\]|\\.)*(?:authorization|cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey)(?:[^"\\]|\\.)*"\s*:\s*)"[^"]*"/gi, '$1"[REDACTED]"')
-            .replace(/((?:authorization|cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey)=)[^&\s"'<>]+/gi, '$1[REDACTED]')
+            .replace(/(^|\r?\n)((?:set-cookie|cookie|authorization)\s*:\s*)[^\r\n]*/gi, '$1$2[REDACTED]')
+            .replace(/(["'][^"'\n]*(?:authorization|cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey|_?nonce)[^"'\n]*["']\s*:\s*)(?:"(?:\\.|[^"\\])*"|'[^']*'|[^\s,}\]]+)/gi, '$1"[REDACTED]"')
+            .replace(/((?:[\w.-]*(?:authorization|cookie|token|secret|password|passwd|csrf|xsrf|session|jwt|bearer|formhash|safeid|authkey|_?nonce)[\w.-]*)=)[^&\s"'<>]+/gi, '$1[REDACTED]')
+            .replace(/(<input\b[^>]*\bname=["'][^"']*(?:token|formhash|safeid|nonce|password|csrf|session)[^"']*["'][^>]*\bvalue=["'])[^"']*/gi, '$1[REDACTED]')
+            .replace(/(<input\b[^>]*\bvalue=["'])[^"']*(["'][^>]*\bname=["'][^"']*(?:token|formhash|safeid|nonce|password|csrf|session)[^"']*["'])/gi, '$1[REDACTED]$2')
+            .replace(/(\b[\w.-]*(?:token|secret|password|csrf|session|formhash|safeid|authkey|nonce)[\w.-]*\s*=\s*)(["'])(.*?)\2/gi, '$1$2[REDACTED]$2')
             .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1[REDACTED]');
+    }
+
+    function sanitizeDebugValue(value, key = '') {
+        if (DEBUG_SENSITIVE_KEY_RE.test(key)) return '[REDACTED]';
+        if (Array.isArray(value)) return value.slice(0, key === 'entries' ? DEBUG_LOG_MAX_ENTRIES_PER_SESSION : DEBUG_LOG_MAX_SESSIONS).map(item => sanitizeDebugValue(item));
+        if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sanitizeDebugValue(item, name)]));
+        if (typeof value === 'string') return truncateDebugText(/url$/i.test(key) ? sanitizeDebugUrl(value) : redactDebugText(value));
+        return value;
     }
 
     function stringifyDebugError(error) {
@@ -708,8 +1039,11 @@
     function sanitizeDebugUrl(value) {
         try {
             const url = new URL(String(value), location.href);
+            if (url.username) url.username = '[REDACTED]';
+            if (url.password) url.password = '[REDACTED]';
+            url.hash = redactDebugText(url.hash);
             for (const key of Array.from(url.searchParams.keys())) {
-                if (DEBUG_SENSITIVE_KEY_RE.test(key)) {
+                if (DEBUG_SENSITIVE_KEY_RE.test(key) || key === '__bbs_task') {
                     url.searchParams.set(key, '[REDACTED]');
                 }
             }
@@ -803,33 +1137,27 @@
             siteKey,
             siteName,
             mode,
+            operation: pageOperations.get(siteKey) || captureOperation(siteKey),
             pageUrl: sanitizeDebugUrl(location.href),
             startedAt: getLocalDateTimeWithOffset(),
-            parent: activeSignDebugContext,
             finished: false,
             entries: []
         };
-        activeSignDebugContext = context;
+        requestContexts.set(siteKey, context);
         return context;
     }
 
     function finishSignDebugCapture(context) {
         context.finished = true;
-        if (activeSignDebugContext === context) {
-            let parent = context.parent || null;
-            while (parent?.finished) {
-                parent = parent.parent || null;
-            }
-            activeSignDebugContext = parent;
-        }
-        delete context.parent;
+        if (requestContexts.get(context.siteKey) === context) requestContexts.delete(context.siteKey);
     }
 
-    function addSignDebugEntry(entry, context = activeSignDebugContext) {
+    function addSignDebugEntry(entry, context) {
         if (!context || context.finished || context.entries.length >= DEBUG_LOG_MAX_ENTRIES_PER_SESSION) return null;
         const item = {
             ...entry,
             pageUrl: sanitizeDebugUrl(location.href),
+            attempt: context.attempt || 1,
             time: getLocalDateTimeWithOffset()
         };
         context.entries.push(item);
@@ -844,13 +1172,13 @@
                 const time = new Date(item.savedAt || item.startedAt || 0).getTime();
                 return Number.isFinite(time) && time >= cutoff;
             })
-            .slice(-DEBUG_LOG_MAX_SESSIONS);
+            .slice(-DEBUG_LOG_MAX_SESSIONS).map(item => sanitizeDebugValue(item));
     }
 
     function persistSignDebugFailure(context, reason = {}) {
         if (!context) return;
         const logs = pruneSignDebugLogs(readArray(STORAGE_KEYS.signDebugLogs, []));
-        logs.push({
+        logs.push(sanitizeDebugValue({
             siteKey: context.siteKey,
             siteName: context.siteName,
             mode: context.mode,
@@ -858,20 +1186,37 @@
             startedAt: context.startedAt,
             savedAt: getLocalDateTimeWithOffset(),
             reason,
+            taskId: context.operation?.taskId || '',
             entries: context.entries
-        });
+        }));
         writeObject(STORAGE_KEYS.signDebugLogs, pruneSignDebugLogs(logs));
     }
 
-    function buildSignDebugExport() {
+    function buildSignDebugExport(siteKey = '') {
         const logs = pruneSignDebugLogs(readArray(STORAGE_KEYS.signDebugLogs, []));
         writeObject(STORAGE_KEYS.signDebugLogs, logs);
         return {
             tool: 'BBSSignHelperDebugLogs',
             exportedAt: getLocalDateTimeWithOffset(),
             retentionDays: 3,
-            logs
+            logs: siteKey ? logs.filter(item => item.siteKey === siteKey) : logs
         };
+    }
+
+    function showTargetDiagnostics(target) {
+        const status = getNormalizedTargetStatus(target);
+        const data = buildSignDebugExport(target.id);
+        const dialog = el('dialog', { className: 'bbs-sign-diagnostics' });
+        dialog.style.cssText = 'max-width:min(90vw,900px);max-height:85vh;overflow:auto;z-index:2147483647';
+        dialog.append(el('h3', { text: `${target.name} · 单站诊断` }),
+            el('p', { text: `状态：${STATUS_META[status.status]?.label}；阶段：${status.stage || '未开始'}；原因：${status.message || '暂无请求'}。${data.logs.length ? '' : '没有保存失败请求日志；打开、人工等待或尚未请求时仅显示阶段说明。'}` }),
+            el('pre', { text: JSON.stringify(data, null, 2) }),
+            el('button', { text: '导出本站日志', onClick: () => downloadJson(data, `bbs-sign-debug-${target.id}-${getToday()}.json`) }),
+            el('button', { text: '清空本站日志', onClick: () => { writeObject(STORAGE_KEYS.signDebugLogs, buildSignDebugExport().logs.filter(item => item.siteKey !== target.id)); dialog.remove(); } }),
+            el('button', { text: '关闭', onClick: () => dialog.remove() }));
+        document.body.append(dialog);
+        dialog.addEventListener('close', () => dialog.remove());
+        dialog.showModal();
     }
 
     function downloadSignDebugLogs() {
@@ -923,13 +1268,18 @@
             return existingState;
         }
 
+        const operation = pageOperations.get(options.siteKey) || captureOperation(options.siteKey);
         const state = { submitted: false, finished: false, timer: null, timeout: null, check: null };
         const stop = () => {
             clearInterval(state.timer);
             clearTimeout(state.timeout);
+            state.finished = true;
+            captchaAutoSubmitStates.delete(options.siteKey);
         };
+        state.stop = stop;
         const check = () => {
             if (state.finished) return;
+            if (!isOperationCurrent(operation)) { stop(); return; }
             if (options.isSigned()) {
                 state.finished = true;
                 stop();
@@ -941,8 +1291,8 @@
             const button = options.getSubmitButton();
             if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return;
 
+            if (!markPendingAutoCloseAfterSignAction(options.siteKey, 'captcha-submit')) return false;
             state.submitted = true;
-            markPendingAutoCloseAfterSignAction(options.siteKey, 'captcha-submit');
             recordTargetStatus(options.siteKey, 'running', {
                 stage: 'submit',
                 message: `${options.siteName} 验证已通过，已自动点击${options.actionLabel}`,
@@ -966,40 +1316,54 @@
     ];
 
     function isSignSuccessRecorded(key) {
-        return getData(key) === getToday() || getRawTargetStatus(key)?.status === 'success';
+        return getNormalizedTargetStatus({ id: key, siteKey: key, enabled: true }).status === 'success';
     }
 
     async function waitForSiteSuccessRecheck(site) {
         const startedAt = Date.now();
         let elapsedBeforePhase = 0;
+        let requestChecks = 0;
+        const remote = ['uugg', 'acgndog', 'vik', 'kfpromax', 'sijishe', 'fxacg'].includes(site.key);
+        const context = requestContexts.get(site.key);
         for (const phase of SIGN_RECHECK_SCHEDULE) {
             const phaseEndAt = startedAt + elapsedBeforePhase + phase.durationMs;
             while (Date.now() < phaseEndAt) {
                 await delay(Math.min(phase.intervalMs, Math.max(0, phaseEndAt - Date.now())));
-
+                if (!isOperationCurrent(context?.operation || pageOperations.get(site.key))) return false;
                 if (isSignSuccessRecorded(site.key)) return true;
-
-                const urlBeforeRun = location.href;
+                if (remote && requestChecks++ >= 3) return false;
                 try {
-                    const isSuccess = await site.run();
-                    if (isSuccess) {
-                        if (getData(site.key) !== getToday()) {
-                            markSignSuccess(site.key, '复查确认签到成功');
-                        }
-                        return true;
-                    }
-                    if (isSignSuccessRecorded(site.key)) return true;
+                    const result = await site.check(context);
+                    if (result.outcome === 'success') return true;
+                    if (['needs-login', 'needs-verification'].includes(result.outcome) || result.reasonCode === 'readonly-unavailable') return false;
                 } catch (err) {
-                    console.log(`[签到助手] ${site.name} 复查时发生异常:`, err);
-                }
-
-                if (location.href !== urlBeforeRun) {
-                    return isSignSuccessRecorded(site.key);
+                    const code = err.reasonCode || 'adaptation';
+                    if (!['network', 'timeout', 'temporary'].includes(code)) {
+                        recordTargetStatus(site.key, code === 'login' ? 'needs-login' : code === 'captcha' ? 'needs-foreground' : 'result-unknown', { context: context?.operation, reasonCode: code, stage: 'verify', message: stringifyDebugError(err) });
+                        return false;
+                    }
+                    if (remote && requestChecks < 3) await delay(Math.max(requestChecks * 3000, err.retryAfterMs || 0));
                 }
             }
             elapsedBeforePhase += phase.durationMs;
         }
         return false;
+    }
+
+    async function runPageTask(site, context, checkOnly) {
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            context.attempt = attempt;
+            if (!isOperationCurrent(context.operation)) return { outcome: 'cancelled' };
+            try { return checkOnly ? await site.check(context) : await site.execute(context); }
+            catch (err) {
+                if (context.submitted || !err.retryable || attempt === 3) throw err;
+                persistSignDebugFailure(context, { status: 'failed', reasonCode: err.reasonCode, message: stringifyDebugError(err), attempt });
+                const wait = Math.max(attempt * 3000, err.retryAfterMs || 0);
+                recordTargetStatus(site.key, 'running', { context: context.operation, stage: 'retry', message: `第 ${attempt} 次临时失败，${Math.ceil(wait / 1000)} 秒后重试（${attempt + 1}/3）` });
+                await delay(wait);
+            }
+        }
+        return { outcome: 'unknown' };
     }
 
     function gmRequest(details) {
@@ -1009,7 +1373,23 @@
                 return;
             }
             const method = details.method || 'GET';
+            const debugContext = details.debugContext || requestContextForUrl(details.url);
+            if (!isOperationCurrent(debugContext?.operation)) { reject(signRequestError('cancelled', '本次任务已重置')); return; }
+            const action = isSignActionRequest(details.url, method);
+            if (action && debugContext) { debugContext.submitted = true; markPendingAutoCloseAfterSignAction(debugContext.siteKey, 'request'); }
             const startedAt = Date.now();
+            let settled = false;
+            let request;
+            const finish = (error, response) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeoutId);
+                if (error) reject(error); else resolve(response);
+            };
+            const timeoutId = setTimeout(() => {
+                finish(signRequestError('timeout', '请求超时'));
+                request?.abort?.();
+            }, details.timeout || REQUEST_TIMEOUT_MS);
             const debugEntry = addSignDebugEntry({
                 type: 'gmRequest',
                 method,
@@ -1018,9 +1398,10 @@
                 requestBody: debugBodyToText(details.data),
                 responseType: details.responseType || 'text',
                 status: 'pending'
-            }, details.debugContext || activeSignDebugContext);
-            GM_xmlhttpRequest({
+            }, debugContext);
+            try { request = GM_xmlhttpRequest({
                 method,
+                timeout: details.timeout || REQUEST_TIMEOUT_MS,
                 url: details.url,
                 headers: details.headers || {},
                 data: details.data,
@@ -1028,6 +1409,7 @@
                 anonymous: false,
                 withCredentials: true,
                 onload: (response) => {
+                    if (settled) return;
                     if (debugEntry) {
                         debugEntry.status = response.status;
                         debugEntry.finalUrl = sanitizeDebugUrl(response.finalUrl || details.url);
@@ -1035,7 +1417,8 @@
                         debugEntry.response = getDebugGmResponseText(response);
                         debugEntry.durationMs = Date.now() - startedAt;
                     }
-                    resolve(response);
+                    const error = classifyHttpResponse(response.status, getDebugGmResponseText(response), response.responseHeaders, response.finalUrl || details.url);
+                    finish(error, response);
                 },
                 onerror: (err) => {
                     if (debugEntry) {
@@ -1043,7 +1426,7 @@
                         debugEntry.error = stringifyDebugError(err);
                         debugEntry.durationMs = Date.now() - startedAt;
                     }
-                    reject(err);
+                    finish(signRequestError('network', '网络请求失败'));
                 },
                 ontimeout: (err) => {
                     if (debugEntry) {
@@ -1051,13 +1434,60 @@
                         debugEntry.error = stringifyDebugError(err);
                         debugEntry.durationMs = Date.now() - startedAt;
                     }
-                    reject(err);
-                }
-            });
+                    finish(signRequestError('timeout', '请求超时'));
+                },
+                onabort: () => finish(signRequestError('cancelled', '请求已取消'))
+            }); } catch (err) { finish(signRequestError('network', stringifyDebugError(err))); }
         });
     }
 
-    async function debugPageFetch(label, fetchFn, url, options = {}, debugContext = activeSignDebugContext) {
+    function signRequestError(reasonCode, message, retryAfterMs = 0) {
+        return Object.assign(new Error(message), { reasonCode, retryAfterMs, retryable: ['network', 'timeout', 'temporary'].includes(reasonCode) });
+    }
+
+    function classifyHttpResponse(status, text = '', headers = '', finalUrl = '') {
+        if (/Just a moment|Enable JavaScript and cookies to continue/i.test(text)) return signRequestError('captcha', '站点要求前台完成人工验证');
+        if (status === 401 || /\/(?:login|sign_in)(?:[/?#]|$)|[?&](?:mod=logging&action=login|action=login)(?:&|$)/i.test(finalUrl)) return signRequestError('login', '登录状态已失效，请先登录');
+        if (status === 403) return signRequestError(/cloudflare|challenge|captcha/i.test(text) ? 'captcha' : 'permission', '访问受限，请前台检查验证或权限');
+        if (status === 429 || status >= 500) {
+            const value = String(headers).match(/retry-after:\s*([^\r\n]+)/i)?.[1] || '';
+            const seconds = /^\d+$/.test(value) ? Number(value) * 1000 : Math.max(0, new Date(value).getTime() - Date.now());
+            return signRequestError('temporary', `站点暂时不可用（HTTP ${status}）`, Math.min(60000, seconds || 0));
+        }
+        if (status >= 400) return signRequestError('adaptation', `请求失败（HTTP ${status}），请检查站点适配`);
+        return null;
+    }
+
+    function isSignActionRequest(url, method) {
+        if (/getUserInfo|getMissionList/.test(url)) return false;
+        return method.toUpperCase() === 'POST' || /[?&](?:actions=job2?|ok=3|operation=qiandao)(?:&|$)|type=goSign/.test(url);
+    }
+
+    async function fetchBuffered(fetchFn, url, options, timeoutMs = REQUEST_TIMEOUT_MS) {
+        const Controller = typeof unsafeWindow !== 'undefined' && unsafeWindow.AbortController || (typeof AbortController !== 'undefined' ? AbortController : null);
+        const controller = Controller ? new Controller() : null;
+        let timeoutId;
+        try {
+            return await Promise.race([
+                (async () => {
+                    const response = await fetchFn(url, { ...options, signal: controller?.signal });
+                    const buffer = await response.arrayBuffer();
+                    const result = new Response([204, 205, 304].includes(response.status) ? null : buffer, { status: response.status, statusText: response.statusText, headers: response.headers });
+                    Object.defineProperty(result, 'url', { value: response.url || String(url) });
+                    const error = classifyHttpResponse(response.status, await result.clone().text(), [...response.headers].map(([k, v]) => `${k}: ${v}`).join('\n'), response.url || String(url));
+                    if (error) throw error;
+                    return result;
+                })(),
+                new Promise((resolve, reject) => {
+                    timeoutId = setTimeout(() => { reject(signRequestError('timeout', '页面请求或响应体读取超时')); controller?.abort(); }, timeoutMs);
+                })
+            ]);
+        } finally { clearTimeout(timeoutId); }
+    }
+
+    async function debugPageFetch(label, fetchFn, url, options = {}, debugContext = requestContextForUrl(url)) {
+        if (!isOperationCurrent(debugContext?.operation)) throw signRequestError('cancelled', '本次任务已重置');
+        if (isSignActionRequest(url, options.method || 'GET') && debugContext) { debugContext.submitted = true; markPendingAutoCloseAfterSignAction(debugContext.siteKey, 'request'); }
         const startedAt = Date.now();
         const method = options.method || 'GET';
         const debugEntry = addSignDebugEntry({
@@ -1071,7 +1501,7 @@
         }, debugContext);
 
         try {
-            const response = await fetchFn(url, options);
+            const response = await fetchBuffered(fetchFn, url, options);
             if (debugEntry) {
                 debugEntry.status = response.status;
                 debugEntry.ok = response.ok;
@@ -1090,6 +1520,7 @@
             }
             return response;
         } catch (err) {
+            if (!err.reasonCode) err = signRequestError('network', stringifyDebugError(err));
             if (debugEntry) {
                 debugEntry.status = 'error';
                 debugEntry.error = stringifyDebugError(err);
@@ -1102,6 +1533,18 @@
     function extractCdata(text) {
         const match = String(text || '').match(/<!\[CDATA\[([\s\S]*?)\]\]>/);
         return match ? match[1] : String(text || '');
+    }
+
+    function hasUserDailyRecord(html, uid, marker) {
+        if (!uid) return false;
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        return Array.from(doc.querySelectorAll('a[href*="uid="]')).some(link => {
+            try {
+                if (new URL(link.getAttribute('href'), location.href).searchParams.get('uid') !== String(uid)) return false;
+                const row = link.closest('tr, li, article, .sign-row');
+                return Boolean(row && marker.test(row.textContent || ''));
+            } catch (err) { return false; }
+        });
     }
 
     function readFormFieldsFromHtml(html, selector) {
@@ -1125,7 +1568,8 @@
         return params;
     }
 
-    async function runFeixueApiSign(debugContext) {
+    async function runFeixueApiSign(debugContext, checkOnly = false) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const modalRes = await gmRequest({
             url: 'https://feixueacg.org/plugin.php?id=dc_signin:sign&infloat=yes&handlekey=sign&inajax=1&ajaxtarget=fwin_content_sign',
             debugContext
@@ -1140,9 +1584,11 @@
             });
             return false;
         }
-        if (/已签到|已经签到|今日已/.test(modalHtml)) {
+        if (/(?:您|你)(?:今天|今日)?(?:已经|已)签到|(?:今日|今天)已签到(?!人数|用户)/.test(modalHtml)) {
             return completeSign('fxacg', '接口返回今日已签到');
         }
+
+        if (checkOnly) { debugContext.unsignedConfirmed = /您(?:今日|今天)(?:尚未|还未)签到/.test(modalHtml); return false; }
 
         const params = readFormFieldsFromHtml(modalHtml, '#signform');
         if (!params) {
@@ -1167,10 +1613,10 @@
         });
         const submitText = submitRes.responseText || '';
 
-        if (/签到成功|随机奖励|succeedhandle_signin/.test(submitText)) {
+        if (/签到成功|succeedhandle_signin/.test(submitText)) {
             return completeSign('fxacg', '接口返回签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
-        if (/已签到|已经签到|今日已/.test(submitText)) {
+        if (/(?:您|你)(?:今天|今日)?(?:已经|已)签到|(?:今日|今天)已签到(?!人数|用户)/.test(submitText)) {
             return completeSign('fxacg', '接口返回今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (/尚未登录|请先登录|member\.php\?mod=logging&action=login/.test(submitText)) {
@@ -1187,6 +1633,7 @@
     }
 
     async function runSouthPlusApiSign(debugContext) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         let completedByAction = false;
         const fetchTask = async (id) => {
             let res = await gmRequest({
@@ -1194,6 +1641,7 @@
                 debugContext
             });
             let text = res.responseText || '';
+            if (/请先登录|您还没有登录|尚未登录/.test(text)) { recordTargetStatus('southplus', 'needs-login', { stage: 'login', message: 'South-Plus 需要先登录账号' }); return false; }
             if (text.includes('还没超过')) {
                 console.log(`[南+] 任务${id} 刷新时间未到`);
                 return true;
@@ -1229,12 +1677,14 @@
     }
 
     async function runSlAsmrApiSign(debugContext) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const res = await gmRequest({
             method: 'POST',
             url: 'https://www.sl-asmr.com/api/mission/fast',
             debugContext
         });
         const text = res.responseText || '';
+        if (/请先登录|未登录|尚未登录/.test(text)) { recordTargetStatus('sl-asmr', 'needs-login', { stage: 'login', message: '夜世界需要先登录账号' }); return false; }
         if (text.includes('签到成功')) {
             return completeSign('sl-asmr', '接口返回签到成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
@@ -1245,7 +1695,8 @@
         return false;
     }
 
-    async function runKfpromaxApiSign(debugContext) {
+    async function runKfpromaxApiSign(debugContext, checkOnly = false) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const isKfpromaxPage = location.hostname === 'bbs.kfpromax.com';
         const decodePageText = (buffer, headers = '') => {
             const encoding = /gbk|gb2312/i.test(headers) ? 'gbk' : 'utf-8';
@@ -1311,6 +1762,8 @@
             return completeSign('kfpromax', '页面显示成长奖励已领取');
         }
 
+        if (checkOnly) { debugContext.unsignedConfirmed = isLoggedInPage(growthPage.text) && /kf_growup\.php\?ok=3(?:&amp;|&)safeid=/i.test(growthPage.text); return false; }
+
         const hrefMatch = growthPage.text.match(/href=["']([^"']*kf_growup\.php\?ok=3(?:&amp;|&)safeid=[^"']+)["']/i);
         const safeidMatch = growthPage.text.match(/kf_growup\.php\?ok=3(?:&amp;|&)safeid=([a-z0-9]+)/i);
         const signPath = hrefMatch?.[1]?.replace(/&amp;/g, '&') ||
@@ -1338,7 +1791,8 @@
         return false;
     }
 
-    async function runSijisheApiSign(debugContext) {
+    async function runSijisheApiSign(debugContext, checkOnly = false) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const requestText = async (url) => {
             const response = await gmRequest({
                 url: new URL(url, 'https://sjs96.com/').href,
@@ -1362,9 +1816,11 @@
             return false;
         }
 
-        if (/btnvisted|今日已签到|已经签到|您今日已经签到|已签到/.test(pageText)) {
+        if (/<[^>]+(?:class=["'][^"']*btnvisted|id=["']JD_sign["'][^>]*>[^<]*今日已签到)/i.test(pageText)) {
             return completeSign('sijishe', '页面显示今日已签到');
         }
+
+        if (checkOnly) { debugContext.unsignedConfirmed = /id=["']JD_sign["'][^>]*href=["'][^"']*operation=qiandao/i.test(pageText); return false; }
 
         const hrefMatch = pageText.match(/id=["']JD_sign["'][\s\S]*?href=["']([^"']+)["']/i) ||
             pageText.match(/href=["']([^"']*plugin\.php\?id=k_misign(?::|%3A)sign[^"']*operation=qiandao[^"']*)["']/i);
@@ -1380,13 +1836,12 @@
         await requestText(signUrl.href);
 
         const rankText = await requestText('https://sjs96.com/plugin.php?id=k_misign:sign&operation=list&inajax=1&ajaxtarget=ranklist');
-        const uidPattern = new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,500}${getToday()}`);
-        if (uidPattern.test(rankText)) {
+        if (hasUserDailyRecord(rankText, uid, new RegExp(getToday()))) {
             return completeSign('sijishe', '今日排行已确认签到记录', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
         const verifyText = await requestText('https://sjs96.com/k_misign-sign.html');
-        if (/btnvisted|今日已签到|已经签到|您今日已经签到|已签到/.test(verifyText)) {
+        if (/<[^>]+class=["'][^"']*btnvisted/i.test(verifyText)) {
             return completeSign('sijishe', '页面复查确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
@@ -1394,7 +1849,8 @@
         return false;
     }
 
-    async function runUuGgPageSign() {
+    async function runUuGgPageSign(debugContext, checkOnly = false) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         await delay(1200);
 
         const html = document.documentElement?.innerHTML || '';
@@ -1441,6 +1897,7 @@
         }
 
         if (!isSignPage) {
+            if (checkOnly) return false;
             window.location.href = 'https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign';
             return false;
         }
@@ -1468,14 +1925,13 @@
         const signedStateRe = /今天已签到|今日已签到|您今天已经签到|您今日已经签到/;
         const unsignedStateRe = /今天未签到|今日未签到/;
         const signSuccessMessageRe = /恭喜你签到成功|签到成功|获得随机奖励|获得[^<]*(?:叽币|奖励|积分)|已经签到过|签到过了|您今天已经签到|您今日已经签到/;
-        const hasCurrentUserSignedRowInHtml = (sourceHtml) => uid && new RegExp(`home\\.php\\?mod=space(?:&amp;|&)uid=${uid}[\\s\\S]{0,800}(?:今天已签到|已签到|${getToday()})`).test(sourceHtml);
+        const hasCurrentUserSignedRowInHtml = sourceHtml => hasUserDailyRecord(sourceHtml, uid, new RegExp(`今天已签到|已签到|${getToday()}`));
         const isConfirmedSignedPage = (text, sourceHtml) => {
             const serviceText = getSignServiceText(text);
             const hasUnsignedText = unsignedStateRe.test(serviceText);
             return !hasUnsignedText && (
                 signedStateRe.test(serviceText) ||
-                hasCurrentUserSignedRowInHtml(sourceHtml) ||
-                signSuccessMessageRe.test(text)
+                hasCurrentUserSignedRowInHtml(sourceHtml)
             );
         };
         const fetchVerifyPage = async (label) => {
@@ -1517,13 +1973,19 @@
         const hasCurrentUserUnsignedText = unsignedStateRe.test(signServiceText);
         const hasCurrentUserSignedText = signedStateRe.test(signServiceText);
         if (hasCurrentUserUnsignedText && getData('uugg') === getToday()) {
-            clearSignSuccess('uugg', '页面显示今天未签到，已清除错误的今日成功记录');
+            clearSignSuccess('uugg', '页面显示今天未签到，已清除错误的今日成功记录', debugContext?.operation);
         }
         const hasCurrentUserSignedRow = hasCurrentUserSignedRowInHtml(html);
-        const hasSignedMessage = signSuccessMessageRe.test(pageText);
+        const hasSignedMessage = signSuccessMessageRe.test(document.querySelector('#messagetext, #succeedlocation, .alert_right')?.textContent || '');
 
         if (!hasCurrentUserUnsignedText && (hasCurrentUserSignedText || hasCurrentUserSignedRow || hasSignedMessage)) {
             return completeSign('uugg', '页面确认今日已签到');
+        }
+
+        if (checkOnly) {
+            if (hasCurrentUserUnsignedText && (uid || hasLogoutLink)) { debugContext.unsignedConfirmed = true; return false; }
+            const verified = await verifySignedAfterSubmit(1);
+            return verified.confirmed ? completeSign('uugg', '复查确认今日已签到') : false;
         }
 
         if (signForm && !uuGgPageSubmitAttempted) {
@@ -1619,7 +2081,8 @@
         return false;
     }
 
-    async function runAcgndogApiSign() {
+    async function runAcgndogApiSign(debugContext, checkOnly = false) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const checkAction = 'd2e5b56b75e2f3d4ab412a6d9561faee';
         const signAction = '5ced0113734a2bc46ecf3f30b0685b7b';
         const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
@@ -1678,6 +2141,8 @@
         if (isSignedPayload(checkJson)) {
             return completeSign('acgndog', '接口返回今日已签到');
         }
+
+        if (checkOnly) { const value = checkJson.customPointSignDaily?.signed ?? checkJson.data?.customPointSignDaily?.signed; debugContext.unsignedConfirmed = [false, 0, '0', 'false'].includes(value); return false; }
 
         const signText = await requestText(
             `https://www.acgndog.com/wp-admin/admin-ajax.php?_nonce=${encodeURIComponent(checkJson._nonce)}&action=${signAction}&type=goSign`,
@@ -1818,22 +2283,16 @@
         return `${y}-${m}-${day}` === getToday();
     }
 
-    async function runVikApiSign() {
+    async function runVikApiSign(debugContext, checkOnly = false) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         if (!location.href.includes('wallet/mission')) {
+            if (checkOnly) return false;
             console.log('[维咔] 前往任务页');
             window.location.href = '/wallet/mission';
             return false;
         }
 
         const authTokens = getVikAuthTokens();
-        if (!authTokens.length) {
-            recordTargetStatus('vik', 'needs-login', {
-                stage: 'login',
-                message: '维咔需要先登录账号，或前台打开一次任务页刷新登录凭据',
-                url: location.href
-            });
-            return false;
-        }
 
         const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
             ? unsafeWindow.fetch.bind(unsafeWindow)
@@ -1852,12 +2311,16 @@
                 headers.Authorization = authToken;
             }
             const requestUrl = `https://www.vikacg.com/api/vikacg/v1/${path}`;
-            const res = await debugPageFetch(`vik-${path}`, pageFetch, requestUrl, {
-                method: 'POST',
-                credentials: 'include',
-                headers,
-                body: JSON.stringify(payload)
-            });
+            let res;
+            try {
+                res = await debugPageFetch(`vik-${path}`, pageFetch, requestUrl, {
+                    method: 'POST', credentials: 'include', headers, body: JSON.stringify(payload)
+                });
+            } catch (err) {
+                // 单个旧令牌的 HTTP 401 不能中断其他令牌及 Cookie 的验证。
+                if (err.reasonCode === 'login') return { status: 'error', code: 401, message: err.message };
+                throw err;
+            }
             const text = await res.text();
             try {
                 return JSON.parse(text || '{}');
@@ -1884,13 +2347,14 @@
             userInfo = candidateUserInfo;
             break;
         }
-        if ((!userInfo || userInfo.status !== 'success' || !userInfo.data?.basic?.id) && lastAuthError) {
+        if (!userInfo || userInfo.status !== 'success' || !userInfo.data?.basic?.id) {
             const cookieUserInfo = await requestApi('getUserInfo', { detail: true }, '');
             if (cookieUserInfo?.status === 'success' && cookieUserInfo.data?.basic?.id) {
                 authToken = '';
                 userInfo = cookieUserInfo;
                 lastAuthError = null;
-            }
+            } else if (isVikAuthError(cookieUserInfo)) lastAuthError = cookieUserInfo;
+            else userInfo = cookieUserInfo;
         }
         if (!userInfo || userInfo.status !== 'success' || !userInfo.data?.basic?.id) {
             if (lastAuthError || isVikAuthError(userInfo)) {
@@ -1908,6 +2372,8 @@
         if (isVikTodayTimestamp(userInfo.data?.credit?.sign_time)) {
             return completeSign('vik', '接口返回今日已签到');
         }
+
+        if (checkOnly) { debugContext.unsignedConfirmed = Number.isFinite(Number(userInfo.data?.credit?.sign_time)) && userInfo.data?.credit?.sign_time !== undefined; return false; }
 
         const signJson = await requestApi('userMission', {}, authToken);
         if (isVikAuthError(signJson)) {
@@ -1955,7 +2421,7 @@
     }
 
     function isGalgameXNewSignedText(text) {
-        return /今日已签到|今日已完成|今天已签到|已完成今日签到/.test(String(text || ''));
+        return /今日已签到|今天已签到|已完成今日签到/.test(String(text || ''));
     }
 
     function getGalgameXNewSignedText() {
@@ -1964,11 +2430,11 @@
             .map(btn => (btn.innerText || btn.textContent || '').trim())
             .find(text => isGalgameXNewSignedText(text));
         if (taskButtonText) return taskButtonText;
-        const match = bodyText.match(/今日已签到|今日已完成|今天已签到|已完成今日签到/);
-        return match ? match[0] : '';
+        return '';
     }
 
     async function runGalgameXNewApiSign(debugContext) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const res = await gmRequest({
             method: 'POST',
             url: 'https://www.galgamex.net/api/user/checkin',
@@ -1987,6 +2453,7 @@
 
         if (text.includes('randomMoemoepoints')) {
             const json = JSON.parse(text);
+            if (json.success === false || ['error', 'failed'].includes(json.status) || !Number.isFinite(Number(json.randomMoemoepoints))) return false;
             return completeSign('galGameXNew', `签到成功，获得 ${json.randomMoemoepoints} 萌点`, CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
         if (text.includes('您今天已经签到过了')) {
@@ -2006,7 +2473,7 @@
                 Object.prototype.hasOwnProperty.call(pointResult, 'totalPoints')
             );
 
-            if (hasNewCheckinResult && res.status >= 200 && res.status < 300) {
+            if (hasNewCheckinResult && json.success !== false && !['error', 'failed'].includes(json.status) && (json.code === undefined || json.code === 0 || json.code === 200) && res.status >= 200 && res.status < 300) {
                 const exp = Number(data.exp || 0);
                 const points = Number(pointResult.points || 0);
                 const gained = [];
@@ -2025,37 +2492,21 @@
         return false;
     }
 
-    async function runFufugalPageSign() {
-        const extractResultText = (text) => {
-            const source = String(text || '');
-            const reportMatch = source.match(/寻宝报告[\s\S]{0,700}(?:确定|$)/);
-            if (reportMatch) return reportMatch[0].trim();
-            const doneMatch = source.match(/今日已完成寻宝[^\n。]*(?:[。！!])?/);
-            if (doneMatch) return doneMatch[0].trim();
-            const scoreMatch = source.match(/(?:最终携带回了|携带回了)[^\n]*积分/);
-            return scoreMatch ? scoreMatch[0].trim() : '';
-        };
-        const getNoticeText = () => {
-            const texts = Array.from(document.querySelectorAll('.el-notification__content, .el-message__content, [role="dialog"]'))
-                .map(node => extractResultText(node.innerText || node.textContent) || (node.innerText || node.textContent || '').trim())
-                .filter(Boolean);
-            const bodyResultText = extractResultText(document.body?.innerText || '');
-            if (bodyResultText && !texts.includes(bodyResultText)) texts.push(bodyResultText);
-            return texts.join('\n');
-        };
+    async function runFufugalPageSign(debugContext) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
+        const getNoticeText = getFufugalNotice;
         const waitForNoticeText = async (beforeText = '', timeout = 5000) => {
             const startedAt = Date.now();
             let lastText = '';
             while (Date.now() - startedAt < timeout) {
                 const text = getNoticeText();
-                if (text && text !== beforeText) return text;
+                if (text && text !== beforeText && (isSuccessText(text) || isLoginText(text) || isFailureText(text))) return text;
                 if (text) lastText = text;
                 await delay(250);
             }
             return lastText;
         };
-        const isAlreadyDoneText = (text) => /今日已完成寻宝|请明日再来|今日已.*寻宝|已经.*寻宝|明天再来/.test(text);
-        const isSuccessText = (text) => isAlreadyDoneText(text) || /寻宝报告|寻宝成功|寻宝结束|休息状态|(?:最终携带回了|携带回了)[^\n]*积分|获得[^\n]*积分|等级提升|成功/.test(text);
+        const isSuccessText = isFufugalConfirmed;
         const isLoginText = (text) => /请先登录|登录后|登陆后|未登录|未登陆/.test(text);
         const isFailureText = (text) => /失败|错误|异常|无法|请稍后|error/i.test(text);
 
@@ -2071,6 +2522,11 @@
             return false;
         }
 
+        const beforeNoticeText = getNoticeText();
+        if (isSuccessText(beforeNoticeText)) {
+            return completeSign('fufugal', beforeNoticeText);
+        }
+
         const btn = await waitForElement(
             '#photo_wrap > figure > div.user-infos > div.xbs.el-tooltip__trigger.el-tooltip__trigger, #photo_wrap .user-infos .xbs',
             5000
@@ -2080,11 +2536,7 @@
             return false;
         }
 
-        const beforeNoticeText = getNoticeText();
-        if (isAlreadyDoneText(beforeNoticeText)) {
-            return completeSign('fufugal', beforeNoticeText);
-        }
-
+        if (!markPendingAutoCloseAfterSignAction('fufugal', 'hunt-click')) return false;
         btn.click();
         console.log('执行寻宝(签到)点击');
         const noticeText = await waitForNoticeText(beforeNoticeText);
@@ -2107,12 +2559,8 @@
             });
             return false;
         }
-        if ((btn.innerText || '').includes('寻宝')) {
-            return completeSign('fufugal', '已点击寻宝按钮，未检测到异常提示', CLOSE_PAGE_AFTER_SIGN_ACTION);
-        }
-
-        console.log('[初音的青葱] 寻宝按钮点击后未识别站点提示', noticeText);
-        return completeSign('fufugal', '寻宝按钮状态已确认', CLOSE_PAGE_AFTER_SIGN_ACTION);
+        recordTargetStatus('fufugal', 'result-unknown', { stage: 'verify', message: '寻宝已点击但结果未确认，请重新检查' });
+        return false;
     }
 
     function isSehuatangSignPage() {
@@ -2130,26 +2578,26 @@
         };
     }
 
-    function monitorSehuatangManualSign() {
+    function monitorSehuatangManualSign(debugContext) {
         const container = document.querySelector('.ddpc_sign_btna');
         if (!container || container.dataset.bbsSignMonitor === '1') return;
-
+        const operation = debugContext?.operation || pageOperations.get('sehuatang') || captureOperation('sehuatang');
+        const actions = taskActions({ operation });
         container.dataset.bbsSignMonitor = '1';
+        let timeout;
+        const stop = () => { observer.disconnect(); clearTimeout(timeout); delete container.dataset.bbsSignMonitor; pageObserverStops.delete(stop); };
         const observer = new MutationObserver(() => {
+            if (!isOperationCurrent(operation)) { stop(); return; }
             if (!getSehuatangSignControlState().isSigned) return;
-            observer.disconnect();
-            completeSign('sehuatang', '页面显示今日已签到');
+            stop(); actions.completeSign('sehuatang', '页面显示今日已签到');
         });
-        observer.observe(container, {
-            attributes: true,
-            attributeFilter: ['class', 'id'],
-            childList: true,
-            characterData: true,
-            subtree: true
-        });
+        observer.observe(container, { attributes: true, attributeFilter: ['class', 'id'], childList: true, characterData: true, subtree: true });
+        timeout = setTimeout(stop, AUTO_CLOSE_PENDING_TTL_MS);
+        pageObserverStops.add(stop);
     }
 
-    async function runSehuatangPageSign() {
+    async function runSehuatangPageSign(debugContext) {
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
         if (!isSehuatangSignPage()) {
             recordTargetStatus('sehuatang', 'needs-foreground', {
                 stage: 'prerequisite',
@@ -2165,7 +2613,7 @@
             return completeSign('sehuatang', '页面显示今日已签到');
         }
         if (signState.canSign) {
-            monitorSehuatangManualSign();
+            monitorSehuatangManualSign(debugContext);
             recordTargetStatus('sehuatang', 'needs-foreground', {
                 stage: 'captcha',
                 message: '请手动点击签到并完成验证码，成功后脚本会自动识别',
@@ -2207,225 +2655,8 @@
                 resultMode: "script",
                 note: "富文本回帖流程对后台标签较敏感"
             },
-            async run() {
-                // 1. 登录检查
-                const isLogin = !document.querySelector('a[data-role="login"]') && !document.body.innerText.includes("现有用户? 登入");
-                if (!isLogin) {
-                    console.log('[签到助手] SS同盟：检测到未登录，等待用户手动登录...');
-                    recordTargetStatus('sstm', 'needs-login', {
-                        stage: 'login',
-                        message: 'SS同盟需要先登录账号',
-                        url: location.href
-                    });
-                    return false;
-                }
-
-                const now = new Date();
-                const year = now.getFullYear();
-                const month = now.getMonth() + 1;
-                const date = now.getDate();
-                const dateStr = `【${year}/${month}/${date}】`;
-
-                // 2. 如果在签到区列表页，寻找今日贴
-                if (location.href.includes('/forum/72-')) {
-                    // 使用更通用的选择器，不再依赖 data-role="canEditTitle"
-                    const threadLinks = document.querySelectorAll('.ipsDataItem_title a, a[href*="/topic/"]');
-                    console.log(`[签到助手] 发现 ${threadLinks.length} 个可能的帖子链接，正在匹配：${dateStr}`);
-
-                    for (const a of threadLinks) {
-                        const title = a.innerText.trim();
-                        if (title.includes("签到") && title.includes(dateStr)) {
-                            console.log('[签到助手] 成功匹配今日贴：' + title);
-                            recordTargetStatus('sstm', 'opened', {
-                                stage: 'find-thread',
-                                message: '已找到今日签到贴，正在进入帖子',
-                                url: a.href
-                            });
-                            window.location.href = a.href;
-                            return false;
-                        }
-                    }
-
-                    // 如果还是没找到，尝试模糊匹配（不带中括号的日期）
-                    const fuzzyDateStr = `${year}/${month}/${date}`;
-                    for (const a of threadLinks) {
-                        const title = a.innerText.trim();
-                        if (title.includes("版主招募区签到") && title.includes(fuzzyDateStr)) {
-                            console.log('[签到助手] 模糊匹配成功：' + title);
-                            recordTargetStatus('sstm', 'opened', {
-                                stage: 'find-thread',
-                                message: '已模糊匹配今日签到贴，正在进入帖子',
-                                url: a.href
-                            });
-                            window.location.href = a.href;
-                            return false;
-                        }
-                    }
-
-                    console.log('[签到助手] 未找到包含 ' + dateStr + ' 的今日贴。尝试刷新页面或手动检查。');
-                    recordTargetStatus('sstm', 'failed', {
-                        stage: 'find-thread',
-                        message: `未找到 ${dateStr} 的今日签到贴`,
-                        url: location.href
-                    });
-                    return false;
-                }
-
-                // 3. 如果在帖子详情页，执行回帖
-                if (location.href.includes('/topic/')) {
-                    // 校验是否为今日贴，防止跑错帖子
-                    const pageTitle = document.querySelector('h1.ipsType_pageTitle')?.innerText || "";
-                    if (!pageTitle.includes(dateStr) && !pageTitle.includes(`${year}/${month}/${date}`)) {
-                        console.log('[签到助手] 当前帖子日期不匹配，跳转到签到区寻找新帖...');
-                        recordTargetStatus('sstm', 'opened', {
-                            stage: 'navigate',
-                            message: '当前帖子不是今日签到贴，正在返回签到区',
-                            url: location.href
-                        });
-                        window.location.href = "https://sstm.moe/forum/72-%E5%90%8C%E7%9B%9F%E7%AD%BE%E5%88%B0%E5%8C%BA/";
-                        return false;
-                    }
-
-                    // 构建回复内容：2026年4月16日 21:02:16
-                    const timeString = `${year}年${month}月${date}日 ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
-
-                    // 改进防重复校验：必须是当前登录用户在今天发表的回帖，防止被其他包含日期的回帖误导
-                    let hasSignedToday = false;
-                    const currentUserLink = document.querySelector('#elUserLink');
-                    const currentUserName = currentUserLink ? currentUserLink.textContent.trim() : '';
-                    const currentUserUrl = currentUserLink ? currentUserLink.href.split('?')[0].replace(/\/$/, '') : '';
-
-                    const comments = document.querySelectorAll('article.ipsComment, [data-role="commentFeed"] article');
-                    for (const comment of comments) {
-                        const authorLink = comment.querySelector('aside.cAuthorPane h3 a, .cAuthorPane_author a, .ipsComment_author a');
-                        const authorName = authorLink ? authorLink.textContent.trim() : '';
-                        const authorUrl = authorLink ? authorLink.href.split('?')[0].replace(/\/$/, '') : '';
-
-                        const isMyComment = (authorUrl && currentUserUrl && authorUrl === currentUserUrl) ||
-                                            (authorName && currentUserName && authorName === currentUserName);
-
-                        if (isMyComment) {
-                            const contentEl = comment.querySelector('.ipsComment_content, [data-role="commentContent"]') || comment;
-                            if (contentEl.innerText.includes(`${year}年${month}月${date}日`)) {
-                                hasSignedToday = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if (hasSignedToday) {
-                        console.log('[签到助手] 评论区已检测到您今日的回帖，判定为签到成功。');
-                        return completeSign('sstm', '评论区已检测到今日回帖', CLOSE_PAGE_AFTER_SIGN_ACTION);
-                    } else if (!currentUserLink) {
-                        // 兼容极端情况：如果未能获取到当前用户信息，降级为检查严格的日期时间格式
-                        const commentsArea = document.querySelector('[data-role="commentFeed"]');
-                        const strictDateRegex = new RegExp(`${year}年${month}月${date}日\\s+\\d{2}:\\d{2}:\\d{2}`);
-                        if (commentsArea && strictDateRegex.test(commentsArea.innerText)) {
-                            console.log('[签到助手] 评论区检测到严格符合格式的回帖（防误判降级），判定为签到成功。');
-                            return completeSign('sstm', '评论区检测到今日回帖格式', CLOSE_PAGE_AFTER_SIGN_ACTION);
-                        }
-                    }
-
-                    const retryCount = GM_getValue('sstm_retry_count', 0);
-                    if (retryCount >= 3) {
-                        alert("【签到助手】SS同盟签到连续3次失败，请检查回帖权限或是否被禁言！");
-                        GM_setValue('sstm_retry_count', 0);
-                        recordTargetStatus('sstm', 'needs-foreground', {
-                            stage: 'retry',
-                            message: 'SS同盟连续多次未完成，请前台检查回帖权限或禁言状态',
-                            url: location.href
-                        });
-                        return false;
-                    }
-
-                    console.log(`[签到助手] 准备回帖，当前重试次数：${retryCount}`);
-
-                    // 1. 强力激活编辑器
-                    const dummy = document.querySelector('.ipsComposeArea_dummy');
-                    if (dummy) {
-                        console.log('[签到助手] 发现占位符，执行强力激活...');
-                        dummy.focus();
-                        // 移除 view: window 以修复 TypeError
-                        const mousedownEvent = new MouseEvent('mousedown', { bubbles: true, cancelable: true });
-                        dummy.dispatchEvent(mousedownEvent);
-                        dummy.click();
-                        await delay(2000); // 给一点加载时间
-                    }
-
-                    // 2. 多策略寻找编辑器
-                    let editorField = await (async () => {
-                        // 策略 A: 直接找页面上可见的 contenteditable
-                        const editables = Array.from(document.querySelectorAll('[contenteditable="true"]'));
-                        for (let el of editables) {
-                            if (el.offsetWidth > 0 || el.offsetHeight > 0) return el;
-                        }
-
-                        // 策略 B: 找 iframe 内部
-                        const iframe = document.querySelector('iframe.cke_wysiwyg_frame, .ipsComposeArea iframe');
-                        if (iframe && iframe.contentDocument) return iframe.contentDocument.body;
-
-                        // 策略 C: 轮询等待（处理异步加载）
-                        return await waitForElement('[contenteditable="true"], .cke_wysiwyg_div', 5000);
-                    })();
-
-                    if (editorField) {
-                        console.log('[签到助手] 编辑器已定位，准备输入内容...');
-                        editorField.focus();
-
-                        // 确保清空并填入
-                        try {
-                            // 针对某些编辑器，直接赋值比 execCommand 更稳
-                            editorField.innerHTML = `<p>${timeString}</p>`;
-                            // 触发 input 事件通知编辑器内容已变
-                            editorField.dispatchEvent(new Event('input', { bubbles: true }));
-                        } catch (e) {
-                            document.execCommand('insertText', false, timeString);
-                        }
-
-                        await delay(1500);
-
-                        // 3. 多重策略寻找提交按钮
-                        const submitBtn = document.querySelector('button[type="submit"].ipsButton_primary, [data-action="submitReply"], .ipsComposeArea_submit button');
-                        if (submitBtn) {
-                            console.log('[签到助手] 点击提交按钮...');
-                            markPendingAutoCloseAfterSignAction('sstm', 'reply-submit');
-                            submitBtn.click();
-
-                            // 4. 等待并校验
-                            await delay(5000);
-                            const commentsArea = document.querySelector('[data-role="commentFeed"], #elPostFeed, .ipsType_richText');
-                            if (document.body.innerText.includes(timeString)) {
-                                console.log('[签到助手] 校验成功！');
-                                GM_setValue('sstm_retry_count', 0);
-                                return completeSign('sstm', '回帖提交后已校验成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
-                            }
-                        }
-                    }
-
-                    console.log('[签到助手] 编辑器或按钮未就绪，准备刷新重试...');
-                    recordTargetStatus('sstm', 'needs-foreground', {
-                        stage: 'editor',
-                        message: '编辑器或提交按钮未就绪，建议保持页面前台后重试',
-                        url: location.href,
-                        incrementAttempt: true
-                    });
-                    GM_setValue('sstm_retry_count', retryCount + 1);
-                    location.reload();
-                    return false;
-                }
-
-                // 4. 如果在主域首页或其他页面，引导至签到区
-                if (location.hostname === 'sstm.moe' && !location.href.includes('/forum/72-') && !location.href.includes('/topic/')) {
-                    console.log('[签到助手] 自动前往签到区...');
-                    recordTargetStatus('sstm', 'opened', {
-                        stage: 'navigate',
-                        message: '已打开 SS同盟，正在前往签到区',
-                        url: location.href
-                    });
-                    window.location.href = "https://sstm.moe/forum/72-%E5%90%8C%E7%9B%9F%E7%AD%BE%E5%88%B0%E5%8C%BA/";
-                }
-
-                return false;
+            async run(debugContext) {
+                return await runSstmPageSign(debugContext);
             }
         },
         {
@@ -2437,7 +2668,8 @@
                 openMode: "background",
                 resultMode: "script"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 if (!location.href.includes('k_misign:sign')) {
                     if (!$('#ls_username').length) {
                         window.location.href = "plugin.php?id=k_misign:sign";
@@ -2450,9 +2682,10 @@
                     console.log('已签到!');
                     return completeSign('wcccc', '页面显示今日已签到');
                 } else if (btnSign) {
+                    if (!markPendingAutoCloseAfterSignAction('wcccc', 'sign-click')) return false;
                     btnSign.click();
-                    console.log('签到成功!');
-                    return completeSign('wcccc', '已点击签到按钮', CLOSE_PAGE_AFTER_SIGN_ACTION);
+                    recordTargetStatus('wcccc', 'result-unknown', { stage: 'verify', message: '已点击签到，等待站点确认' });
+                    return false;
                 }
                 return false;
             }
@@ -2467,7 +2700,8 @@
                 resultMode: "script",
                 note: "签到提交需要站点点击验证，需前台完成"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 const bodyText = document.body?.innerText || '';
                 const isLoginPage = /member\.php\?mod=logging(?:&|&amp;)action=login/i.test(location.href) ||
                     /登录老王论坛|立即登录|用户名|找回密码/.test(bodyText);
@@ -2486,9 +2720,7 @@
                 }
 
                 const isSigned = () => {
-                    const text = document.body?.innerText || '';
-                    return Boolean(document.querySelector('.btnvisted')) ||
-                        /签到成功|恭喜你签到成功|今日已签到|您今日已经签到|已经签到/.test(text);
+                    return Boolean(document.querySelector('.qdleft .btnvisted, #JD_sign.btnvisted, .btnvisted'));
                 };
                 if (isSigned()) {
                     return completeSign('laowang', '页面显示今日已签到');
@@ -2533,7 +2765,7 @@
 
                 const btn = await waitForElement('a[href*="operation=qiandao"], #JD_sign, .qdleft a.btn', 5000);
                 if (btn && !captchaMonitor.submitted) {
-                    markPendingAutoCloseAfterSignAction('laowang', 'sign-click');
+                    if (!markPendingAutoCloseAfterSignAction('laowang', 'sign-click')) return false;
                     btn.click();
                     console.log('[老王论坛] 已点击签到按钮，等待验证和结果确认...');
 
@@ -2569,11 +2801,13 @@
                 note: "支持控制台 API 直签"
             },
             directRun: runFeixueApiSign,
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 try {
-                    return await runFeixueApiSign();
+                    return await runFeixueApiSign(debugContext);
                 } catch (err) {
                     console.log('[飞雪论坛] API 签到异常', err);
+                    throw err;
                 }
                 return false;
             }
@@ -2589,8 +2823,9 @@
                 note: "支持控制台 API 直签"
             },
             directRun: runSouthPlusApiSign,
-            async run() {
-                return await runSouthPlusApiSign();
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
+                return await runSouthPlusApiSign(debugContext);
             }
         },
         {
@@ -2603,7 +2838,8 @@
                 resultMode: "script",
                 note: "签到提交需要验证码校验，需前台完成"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 if (/^\/login\/?$/.test(location.pathname) || location.href.includes('not_authenticated') ||
                     location.href.includes('sign_in') || document.querySelector('a[href="/login"]')) {
                     recordTargetStatus('2dfan', 'needs-login', {
@@ -2659,7 +2895,7 @@
                     if (!getCaptchaDialog() && !captchaMonitor.dialogOpened && !btn.disabled &&
                         btn.textContent.trim() === '签到') {
                         captchaMonitor.dialogOpened = true;
-                        markPendingAutoCloseAfterSignAction('2dfan', 'sign-click');
+                        if (!markPendingAutoCloseAfterSignAction('2dfan', 'sign-click')) return false;
                         btn.click();
                     }
                     recordTargetStatus('2dfan', 'needs-foreground', {
@@ -2674,9 +2910,9 @@
                     const signFlag = document.querySelector('#checkin');
                     const signFlag2 = document.querySelector('.checkin-info .pull-right');
                     const bodyText = document.body?.innerText || '';
-                    return (signFlag && /已签到|已连续签到/.test(signFlag.innerText)) ||
-                        (signFlag2 && /已签到|已连续签到/.test(signFlag2.innerText)) ||
-                        /已连续签到|今日已签到/.test(bodyText);
+                    return (signFlag && /今日已签到|今天已签到/.test(signFlag.innerText)) ||
+                        (signFlag2 && /今日已签到|今天已签到/.test(signFlag2.innerText)) ||
+                        false;
                 };
 
                 if (isSigned()) {
@@ -2718,7 +2954,7 @@
                         return false;
                     }
 
-                    markPendingAutoCloseAfterSignAction('2dfan', 'sign-click');
+                    if (!markPendingAutoCloseAfterSignAction('2dfan', 'sign-click')) return false;
                     btn.click();
                     console.log('[2dfan] 已点击签到按钮，等待页面验证和结果确认...');
 
@@ -2751,8 +2987,9 @@
                 note: "支持控制台 API 直签"
             },
             directRun: runSlAsmrApiSign,
-            async run() {
-                return await runSlAsmrApiSign();
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
+                return await runSlAsmrApiSign(debugContext);
             }
         },
         {
@@ -2765,11 +3002,13 @@
                 resultMode: "script",
                 note: "后台打开页面后自动 API 签到"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 try {
-                    return await runAcgndogApiSign();
+                    return await runAcgndogApiSign(debugContext);
                 } catch (err) {
                     console.log('[次元狗] API 签到异常', err);
+                    throw err;
                 }
                 return false;
             }
@@ -2785,16 +3024,18 @@
                 note: "支持控制台 API 直签"
             },
             directRun: runKfpromaxApiSign,
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 if (!location.href.includes('kf_growup.php')) {
                     window.location.href = 'kf_growup.php';
                     return false;
                 }
 
                 try {
-                    return await runKfpromaxApiSign();
+                    return await runKfpromaxApiSign(debugContext);
                 } catch (err) {
                     console.log('[绯月] API 签到异常', err);
+                    throw err;
                 }
                 return false;
             }
@@ -2809,11 +3050,13 @@
                 resultMode: "script",
                 note: "后台打开任务页后自动 API 签到"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 try {
-                    return await runVikApiSign();
+                    return await runVikApiSign(debugContext);
                 } catch (err) {
                     console.log('[维咔] API 签到异常', err);
+                    throw err;
                 }
                 return false;
             }
@@ -2829,11 +3072,13 @@
                 note: "支持控制台 API 直签"
             },
             directRun: runSijisheApiSign,
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 try {
-                    return await runSijisheApiSign();
+                    return await runSijisheApiSign(debugContext);
                 } catch (err) {
                     console.log('[司机社] API 签到异常', err);
+                    throw err;
                 }
                 return false;
             }
@@ -2848,8 +3093,9 @@
                 resultMode: "script",
                 note: "后台打开签到页后由页面内 API 提交，Cloudflare 验证需前台完成"
             },
-            async run() {
-                return await runUuGgPageSign();
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
+                return await runUuGgPageSign(debugContext);
             }
         },
         {
@@ -2862,7 +3108,8 @@
                 resultMode: "script",
                 note: "登录访问即自动获得 2 银币"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 await delay(1000);
 
                 const getDiscuzUid = () => {
@@ -2904,7 +3151,8 @@
                 note: "新版站点登录后自动签到，脚本调用接口并复查状态"
             },
             directRun: runGalgameXNewApiSign,
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 await delay(1000);
 
                 const signedText = getGalgameXNewSignedText();
@@ -2913,9 +3161,10 @@
                 }
 
                 try {
-                    return await runGalgameXNewApiSign();
+                    return await runGalgameXNewApiSign(debugContext);
                 } catch (err) {
                     console.log('[GalgameX 新站] API 签到异常', err);
+                    throw err;
                 }
                 return false;
             }
@@ -2929,7 +3178,8 @@
                 openMode: "background",
                 resultMode: "script"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 if (!location.href.includes('plugin.php?id=dsu_paulsign:sign')&&!location.href.includes('member.php?mod=logging&action=login')) {
                     if (document.body.innerText.includes("签到")) { // 弱校验是否包含入口
                         window.location.href = "plugin.php?id=dsu_paulsign:sign";
@@ -2954,11 +3204,14 @@
                     if (say) say.value = "每天签到水一发。。。";
 
                     const form = document.querySelector('#qiandao');
-                    if (form) markPendingAutoCloseAfterSignAction('ZodGame', 'sign-form-submit');
-                    if (form) form.submit();
-                    markSignSuccess('ZodGame', '已提交签到表单');
-
-                    return true;
+                    if (!form) {
+                        recordTargetStatus('ZodGame', 'failed', { stage: 'form', reasonCode: 'adaptation', message: '未识别到签到表单，请前台检查' });
+                        return false;
+                    }
+                    if (!markPendingAutoCloseAfterSignAction('ZodGame', 'sign-form-submit')) return false;
+                    recordTargetStatus('ZodGame', 'result-unknown', { stage: 'verify', message: '已提交签到表单，等待结果页确认' });
+                    form.submit();
+                    return false;
                 }
                 return false;
             }
@@ -2973,9 +3226,10 @@
                 resultMode: "script",
                 note: "后台打开页面后点击寻宝按钮"
             },
-            async run() {
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
                 try {
-                    return await runFufugalPageSign();
+                    return await runFufugalPageSign(debugContext);
                 } catch (err) {
                     console.log('[初音的青葱] 页面寻宝异常', err);
                 }
@@ -2992,11 +3246,25 @@
                 resultMode: "script",
                 note: "需先回复 1 次，再手动进入签到页完成点选验证码；脚本只检测结果"
             },
-            async run() {
-                return await runSehuatangPageSign();
+            async run(debugContext) {
+                const { completeSign, recordTargetStatus } = taskActions(debugContext);
+                return await runSehuatangPageSign(debugContext);
             }
         }
     ];
+
+    function siteOutcome(site, context, value) {
+        const status = getRawTargetStatus(site.key);
+        const confirmed = status?.status === 'success' && isOperationCurrent(context?.operation) && (value === true || value?.outcome === 'success');
+        return { outcome: confirmed ? 'success' : status?.status === 'needs-login' ? 'needs-login' : status?.status === 'needs-foreground' ? 'needs-verification' : value?.outcome === 'not-completed' ? 'not-completed' : context?.submitted ? 'waiting-result' : status?.status === 'failed' ? 'adaptation-error' : 'unknown',
+            reasonCode: status?.reasonCode || '', message: status?.message || '未获得明确结果', evidence: confirmed ? status.evidence : '',
+            evidenceDate: context?.operation?.date || getToday(), submitted: context?.submitted === true };
+    }
+
+    for (const site of siteConfigs) {
+        site.check = async context => siteOutcome(site, context, await checkSiteResult(site, context));
+        site.execute = async (context, direct = false) => siteOutcome(site, context, await (direct ? site.directRun(context) : site.run(context)));
+    }
 
     // ================== 签到控制台数据与 UI ==================
 
@@ -3113,64 +3381,39 @@
             console.log(`[签到助手] ${key} 已由控制台关闭签到页面：${reason}`);
         } catch (err) {
             console.log(`[签到助手] ${key} 控制台关闭签到页面失败，可能是浏览器限制。`, err);
+            recordTargetStatus(key, 'success', { context: entry.operation, stage: 'close', message: `${reason}；自动关闭受限，请手动关闭对应页面` });
         }
         launchedAutoCloseTabs.delete(key);
     }
 
     function syncLaunchedAutoCloseTabs(targets = getAllTargets()) {
-        const config = getDashboardConfig();
-        const now = Date.now();
-
         for (const [key, entry] of launchedAutoCloseTabs) {
-            if (!config.preferences.autoClosePageAfterSign) {
+            const status = getRawTargetStatus(key);
+            const current = isOperationCurrent(entry.operation);
+            if (entry.tab?.closed || Date.now() - entry.openedAt > AUTO_CLOSE_PENDING_TTL_MS || !current) {
+                if (current && !isTargetDone(status?.status)) recordTargetStatus(key, 'result-unknown', {
+                    context: entry.operation, stage: 'page-recovery', reasonCode: 'page-ended', message: '页面已关闭或任务超期，请先重新检查结果'
+                });
+                finishTaskLease(entry.operation);
                 launchedAutoCloseTabs.delete(key);
                 continue;
             }
-            if (!entry?.tab || typeof entry.tab.close !== 'function') {
-                launchedAutoCloseTabs.delete(key);
-                continue;
-            }
-            if (entry.tab.closed || now - entry.openedAt > AUTO_CLOSE_PENDING_TTL_MS) {
-                launchedAutoCloseTabs.delete(key);
-                continue;
-            }
-
-            const target = targets.find(item => getLaunchedAutoCloseKey(item) === key);
-            if (!target) {
-                launchedAutoCloseTabs.delete(key);
-                continue;
-            }
-
-            const status = getNormalizedTargetStatus(target);
-            if (status.status === 'success') {
-                closeLaunchedAutoCloseTab(key, entry, status.message || '已确认签到成功');
+            if (status?.status === 'success' && status.taskId === entry.operation.taskId && status.confirmationSource === 'automatic') {
+                if (getDashboardConfig().preferences.autoClosePageAfterSign && typeof entry.tab?.close === 'function') {
+                    closeLaunchedAutoCloseTab(key, entry, '对应任务已自动确认成功');
+                } else launchedAutoCloseTabs.delete(key);
+                finishTaskLease(entry.operation);
             }
         }
-
         if (!launchedAutoCloseTabs.size) stopLaunchedAutoCloseMonitor();
     }
 
     function startLaunchedAutoCloseMonitor() {
-        if (launchedAutoCloseMonitorTimer) return;
-        launchedAutoCloseMonitorTimer = setInterval(() => {
-            syncLaunchedAutoCloseTabs();
-        }, 1000);
+        if (!launchedAutoCloseMonitorTimer) launchedAutoCloseMonitorTimer = setInterval(syncLaunchedAutoCloseTabs, 1000);
     }
 
-    function trackLaunchedAutoCloseTab(target, tab, beforeStatus) {
-        if (isTargetDone(beforeStatus)) return;
-        if (!target?.siteKey || !tab || typeof tab.close !== 'function') return;
-        if (!TRACK_LAUNCHED_AUTO_CLOSE_SITE_KEYS.has(target.siteKey)) return;
-        const config = getDashboardConfig();
-        if (!config.preferences.autoClosePageAfterSign) return;
-
-        const key = getLaunchedAutoCloseKey(target);
-        if (!key) return;
-        launchedAutoCloseTabs.set(key, {
-            tab,
-            openedAt: Date.now(),
-            url: target.url
-        });
+    function trackLaunchedAutoCloseTab(target, tab, operation) {
+        launchedAutoCloseTabs.set(target.id, { tab, operation, openedAt: Date.now(), url: target.url });
         startLaunchedAutoCloseMonitor();
     }
 
@@ -3182,111 +3425,154 @@
                 setParent: true
             });
         }
-        return window.open(url, openMode === 'foreground' ? '_self' : '_blank', 'noopener');
+        const tab = window.open(url, '_blank');
+        if (tab) { try { tab.opener = null; } catch (err) { /* 管理器可能限制句柄。 */ } }
+        return tab;
     }
 
-    function launchTarget(target) {
-        const beforeStatus = getNormalizedTargetStatus(target).status;
-        markPendingAutoCloseAfterDashboardLaunch(target);
-        const tab = openUrl(target.url, target.openMode);
-        trackLaunchedAutoCloseTab(target, tab, beforeStatus);
-        const message = target.resultMode === 'script'
-            ? '已打开，等待站点脚本确认签到结果'
-            : '已打开，等待手动确认签到结果';
-        recordTargetStatus(target.id, 'opened', {
-            stage: 'launch',
-            message,
-            url: target.url,
-            incrementAttempt: true
-        });
+    function showPageTaskInfo(target) {
+        const entry = launchedAutoCloseTabs.get(target.id);
+        if (typeof entry?.tab?.focus === 'function') { entry.tab.focus(); return; }
+        const lease = getTaskLease(target.id);
+        const dialog = el('dialog');
+        dialog.style.cssText = 'max-width:min(90vw,600px);z-index:2147483647';
+        dialog.append(el('h3', { text: `${target.name} · 当前任务` }),
+            el('p', { text: hasActiveTask(target.id) ? `已存在有效任务，期限至 ${new Date(lease.expiresAt).toLocaleTimeString()}。请切回已打开的 ${target.name} 标签页；当前管理器无法直接激活它。` : '当前没有有效任务，可从目标行重新检查或打开。' }),
+            el('p', { text: target.url }),
+            el('button', { text: '关闭', onClick: () => dialog.remove() }));
+        document.body.append(dialog); dialog.addEventListener('close', () => dialog.remove()); dialog.showModal();
     }
 
-    async function runDirectTargetOnce(target, site, attempt, totalAttempts) {
-        recordTargetStatus(target.id, 'running', {
-            stage: 'direct-api',
-            message: `正在从控制台发送 API 签到请求（${attempt}/${totalAttempts}）`,
-            url: target.url,
-            incrementAttempt: true
-        });
+    function releaseLegacyQueuedTask(key) {
+        const raw = getRawTargetStatus(key);
+        if (raw?.status !== 'queued') return;
+        const lease = getTaskLease(key);
+        if (lease) finishTaskLease(lease);
+        recordTargetStatus(key, 'not-started', { context: captureOperation(key), stage: 'queue-removed', message: '已取消旧排队，可立即执行' });
+    }
 
-        const debugContext = startSignDebugCapture(target.id, target.name, 'direct-api');
+    function launchTarget(target, checkOnly = false) {
+        releaseLegacyQueuedTask(target.id);
+        if (hasActiveTask(target.id)) return false;
+        const raw = getRawTargetStatus(target.id);
+        const manualCheck = raw?.stage === 'manual' && ['failed', 'skipped'].includes(raw.status);
+        if (manualCheck) checkOnly = true;
+        const operation = acquireTaskLease(target.id, 'page');
+        if (!operation) return false;
+        operation.checkOnly = checkOnly;
+        GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, target.id), { ...getTaskLease(target.id), checkOnly, checkOnlySource: manualCheck ? 'manual' : checkOnly ? 'explicit' : '', updatedAt: Date.now(), expiresAt: Date.now() + AUTO_CLOSE_PENDING_TTL_MS });
+        const url = new URL(target.url);
+        if (target.builtIn) url.searchParams.set('__bbs_task', operation.taskId);
         try {
-            const isSuccess = await site.directRun(debugContext);
-            if (!isSuccess) {
-                const status = getNormalizedTargetStatus(target);
-                const reason = status.status === 'running'
-                    ? {
-                        outcome: 'failed',
-                        status: 'failed',
-                        stage: 'direct-api',
-                        message: 'API 签到未返回成功标记'
-                    }
-                    : {
-                        outcome: 'failed',
-                        status: status.status,
-                        stage: status.stage || 'direct-api',
-                        message: status.message || '控制台直签未确认成功'
-                    };
-                return {
-                    isSuccess: false,
-                    debugContext,
-                    reason
-                };
-            }
-            return { isSuccess: true, debugContext, reason: null };
+            const tab = openUrl(url.href, target.openMode);
+            if (tab === null || (!tab && typeof GM_openInTab !== 'function')) throw new Error('浏览器拒绝打开页面');
+            trackLaunchedAutoCloseTab(target, tab, operation);
+            recordTargetStatus(target.id, 'opened', { context: operation, stage: 'launch', incrementAttempt: true, url: target.url,
+                message: typeof tab?.close === 'function' ? '已打开对应任务页面，等待确认' : '已请求打开；管理器无法跟踪关闭，请手动确认' });
+            return true;
         } catch (err) {
-            console.log(`[签到助手] ${target.name} 控制台直签异常`, err);
-            return {
-                isSuccess: false,
-                debugContext,
-                reason: {
-                    outcome: 'error',
-                    status: 'failed',
-                    stage: 'direct-api',
-                    message: stringifyDebugError(err)
-                }
-            };
-        } finally {
-            finishSignDebugCapture(debugContext);
+            recordTargetStatus(target.id, 'failed', { context: operation, reasonCode: 'open-failed', stage: 'launch', message: stringifyDebugError(err) });
+            finishTaskLease(operation);
+            return false;
         }
     }
 
-    async function runDirectTarget(target, onProgress) {
+    async function runDirectTargetOnce(target, site, operation, checkOnly = false) {
+        const debugContext = startSignDebugCapture(target.id, target.name, checkOnly ? 'check' : 'direct-api');
+        debugContext.operation = operation;
+        recordTargetStatus(target.id, 'running', { stage: checkOnly ? 'verify' : 'direct-api', context: operation, incrementAttempt: !checkOnly, message: checkOnly ? '正在重新检查签到结果' : '正在从控制台发送签到请求' });
+        try {
+            const result = checkOnly ? await site.check(debugContext) : await site.execute(debugContext, true);
+            if ((result === true || result?.outcome === 'success') && isOperationCurrent(operation) && getRawTargetStatus(target.id)?.status === 'success' && getRawTargetStatus(target.id)?.taskId === operation.taskId) return { isSuccess: true, debugContext };
+            const status = getRawTargetStatus(target.id);
+            if (checkOnly && result?.outcome === 'not-completed') return { isSuccess: false, debugContext, reason: { status: 'not-started', stage: 'verify', reasonCode: 'confirmed-unsigned', message: '已确认今日尚未完成，可再次执行签到', retryable: false } };
+            return { isSuccess: false, debugContext, reason: { status: ['needs-login', 'needs-foreground', 'failed'].includes(status?.status) ? status.status : debugContext.submitted || checkOnly ? 'result-unknown' : 'failed', stage: status?.stage || 'verify', message: status?.status === 'running' ? '本次未获得明确成功证据，请检查结果' : status?.message || '结果未确认', reasonCode: status?.reasonCode || (debugContext.submitted || checkOnly ? 'unknown' : 'adaptation'), retryable: false } };
+        } catch (error) {
+            const code = error.reasonCode || (error instanceof SyntaxError ? 'adaptation' : 'network');
+            return { isSuccess: false, debugContext, reason: { status: code === 'login' ? 'needs-login' : code === 'captcha' ? 'needs-foreground' : debugContext.submitted ? 'result-unknown' : 'failed', stage: 'request', message: stringifyDebugError(error), reasonCode: code, retryable: error.retryable === true || code === 'network', retryAfterMs: error.retryAfterMs || 0 } };
+        } finally { finishSignDebugCapture(debugContext); }
+    }
+
+    async function executeDirectTarget(target, onProgress, operation, checkOnly) {
         const site = siteConfigs.find(item => item.key === target.siteKey && typeof item.directRun === 'function');
         if (!site) return false;
-
-        let lastResult = null;
+        let result;
         for (let attempt = 1; attempt <= DIRECT_SIGN_RETRY_ATTEMPTS; attempt++) {
-            lastResult = await runDirectTargetOnce(target, site, attempt, DIRECT_SIGN_RETRY_ATTEMPTS);
-            if (lastResult.isSuccess) return true;
-
-            if (attempt < DIRECT_SIGN_RETRY_ATTEMPTS) {
-                const status = getNormalizedTargetStatus(target);
-                recordTargetStatus(target.id, 'running', {
-                    stage: 'retry',
-                    message: `第 ${attempt} 次未确认成功，${DIRECT_SIGN_RETRY_DELAY_MS / 1000} 秒后自动重试（${attempt + 1}/${DIRECT_SIGN_RETRY_ATTEMPTS}）`,
-                    url: status.url || target.url
-                });
-                if (typeof onProgress === 'function') onProgress();
-                await delay(DIRECT_SIGN_RETRY_DELAY_MS);
+            if (!isOperationCurrent(operation)) return false;
+            result = await runDirectTargetOnce(target, site, operation, checkOnly);
+            if (result.isSuccess) return true;
+            if (['needs-login', 'needs-foreground'].includes(result.reason.status)) break;
+            if (result.debugContext.submitted) {
+                // 回包丢失也可能已经执行，只检查，不重新提交。
+                const checked = await runDirectTargetOnce(target, site, operation, true);
+                if (checked.isSuccess) return true;
+                if (checked.reason?.reasonCode === 'confirmed-unsigned') { result = checked; break; }
+                if (!['needs-login', 'needs-foreground'].includes(result.reason.status)) result.reason.status = 'result-unknown';
+                break;
             }
+            if (!result.reason.retryable || checkOnly || attempt === DIRECT_SIGN_RETRY_ATTEMPTS) break;
+            persistSignDebugFailure(result.debugContext, { ...result.reason, attempt });
+            const wait = Math.max(DIRECT_SIGN_RETRY_DELAY_MS * attempt, result.reason.retryAfterMs || 0);
+            recordTargetStatus(target.id, 'running', { stage: 'retry', context: operation, message: `第 ${attempt} 次暂时失败，${Math.ceil(wait / 1000)} 秒后重试（${attempt + 1}/3）` });
+            onProgress?.();
+            await delay(wait);
         }
-
-        if (lastResult?.debugContext && lastResult?.reason) {
-            recordTargetStatus(target.id, lastResult.reason.status || 'failed', {
-                stage: lastResult.reason.stage || 'direct-api',
-                message: lastResult.reason.message || '控制台直签未确认成功',
-                url: target.url
-            });
-            persistSignDebugFailure(lastResult.debugContext, lastResult.reason);
+        if (result?.reason && isOperationCurrent(operation)) {
+            recordTargetStatus(target.id, result.reason.status, { ...result.reason, context: operation, url: target.url });
+            persistSignDebugFailure(result.debugContext, result.reason);
         }
         return false;
+    }
+
+    function getTaskLease(key) {
+        const value = GM_getValue(getScopedStorageKey(STORAGE_KEYS.task, key));
+        return value && typeof value === 'object' ? value : null;
+    }
+
+    function hasActiveTask(key) {
+        const lease = getTaskLease(key);
+        return Boolean(lease && lease.date === getToday() && lease.expiresAt > Date.now());
+    }
+
+    function acquireTaskLease(key, kind = 'direct', taskId = newOperationId()) {
+        if (hasActiveTask(key)) return null;
+        const operation = { ...captureOperation(key), taskId };
+        const lease = { ...operation, kind, ownerId: executionOwnerId, updatedAt: Date.now(), expiresAt: Date.now() + (kind === 'page' ? AUTO_CLOSE_PENDING_TTL_MS : 30000) };
+        GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, key), lease);
+        return getTaskLease(key)?.taskId === taskId ? operation : null;
+    }
+
+    function finishTaskLease(operation) {
+        const lease = getTaskLease(operation.key);
+        if (lease?.taskId === operation.taskId) GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, operation.key), { ...lease, expiresAt: 0 });
+    }
+
+    function runDirectTarget(target, onProgress, checkOnly = false) {
+        if (directTasks.has(target.id)) return directTasks.get(target.id);
+        releaseLegacyQueuedTask(target.id);
+        const operation = acquireTaskLease(target.id);
+        if (!operation) return Promise.resolve(false);
+        const wasUnknown = ['result-unknown', 'running', 'opened'].includes(getNormalizedTargetStatus(target).status);
+        const heartbeat = setInterval(() => {
+            const lease = getTaskLease(target.id);
+            if (isOperationCurrent(operation) && lease?.taskId === operation.taskId) GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, target.id), { ...lease, expiresAt: Date.now() + 30000 });
+        }, 10000);
+        const promise = executeDirectTarget(target, onProgress, operation, checkOnly || wasUnknown)
+            .catch(error => { console.error('[签到助手] 任务异常', error); return false; })
+            .finally(() => {
+                clearInterval(heartbeat);
+                finishTaskLease(operation);
+                directTasks.delete(target.id);
+                onProgress?.();
+            });
+        directTasks.set(target.id, promise);
+        return promise;
     }
 
     async function runDirectTargets(targets, rerender) {
         const runnableTargets = targets.filter(target => {
             if (!target.enabled || !target.directApi) return false;
-            return !isTargetDone(getNormalizedTargetStatus(target).status);
+            return !isTargetDone(getNormalizedTargetStatus(target).status) && !hasActiveTask(target.id);
         });
         if (!runnableTargets.length) return;
 
@@ -3308,7 +3594,7 @@
         return getAllTargets().filter(target => {
             if (!target.enabled || target.openMode === 'manual' || target.directApi) return false;
             const targetStatus = getNormalizedTargetStatus(target).status;
-            return !isTargetDone(targetStatus);
+            return !isTargetDone(targetStatus) && !hasActiveTask(target.id);
         });
     }
 
@@ -3316,7 +3602,7 @@
         return getAllTargets().filter(target => {
             if (!target.enabled || !target.directApi) return false;
             const targetStatus = getNormalizedTargetStatus(target).status;
-            return !isTargetDone(targetStatus);
+            return !isTargetDone(targetStatus) && !hasActiveTask(target.id);
         });
     }
 
@@ -3334,38 +3620,6 @@
         return `${getToday()}|${parts.join(',')}`;
     }
 
-    function getDashboardAutoRefreshLeftSeconds() {
-        if (!dashboardAutoRefreshUntil) return 0;
-        return Math.max(0, Math.ceil((dashboardAutoRefreshUntil - Date.now()) / 1000));
-    }
-
-    function isDashboardAutoRefreshActive() {
-        return getDashboardAutoRefreshLeftSeconds() > 0;
-    }
-
-    function stopDashboardAutoRefresh() {
-        if (dashboardAutoRefreshTimer) {
-            clearInterval(dashboardAutoRefreshTimer);
-            dashboardAutoRefreshTimer = null;
-        }
-        dashboardAutoRefreshUntil = 0;
-    }
-
-    function startDashboardAutoRefresh(rerender, durationMs = DASHBOARD_AUTO_REFRESH_DURATION_MS) {
-        stopDashboardAutoRefresh();
-        dashboardAutoRefreshUntil = Date.now() + durationMs;
-        dashboardAutoRefreshTimer = setInterval(() => {
-            const overlay = document.getElementById('bbs-sign-dashboard-overlay');
-            const shouldRerender = overlay?.dataset?.view === 'dashboard';
-            if (!shouldRerender || !isDashboardAutoRefreshActive()) {
-                stopDashboardAutoRefresh();
-                if (shouldRerender && typeof rerender === 'function') rerender();
-                return;
-            }
-            if (typeof rerender === 'function') rerender();
-        }, DASHBOARD_AUTO_REFRESH_INTERVAL_MS);
-    }
-
     function clearAutoOpenCountdown(suppressCurrent = false) {
         if (autoOpenTimer) {
             clearTimeout(autoOpenTimer);
@@ -3377,6 +3631,7 @@
         }
         if (suppressCurrent) {
             autoOpenSuppressedSignature = getAttentionSignature();
+            reminderDismissedDay = getToday();
         }
         autoOpenCountdownLeft = 0;
         autoOpenReminderSignature = '';
@@ -3415,7 +3670,7 @@
             clearAutoOpenCountdown(false);
             return;
         }
-        if (signature === autoOpenSuppressedSignature) {
+        if (signature === autoOpenSuppressedSignature || reminderDismissedDay === getToday()) {
             clearAutoOpenCountdown(false);
             return;
         }
@@ -3424,15 +3679,61 @@
     }
 
     function setManualTargetStatus(target, status) {
-        if (status === 'success' && target.siteKey) {
-            markSignSuccess(target.siteKey, '已从控制台手动标记成功');
-            return;
-        }
-        recordTargetStatus(target.id, status, {
+        const snapshot = { target, status: getNormalizedTargetStatus(target), success: target.siteKey ? getData(target.siteKey) : undefined };
+        const context = invalidateTargetOperation(target.id);
+        if (target.siteKey && getData(target.siteKey) === getToday() && status !== 'success') clearSignSuccess(target.siteKey, '已清除人工撤销的今日成功记录', context);
+        if (status === 'success' && target.siteKey) markSignSuccess(target.siteKey, '已从控制台手动标记成功', { source: 'manual', context });
+        else recordTargetStatus(target.id, status, {
             stage: 'manual',
+            context,
+            confirmationSource: 'manual',
             message: STATUS_META[status]?.message || '已手动更新状态',
             url: target.url
         });
+        snapshot.writeId = getRawTargetStatus(target.id)?.writeId;
+        rememberManualUndo([snapshot]);
+        return snapshot;
+    }
+
+    function invalidateTargetOperation(key) {
+        GM_setValue(getScopedStorageKey(STORAGE_KEYS.mutation, key), newOperationId());
+        GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, key), null);
+        return captureOperation(key);
+    }
+
+    function resetTargetStatus(target) {
+        return setManualTargetStatus(target, 'result-unknown');
+    }
+
+    function rememberManualUndo(entries) {
+        clearTimeout(manualUndoTimer);
+        manualUndo = { expiresAt: Date.now() + 10000, entries };
+        manualUndoTimer = setTimeout(refreshDashboardData, 10001);
+    }
+
+    function undoManualStatus() {
+        if (!manualUndo) return { restored: 0, changed: 0 };
+        if (Date.now() > manualUndo.expiresAt) { const count = manualUndo.entries.length; manualUndo = null; return { restored: 0, changed: count }; }
+        const entries = manualUndo.entries;
+        clearTimeout(manualUndoTimer);
+        manualUndo = null;
+        let restored = 0;
+        for (const entry of entries) {
+            if (getRawTargetStatus(entry.target.id)?.writeId !== entry.writeId) continue;
+            const context = invalidateTargetOperation(entry.target.id);
+            if (entry.target.siteKey) {
+                GM_setValue(getScopedStorageKey(STORAGE_KEYS.successData, entry.target.siteKey), entry.success || '');
+                const legacy = readObject(STORAGE_KEYS.successData);
+                if (entry.success) legacy[entry.target.siteKey] = entry.success;
+                else delete legacy[entry.target.siteKey];
+                writeObject(STORAGE_KEYS.successData, legacy);
+            }
+            recordTargetStatus(entry.target.id, entry.status?.status || 'not-started', {
+                ...entry.status, stage: entry.status?.stage || 'manual', context
+            });
+            restored++;
+        }
+        return { restored, changed: entries.length - restored };
     }
 
     function el(tag, options = {}, children = []) {
@@ -3459,31 +3760,19 @@
     }
 
     function shieldDashboardInput(input) {
-        const stop = (event) => {
-            event.stopPropagation();
-            if (typeof event.stopImmediatePropagation === 'function') {
-                event.stopImmediatePropagation();
-            }
-        };
-        for (const eventName of ['keydown', 'keypress', 'keyup', 'input', 'compositionstart', 'compositionupdate', 'compositionend']) {
-            input.addEventListener(eventName, stop);
+        for (const name of ['keydown', 'keypress', 'keyup', 'input', 'compositionstart', 'compositionupdate', 'compositionend']) {
+            input.addEventListener(name, event => event.stopPropagation());
         }
-        input.addEventListener('focus', (event) => {
-            event.stopPropagation();
-            setTimeout(() => input.focus(), 0);
-        });
         return input;
     }
 
     function createSearchField(value, placeholder, onInput) {
-        return shieldDashboardInput(el('input', {
-            className: 'bbs-sign-field bbs-sign-search',
-            type: 'search',
-            value,
-            placeholder,
-            autocomplete: 'off',
-            onInput
-        }));
+        let composing = false;
+        const input = shieldDashboardInput(el('input', { className: 'bbs-sign-field bbs-sign-search', type: 'search', value, placeholder, autocomplete: 'off',
+            onInput: event => { if (!composing && !event.isComposing) onInput(event); } }));
+        input.addEventListener('compositionstart', () => { composing = true; });
+        input.addEventListener('compositionend', event => { composing = false; onInput(event); });
+        return input;
     }
 
     function createSelect(value, options, onChange) {
@@ -3498,7 +3787,10 @@
 
     function addDashboardStyles() {
         if (document.getElementById('bbs-sign-dashboard-style')) return;
-        GM_addStyle(`
+        const style = document.createElement('style');
+        style.id = 'bbs-sign-dashboard-style';
+        style.textContent = `
+            #bbs-sign-dashboard-overlay [hidden] { display: none !important; }
             #bbs-sign-dashboard-button {
                 position: fixed;
                 right: 22px;
@@ -3626,375 +3918,191 @@
                 }
             }
             #bbs-sign-dashboard-overlay {
-                position: fixed;
-                inset: 0;
-                z-index: 2147483647;
-                display: grid;
-                place-items: center;
-                padding: 24px;
-                background: rgba(15, 23, 42, 0.36);
-                backdrop-filter: blur(10px);
+                position: fixed; inset: 0; z-index: 2147483647; display: grid; place-items: center;
+                padding: 24px; background: rgba(19, 38, 35, .45); backdrop-filter: blur(8px);
                 animation: bbs-sign-overlay-in 180ms ease-out both;
             }
-            .bbs-sign-panel {
-                --bbs-sign-panel-radius: 18px;
-                width: min(1060px, 100%);
-                max-height: min(780px, calc(100vh - 48px));
-                overflow: hidden;
-                display: flex;
-                flex-direction: column;
-                color: #111827;
-                background: #f8fafc;
-                border: 1px solid rgba(148, 163, 184, 0.38);
-                border-radius: var(--bbs-sign-panel-radius);
-                box-shadow: 0 28px 90px rgba(15, 23, 42, 0.32);
-                font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-                transform-origin: center;
-                will-change: transform, opacity, border-radius;
-                animation: bbs-sign-panel-in 240ms cubic-bezier(0.16, 1, 0.3, 1) both;
+            #bbs-sign-dashboard-overlay, #bbs-sign-dashboard-overlay * { box-sizing: border-box; }
+            #bbs-sign-dashboard-overlay .bbs-sign-panel {
+                --bbs-ink: #223b37; --bbs-muted: #778782; --bbs-line: #e2e9e5;
+                --bbs-accent: #167461; --bbs-soft: #edf5f0;
+                width: min(1040px, 100%); max-height: min(820px, calc(100dvh - 48px));
+                display: flex; flex-direction: column; overflow: hidden;
+                color: var(--bbs-ink); background: #f7f9f6; border: 1px solid rgba(255,255,255,.6);
+                border-radius: 20px; box-shadow: 0 32px 100px #102a3040;
+                font: 14px/1.6 "PingFang SC", "Microsoft YaHei", sans-serif; text-align: left;
+                animation: bbs-sign-panel-in 220ms ease-out both;
             }
-            .bbs-sign-panel.bbs-sign-panel-from-button {
-                animation: bbs-sign-panel-from-button 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+            #bbs-sign-dashboard-overlay button, #bbs-sign-dashboard-overlay input,
+            #bbs-sign-dashboard-overlay select, #bbs-sign-dashboard-overlay summary { font: inherit; letter-spacing: normal; }
+            #bbs-sign-dashboard-overlay button, #bbs-sign-dashboard-overlay summary { touch-action: manipulation; }
+            #bbs-sign-dashboard-overlay button:focus-visible, #bbs-sign-dashboard-overlay summary:focus-visible {
+                outline: 2px solid var(--bbs-accent); outline-offset: 3px;
             }
-            .bbs-sign-panel.bbs-sign-panel-from-button .bbs-sign-header,
-            .bbs-sign-panel.bbs-sign-panel-from-button .bbs-sign-body {
-                animation: bbs-sign-content-from-button 300ms cubic-bezier(0.16, 1, 0.3, 1) both;
+            #bbs-sign-dashboard-overlay .bbs-sign-header {
+                flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; gap: 16px;
+                padding: 24px 28px 20px; background: #fff; border-bottom: 1px solid var(--bbs-line);
             }
-            #bbs-sign-dashboard-overlay.bbs-sign-no-enter,
-            #bbs-sign-dashboard-overlay.bbs-sign-no-enter .bbs-sign-panel {
-                animation: none;
+            #bbs-sign-dashboard-overlay .bbs-sign-brand { display: flex; align-items: center; gap: 13px; min-width: 0; }
+            #bbs-sign-dashboard-overlay .bbs-sign-brand-mark {
+                display: grid; place-items: center; flex-shrink: 0; width: 42px; height: 46px;
+                border-radius: 13px 13px 17px 5px; background: var(--bbs-accent); color: #fff;
+                font: 600 24px/1 "STKaiti", "KaiTi", serif; box-shadow: inset 0 0 0 1px #ffffff20;
             }
-            @keyframes bbs-sign-overlay-in {
-                from { opacity: 0; }
-                to { opacity: 1; }
+            #bbs-sign-dashboard-overlay .bbs-sign-title { margin: 0; padding: 0; color: var(--bbs-ink); font-size: 21px; font-weight: 700; line-height: 1.4; }
+            #bbs-sign-dashboard-overlay .bbs-sign-subtitle { margin-top: 3px; color: var(--bbs-muted); font-size: 12px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-header-tools { display: flex; align-items: center; gap: 18px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-date { color: var(--bbs-muted); font-size: 12px; white-space: nowrap; }
+            #bbs-sign-dashboard-overlay .bbs-sign-close {
+                display: grid; place-items: center; width: 32px; height: 32px; padding: 0;
+                border: 1px solid var(--bbs-line); border-radius: 50%; background: #fff; color: #73847c; cursor: pointer; font-size: 22px;
             }
-            @keyframes bbs-sign-panel-in {
-                from {
-                    opacity: 0;
-                    transform: translateY(10px) scale(0.985);
-                }
-                to {
-                    opacity: 1;
-                    transform: translateY(0) scale(1);
-                }
+            #bbs-sign-dashboard-overlay .bbs-sign-close:hover { color: var(--bbs-ink); background: var(--bbs-soft); }
+            #bbs-sign-dashboard-overlay .bbs-sign-body { min-height: 0; padding: 0 28px 24px; overflow: auto; scrollbar-width: thin; scrollbar-color: #c5d3cb transparent; }
+            #bbs-sign-dashboard-overlay .bbs-sign-overview { margin: 22px 0 18px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-overview-head { display: flex; align-items: baseline; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-overview-label { color: var(--bbs-ink); font-size: 13px; font-weight: 600; }
+            #bbs-sign-dashboard-overlay .bbs-sign-progress-label { color: var(--bbs-muted); font-size: 12px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-progress { height: 4px; overflow: hidden; background: #e3ebe5; border-radius: 4px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-progress-fill { height: 100%; background: var(--bbs-accent); border-radius: inherit; transition: width 240ms ease; }
+            #bbs-sign-dashboard-overlay .bbs-sign-summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); margin-top: 16px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-stat { min-width: 0; padding: 0 20px; border-left: 1px solid var(--bbs-line); }
+            #bbs-sign-dashboard-overlay .bbs-sign-stat:first-child { padding-left: 0; border-left: 0; }
+            #bbs-sign-dashboard-overlay .bbs-sign-card-label { display: flex; align-items: center; gap: 6px; color: var(--bbs-muted); font-size: 12px; white-space: nowrap; }
+            #bbs-sign-dashboard-overlay .bbs-sign-card-label::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--stat-color, #a2aca5); }
+            #bbs-sign-dashboard-overlay .bbs-sign-card-value { margin-top: 3px; color: var(--stat-color, var(--bbs-ink)); font: 500 30px/1.2 "Bahnschrift", "DIN Alternate", sans-serif; font-variant-numeric: tabular-nums; }
+            #bbs-sign-dashboard-overlay .bbs-sign-stat.success { --stat-color: #167461; }
+            #bbs-sign-dashboard-overlay .bbs-sign-stat.danger { --stat-color: #bc5e50; }
+            #bbs-sign-dashboard-overlay .bbs-sign-stat.pending { --stat-color: #b28235; }
+            #bbs-sign-dashboard-overlay .bbs-sign-card { min-width: 0; padding: 16px; border: 1px solid var(--bbs-line); border-radius: 12px; background: #fff; }
+            #bbs-sign-dashboard-overlay .bbs-sign-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 20px; padding: 0; }
+            #bbs-sign-dashboard-overlay[data-view="settings"] .bbs-sign-toolbar { padding-top: 20px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-search-wrap { position: relative; display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+            #bbs-sign-dashboard-overlay .bbs-sign-search-wrap > .bbs-sign-message { flex-shrink: 0; white-space: nowrap; }
+            #bbs-sign-dashboard-overlay .bbs-sign-search-wrap::before {
+                content: ""; position: absolute; left: 13px; top: 12px; width: 10px; height: 10px;
+                border: 1.5px solid #82948b; border-radius: 50%; pointer-events: none;
             }
-            @keyframes bbs-sign-panel-from-button {
-                0% {
-                    opacity: 0.86;
-                    border-radius: var(--bbs-sign-enter-radius, 999px);
-                    transform:
-                        translate3d(var(--bbs-sign-enter-x, 0), var(--bbs-sign-enter-y, 0), 0)
-                        scale(var(--bbs-sign-enter-scale-x, 0.12), var(--bbs-sign-enter-scale-y, 0.08));
-                }
-                58% {
-                    opacity: 1;
-                    border-radius: calc(var(--bbs-sign-panel-radius, 18px) + 4px);
-                }
-                100% {
-                    opacity: 1;
-                    border-radius: var(--bbs-sign-panel-radius, 18px);
-                    transform: translate3d(0, 0, 0) scale(1);
-                }
+            #bbs-sign-dashboard-overlay .bbs-sign-search-wrap::after { content: ""; position: absolute; left: 23px; top: 23px; width: 5px; height: 1.5px; background: #82948b; transform: rotate(45deg); pointer-events: none; }
+            #bbs-sign-dashboard-overlay .bbs-sign-actions, #bbs-sign-dashboard-overlay .bbs-sign-row-actions,
+            #bbs-sign-dashboard-overlay .bbs-sign-form-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+            #bbs-sign-dashboard-overlay .bbs-sign-actions { flex-shrink: 0; }
+            #bbs-sign-dashboard-overlay .bbs-sign-button {
+                display: inline-flex; align-items: center; justify-content: center; min-height: 36px;
+                margin: 0; padding: 7px 12px; border: 1px solid #dbe4dd; border-radius: 8px;
+                color: #496056; background: #fff; cursor: pointer; font-size: 12px; font-weight: 600; line-height: 1.5;
+                white-space: nowrap; box-shadow: none; transition: background 120ms ease, border-color 120ms ease;
             }
-            @keyframes bbs-sign-content-from-button {
-                0%, 42% {
-                    opacity: 0;
-                    transform: translateY(8px);
-                }
-                100% {
-                    opacity: 1;
-                    transform: translateY(0);
-                }
+            #bbs-sign-dashboard-overlay .bbs-sign-button:hover { background: var(--bbs-soft); border-color: #b8cdbf; }
+            #bbs-sign-dashboard-overlay .bbs-sign-button.primary { color: #fff; border-color: var(--bbs-accent); background: var(--bbs-accent); }
+            #bbs-sign-dashboard-overlay .bbs-sign-button.primary:hover { background: #115f50; }
+            #bbs-sign-dashboard-overlay .bbs-sign-button.danger { color: #af554b; border-color: #efd9d3; background: #fff5f1; }
+            #bbs-sign-dashboard-overlay .bbs-sign-button.ghost { background: transparent; border-color: transparent; color: var(--bbs-muted); }
+            #bbs-sign-dashboard-overlay .bbs-sign-button.ghost:hover { background: #e9efea; color: var(--bbs-ink); }
+            #bbs-sign-dashboard-overlay .bbs-sign-button:disabled { opacity: .45; cursor: not-allowed; }
+            #bbs-sign-dashboard-overlay .bbs-sign-list { display: grid; gap: 8px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row, #bbs-sign-dashboard-overlay .bbs-sign-setting-row {
+                display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px;
+                padding: 15px 16px; border: 1px solid var(--bbs-line); border-radius: 11px; background: #fff;
             }
-            .bbs-sign-header {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 16px;
-                padding: 20px 22px;
-                border-bottom: 1px solid rgba(148, 163, 184, 0.32);
-                background: #ffffff;
+            #bbs-sign-dashboard-overlay .bbs-sign-row { border-left: 3px solid #d9e4dc; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row { grid-template-columns: minmax(0, 1fr) auto auto; column-gap: 8px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row-controls { display: contents; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row-controls > button { grid-column: 2; grid-row: 1; }
+            #bbs-sign-dashboard-overlay .bbs-sign-setting-row .bbs-sign-row-actions { display: grid; grid-template-columns: repeat(2, minmax(140px, 1fr)); }
+            #bbs-sign-dashboard-overlay .bbs-sign-row[data-tone="warning"] { border-left-color: #d0a857; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row[data-tone="danger"] { border-left-color: #ce8477; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row[data-tone="success"] { border-left-color: #74aa91; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row-main { min-width: 0; }
+            #bbs-sign-dashboard-overlay .bbs-sign-name-line { display: flex; align-items: center; flex-wrap: wrap; column-gap: 9px; row-gap: 3px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-name { color: var(--bbs-ink); font-size: 14px; font-weight: 700; }
+            #bbs-sign-dashboard-overlay .bbs-sign-url, #bbs-sign-dashboard-overlay .bbs-sign-meta { color: var(--bbs-muted); font-size: 11px; overflow-wrap: anywhere; }
+            #bbs-sign-dashboard-overlay .bbs-sign-name-line .bbs-sign-url { margin-left: 3px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-message { margin-top: 5px; color: #5b6e63; font-size: 12px; overflow-wrap: anywhere; }
+            #bbs-sign-dashboard-overlay .bbs-sign-row .bbs-sign-message:empty { display: none; }
+            #bbs-sign-dashboard-overlay .bbs-sign-meta { margin-top: 3px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-badge { display: inline-flex; align-items: center; border-radius: 5px; padding: 1px 6px; font-size: 10px; font-weight: 500; line-height: 1.7; white-space: nowrap; }
+            #bbs-sign-dashboard-overlay .bbs-sign-badge.success { color: #2e7d61; background: #e8f4ec; }
+            #bbs-sign-dashboard-overlay .bbs-sign-badge.pending { color: #507c91; background: #edf4f7; }
+            #bbs-sign-dashboard-overlay .bbs-sign-badge.warning { color: #9b742d; background: #faf0d9; }
+            #bbs-sign-dashboard-overlay .bbs-sign-badge.danger { color: #aa594c; background: #fceee8; }
+            #bbs-sign-dashboard-overlay .bbs-sign-badge.neutral, #bbs-sign-dashboard-overlay .bbs-sign-badge.muted { color: #829087; background: #f0f3ef; }
+            #bbs-sign-dashboard-overlay .bbs-sign-section { margin-top: 20px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-section-title { display: flex; align-items: center; gap: 9px; margin: 22px 0 10px; color: var(--bbs-ink); font-size: 13px; font-weight: 700; }
+            #bbs-sign-dashboard-overlay summary.bbs-sign-section-title { margin: 0 0 10px; cursor: pointer; list-style: none; }
+            #bbs-sign-dashboard-overlay summary::-webkit-details-marker { display: none; }
+            #bbs-sign-dashboard-overlay summary.bbs-sign-section-title::before { content: ""; width: 6px; height: 6px; border-right: 1.5px solid #84978c; border-bottom: 1.5px solid #84978c; transform: rotate(-45deg); transition: transform 120ms ease; }
+            #bbs-sign-dashboard-overlay details[open] > summary.bbs-sign-section-title::before { transform: rotate(45deg) translateY(-2px); }
+            #bbs-sign-dashboard-overlay .bbs-sign-section-count { display: inline-grid; place-items: center; min-width: 21px; height: 20px; padding: 0 6px; background: #e9efea; color: #6b8274; border-radius: 5px; font-size: 11px; font-weight: 500; }
+            #bbs-sign-dashboard-overlay .bbs-sign-section-hint { margin-left: auto; color: #97a39b; font-size: 11px; font-weight: 400; }
+            #bbs-sign-dashboard-overlay .bbs-sign-batch { margin: 6px 0 0; font-size: 11px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-more { position: relative; }
+            #bbs-sign-dashboard-overlay .bbs-sign-more { grid-column: 3; grid-row: 1; }
+            #bbs-sign-dashboard-overlay .bbs-sign-more > summary::after { content: "⌄"; margin-left: 7px; font-size: 13px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-more[open] { display: contents; }
+            #bbs-sign-dashboard-overlay .bbs-sign-more[open] > summary { grid-column: 3; grid-row: 1; background: var(--bbs-soft); }
+            #bbs-sign-dashboard-overlay .bbs-sign-more::details-content { grid-column: 1 / -1; grid-row: 2; }
+            #bbs-sign-dashboard-overlay .bbs-sign-more-menu { grid-column: 1 / -1; grid-row: 2; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 5px; padding: 8px; border: 1px solid var(--bbs-line); border-radius: 10px; background: #f7faf7; }
+            #bbs-sign-dashboard-overlay .bbs-sign-more-menu .bbs-sign-button { min-height: 30px; padding: 5px 8px; font-weight: 400; font-size: 11px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-feedback:empty { display: none; }
+            #bbs-sign-dashboard-overlay .bbs-sign-feedback { margin-bottom: 12px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-empty { padding: 44px 20px; text-align: center; color: var(--bbs-muted); border: 1px dashed #cfdbd2; border-radius: 12px; font-size: 13px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; padding: 18px; border: 1px solid var(--bbs-line); border-radius: 12px; background: #fff; margin-bottom: 16px; }
+            #bbs-sign-dashboard-overlay .bbs-sign-field-wrap { display: grid; gap: 6px; min-width: 0; }
+            #bbs-sign-dashboard-overlay .bbs-sign-field-wrap.full { grid-column: 1 / -1; }
+            #bbs-sign-dashboard-overlay .bbs-sign-label { color: #617668; font-size: 12px; font-weight: 500; }
+            #bbs-sign-dashboard-overlay .bbs-sign-field { min-width: 0; width: 100%; height: 38px; margin: 0; padding: 8px 10px; border: 1px solid #dce5de; border-radius: 8px; color: var(--bbs-ink); background: #fff; font: inherit; font-size: 12px; box-shadow: none; }
+            #bbs-sign-dashboard-overlay .bbs-sign-field:focus { border-color: #4c9983; box-shadow: 0 0 0 3px #16746112; outline: none; }
+            #bbs-sign-dashboard-overlay .bbs-sign-field::placeholder { color: #94a198; opacity: 1; }
+            #bbs-sign-dashboard-overlay .bbs-sign-search { padding-left: 34px; background: #fff; }
+            #bbs-sign-dashboard-overlay .bbs-sign-check { display: inline-flex; align-items: center; gap: 7px; margin-right: 16px; color: #526a5c; font-size: 12px; }
+            #bbs-sign-dashboard-overlay input[type="checkbox"] { accent-color: var(--bbs-accent); width: 14px; height: 14px; flex-shrink: 0; margin: 0; }
+            @keyframes bbs-sign-overlay-in { from { opacity: 0; } to { opacity: 1; } }
+            @keyframes bbs-sign-panel-in { from { opacity: 0; transform: translateY(8px) scale(.99); } to { opacity: 1; transform: none; } }
+            @media (max-width: 900px) {
+                #bbs-sign-dashboard-overlay .bbs-sign-toolbar { flex-wrap: wrap; }
+                #bbs-sign-dashboard-overlay .bbs-sign-toolbar > .bbs-sign-search-wrap { flex-basis: 100%; }
             }
-            .bbs-sign-title {
-                margin: 0;
-                font-size: 20px;
-                line-height: 1.2;
-                letter-spacing: 0;
-            }
-            .bbs-sign-subtitle {
-                margin-top: 4px;
-                color: #64748b;
-                font-size: 13px;
-            }
-            .bbs-sign-close {
-                min-width: 38px;
-                height: 38px;
-                border: 1px solid #e2e8f0;
-                border-radius: 12px;
-                background: #ffffff;
-                color: #475569;
-                cursor: pointer;
-            }
-            .bbs-sign-body {
-                padding: 0 22px 22px;
-                overflow: auto;
-            }
-            .bbs-sign-summary {
-                display: grid;
-                grid-template-columns: repeat(4, minmax(0, 1fr));
-                gap: 12px;
-                margin: 18px 0 16px;
-            }
-            .bbs-sign-card {
-                min-width: 0;
-                border: 1px solid #e2e8f0;
-                border-radius: 14px;
-                padding: 14px;
-                background: #ffffff;
-            }
-            .bbs-sign-card-label {
-                color: #64748b;
-                font-size: 12px;
-            }
-            .bbs-sign-card-value {
-                margin-top: 4px;
-                font-size: 24px;
-                font-weight: 800;
-                line-height: 1.1;
-            }
-            .bbs-sign-toolbar,
-            .bbs-sign-actions,
-            .bbs-sign-row-actions,
-            .bbs-sign-form-actions {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                flex-wrap: wrap;
-            }
-            .bbs-sign-toolbar {
-                position: sticky;
-                top: 0;
-                z-index: 4;
-                justify-content: space-between;
-                margin: 0 -22px 14px;
-                padding: 10px 22px;
-                border-bottom: 1px solid rgba(226, 232, 240, 0.9);
-                background: #f8fafc;
-                box-shadow: 0 10px 22px rgba(15, 23, 42, 0.06);
-            }
-            .bbs-sign-search-wrap {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                min-width: min(360px, 100%);
-                flex: 1 1 320px;
-            }
-            .bbs-sign-search-wrap .bbs-sign-field {
-                max-width: 420px;
-            }
-            .bbs-sign-button {
-                border: 1px solid #cbd5e1;
-                border-radius: 10px;
-                padding: 8px 11px;
-                color: #0f172a;
-                background: #ffffff;
-                cursor: pointer;
-                font-weight: 650;
-                line-height: 1.2;
-                white-space: nowrap;
-            }
-            .bbs-sign-button.primary {
-                color: #ffffff;
-                border-color: #2563eb;
-                background: #2563eb;
-            }
-            .bbs-sign-button.danger {
-                color: #be123c;
-                border-color: #fecdd3;
-                background: #fff1f2;
-            }
-            .bbs-sign-button.ghost {
-                color: #475569;
-                background: #f8fafc;
-            }
-            .bbs-sign-button:disabled {
-                opacity: 0.55;
-                cursor: not-allowed;
-            }
-            .bbs-sign-list {
-                display: grid;
-                gap: 10px;
-            }
-            .bbs-sign-row,
-            .bbs-sign-setting-row {
-                display: grid;
-                grid-template-columns: minmax(220px, 1fr) auto;
-                gap: 12px;
-                align-items: center;
-                border: 1px solid #e2e8f0;
-                border-radius: 14px;
-                padding: 14px;
-                background: #ffffff;
-            }
-            .bbs-sign-row-main {
-                min-width: 0;
-            }
-            .bbs-sign-name-line {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-                flex-wrap: wrap;
-                margin-bottom: 4px;
-            }
-            .bbs-sign-name {
-                font-size: 15px;
-                font-weight: 800;
-                color: #0f172a;
-            }
-            .bbs-sign-url,
-            .bbs-sign-message,
-            .bbs-sign-meta {
-                color: #64748b;
-                font-size: 12px;
-                overflow-wrap: anywhere;
-            }
-            .bbs-sign-message {
-                margin-top: 3px;
-                color: #334155;
-            }
-            .bbs-sign-badge {
-                display: inline-flex;
-                align-items: center;
-                border-radius: 999px;
-                padding: 3px 8px;
-                font-size: 12px;
-                font-weight: 800;
-            }
-            .bbs-sign-badge.success { color: #047857; background: #d1fae5; }
-            .bbs-sign-badge.pending { color: #0369a1; background: #e0f2fe; }
-            .bbs-sign-badge.warning { color: #b45309; background: #fef3c7; }
-            .bbs-sign-badge.danger { color: #be123c; background: #ffe4e6; }
-            .bbs-sign-badge.neutral { color: #475569; background: #e2e8f0; }
-            .bbs-sign-badge.muted { color: #64748b; background: #f1f5f9; }
-            .bbs-sign-section-title {
-                margin: 18px 0 10px;
-                font-size: 15px;
-                font-weight: 800;
-            }
-            .bbs-sign-section-head {
-                display: flex;
-                align-items: center;
-                justify-content: space-between;
-                gap: 10px;
-                margin: 18px 0 10px;
-                flex-wrap: wrap;
-            }
-            .bbs-sign-section-head .bbs-sign-section-title {
-                margin: 0;
-            }
-            .bbs-sign-section-count {
-                color: #64748b;
-                font-size: 12px;
-                font-weight: 750;
-            }
-            .bbs-sign-form {
-                display: grid;
-                grid-template-columns: repeat(2, minmax(0, 1fr));
-                gap: 10px;
-                border: 1px solid #e2e8f0;
-                border-radius: 14px;
-                padding: 14px;
-                background: #ffffff;
-                margin-bottom: 14px;
-            }
-            .bbs-sign-field-wrap {
-                display: grid;
-                gap: 5px;
-                min-width: 0;
-            }
-            .bbs-sign-field-wrap.full {
-                grid-column: 1 / -1;
-            }
-            .bbs-sign-label {
-                color: #475569;
-                font-size: 12px;
-                font-weight: 750;
-            }
-            .bbs-sign-field {
-                min-width: 0;
-                width: 100%;
-                box-sizing: border-box;
-                border: 1px solid #cbd5e1;
-                border-radius: 10px;
-                padding: 8px 10px;
-                color: #0f172a;
-                background: #ffffff;
-                font: inherit;
-            }
-            .bbs-sign-field:focus {
-                border-color: #2563eb;
-                box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
-                outline: none;
-            }
-            .bbs-sign-search {
-                padding-left: 12px;
-                background: #ffffff;
-            }
-            .bbs-sign-check {
-                display: inline-flex;
-                align-items: center;
-                gap: 6px;
-                color: #334155;
-                font-weight: 650;
-            }
-            @media (max-width: 760px) {
-                #bbs-sign-dashboard-overlay {
-                    padding: 10px;
-                }
-                .bbs-sign-panel {
-                    --bbs-sign-panel-radius: 14px;
-                    max-height: calc(100vh - 20px);
-                }
-                .bbs-sign-header,
-                .bbs-sign-body {
-                    padding-left: 14px;
-                    padding-right: 14px;
-                }
-                .bbs-sign-summary {
-                    grid-template-columns: repeat(2, minmax(0, 1fr));
-                }
-                .bbs-sign-toolbar,
-                .bbs-sign-row,
-                .bbs-sign-setting-row,
-                .bbs-sign-form {
-                    grid-template-columns: 1fr;
-                }
-                .bbs-sign-toolbar {
-                    align-items: stretch;
-                    margin-left: -14px;
-                    margin-right: -14px;
-                    padding-left: 14px;
-                    padding-right: 14px;
-                }
-                .bbs-sign-actions,
-                .bbs-sign-row-actions {
-                    justify-content: flex-start;
-                }
-                .bbs-sign-button {
-                    white-space: normal;
-                }
+            @media (max-width: 600px) {
+                #bbs-sign-dashboard-overlay { padding: 10px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-panel { max-height: calc(100dvh - 20px); border-radius: 15px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-header { padding: 17px 16px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-title { font-size: 17px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-brand { gap: 10px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-brand-mark { width: 35px; height: 40px; font-size: 21px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-date { display: none; }
+                #bbs-sign-dashboard-overlay .bbs-sign-body { padding: 0 16px 20px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-overview { margin-top: 18px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-stat { padding: 0 8px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-card-label { gap: 4px; font-size: 10px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-card-value { font-size: 24px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-overview-head { gap: 8px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-progress-label { font-size: 10px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-actions { display: grid; grid-template-columns: 1fr 1fr; width: 100%; gap: 6px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-row, #bbs-sign-dashboard-overlay .bbs-sign-setting-row { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 13px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-row { grid-template-columns: minmax(0, 1fr) auto auto; gap: 8px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-row > .bbs-sign-row-main { grid-column: 1 / -1; }
+                #bbs-sign-dashboard-overlay .bbs-sign-row-controls > button,
+                #bbs-sign-dashboard-overlay .bbs-sign-more,
+                #bbs-sign-dashboard-overlay .bbs-sign-more[open] > summary { grid-row: 2; }
+                #bbs-sign-dashboard-overlay .bbs-sign-more-menu { grid-row: 3; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                #bbs-sign-dashboard-overlay .bbs-sign-more::details-content { grid-row: 3; }
+                #bbs-sign-dashboard-overlay .bbs-sign-name-line .bbs-sign-url { width: 100%; margin-left: 0; }
+                #bbs-sign-dashboard-overlay .bbs-sign-section-hint { display: none; }
+                #bbs-sign-dashboard-overlay .bbs-sign-form { grid-template-columns: minmax(0, 1fr); padding: 14px; }
+                #bbs-sign-dashboard-overlay .bbs-sign-check { margin: 4px 0; }
+                #bbs-sign-dashboard-overlay .bbs-sign-setting-row .bbs-sign-row-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
             }
             @media (prefers-reduced-motion: reduce) {
-                #bbs-sign-dashboard-overlay,
-                #bbs-sign-dashboard-overlay .bbs-sign-panel {
-                    animation: none;
-                }
+                #bbs-sign-dashboard-overlay, #bbs-sign-dashboard-overlay .bbs-sign-panel { animation: none; }
+                #bbs-sign-dashboard-overlay * { transition: none !important; }
             }
-        `);
+        `;
+        (document.head || document.documentElement).append(style);
     }
 
-    function createSummaryCard(label, value) {
-        return el('div', { className: 'bbs-sign-card' }, [
+    function createSummaryCard(label, value, tone = '') {
+        return el('div', { className: `bbs-sign-stat ${tone}` }, [
             el('div', { className: 'bbs-sign-card-label', text: label }),
             el('div', { className: 'bbs-sign-card-value', text: String(value) })
         ]);
@@ -4006,265 +4114,188 @@
     }
 
     function createTargetRow(target, rerender) {
-        const status = getNormalizedTargetStatus(target);
         const row = el('div', { className: 'bbs-sign-row' });
-        const main = el('div', { className: 'bbs-sign-row-main' });
-        main.append(
-            el('div', { className: 'bbs-sign-name-line' }, [
-                el('span', { className: 'bbs-sign-name', text: target.name }),
-                createStatusBadge(status.status)
-            ]),
-            el('div', { className: 'bbs-sign-url', text: target.url }),
-            el('div', { className: 'bbs-sign-message', text: status.message || STATUS_META[status.status]?.message || '' }),
-            el('div', {
-                className: 'bbs-sign-meta',
-                text: `${target.directApi ? '控制台直签 · ' : ''}${OPEN_MODE_LABELS[target.openMode] || target.openMode} · ${RESULT_MODE_LABELS[target.resultMode] || target.resultMode} · 更新 ${getTimeLabel(status.updatedAt)}`
-            })
-        );
-        if (target.note) {
-            main.append(el('div', { className: 'bbs-sign-meta', text: target.note }));
-        }
-
-        const actions = el('div', { className: 'bbs-sign-row-actions' });
-        const directBtn = target.directApi ? el('button', {
-            className: 'bbs-sign-button primary',
-            type: 'button',
-            text: '直签',
-            onClick: async () => {
-                const promise = runDirectTarget(target, rerender);
-                rerender();
-                await promise;
-                rerender();
-            }
-        }) : null;
-        if (directBtn) directBtn.disabled = !target.enabled || status.status === 'running';
-
-        const openBtn = el('button', {
-            className: target.directApi ? 'bbs-sign-button ghost' : 'bbs-sign-button primary',
-            type: 'button',
-            text: target.openMode === 'foreground' ? '前台打开' : '打开',
-            onClick: () => {
-                launchTarget(target);
-                rerender();
-            }
-        });
-        openBtn.disabled = !target.enabled;
-        const rowActions = [
-            ...(directBtn ? [directBtn] : []),
-            openBtn,
-            el('button', {
-                className: 'bbs-sign-button',
-                type: 'button',
-                text: '成功',
-                onClick: () => {
-                    setManualTargetStatus(target, 'success');
-                    rerender();
-                }
-            }),
-            el('button', {
-                className: 'bbs-sign-button',
-                type: 'button',
-                text: '失败',
-                onClick: () => {
-                    setManualTargetStatus(target, 'failed');
-                    rerender();
-                }
-            }),
-            el('button', {
-                className: 'bbs-sign-button ghost',
-                type: 'button',
-                text: '跳过',
-                onClick: () => {
-                    setManualTargetStatus(target, 'skipped');
-                    rerender();
-                }
-            })
-        ];
-        actions.append(...rowActions);
-
-        row.append(main, actions);
+        row.dataset.target = target.id;
+        const name = el('span', { className: 'bbs-sign-name' });
+        const badge = createStatusBadge('not-started');
+        const url = el('span', { className: 'bbs-sign-url' });
+        const message = el('div', { className: 'bbs-sign-message' });
+        const meta = el('div', { className: 'bbs-sign-meta' });
+        const main = el('div', { className: 'bbs-sign-row-main' }, [el('div', { className: 'bbs-sign-name-line' }, [name, badge, url]), message, meta]);
+        const primary = el('button', { className: 'bbs-sign-button primary', type: 'button', onClick: async () => {
+            const item = row.target;
+            if (hasActiveTask(item.id)) { showPageTaskInfo(item); return; }
+            const status = getNormalizedTargetStatus(item).status;
+            if (item.directApi && !['needs-login', 'needs-foreground'].includes(status)) await runDirectTarget(item, rerender, ['result-unknown', 'success'].includes(status));
+            else launchTarget(item, ['result-unknown', 'success'].includes(status));
+            rerender();
+        } });
+        const more = el('details', { className: 'bbs-sign-more' });
+        more.append(el('summary', { className: 'bbs-sign-button', text: '更多' }));
+        const menu = el('div', { className: 'bbs-sign-more-menu' });
+        for (const [label, action] of [
+            ['查看任务', () => showPageTaskInfo(row.target)],
+            ['打开页面', () => launchTarget(row.target)],
+            ['重新检查', async () => { if (row.target.directApi) await runDirectTarget(row.target, rerender, true); else launchTarget(row.target, true); }],
+            ['标记成功', () => setManualTargetStatus(row.target, 'success')],
+            ['标记失败', () => setManualTargetStatus(row.target, 'failed')],
+            ['今日跳过', () => setManualTargetStatus(row.target, 'skipped')],
+            ['重置', () => resetTargetStatus(row.target)],
+            ['查看诊断', () => showTargetDiagnostics(row.target)]
+        ]) menu.append(el('button', { className: 'bbs-sign-button', type: 'button', text: label, onClick: async () => { await action(); more.open = false; rerender(); } }));
+        more.append(menu);
+        more.addEventListener('toggle', () => { if (!more.open) rerender(); });
+        row.append(main, el('div', { className: 'bbs-sign-row-actions bbs-sign-row-controls' }, [primary, more]));
+        row.patch = item => {
+            row.target = item;
+            const status = getNormalizedTargetStatus(item);
+            const info = STATUS_META[status.status] || STATUS_META['not-started'];
+            name.textContent = item.name;
+            try { url.textContent = new URL(item.url).hostname.replace(/^www\./, ''); }
+            catch { url.textContent = item.url; }
+            url.title = item.url;
+            row.dataset.tone = info.tone;
+            badge.textContent = info.label;
+            badge.className = `bbs-sign-badge ${info.tone}`;
+            message.textContent = status.status === 'not-started' ? item.note || '' : status.message || item.note || info.message;
+            message.title = item.note || '';
+            const source = { automatic: '自动确认', manual: '人工标记', legacy: '旧版记录' }[status.confirmationSource] || '';
+            meta.textContent = [item.directApi ? '控制台直签' : OPEN_MODE_LABELS[item.openMode], source, status.updatedAt ? `更新于 ${getTimeLabel(status.updatedAt)}` : '今日尚未执行'].filter(Boolean).join(' · ');
+            meta.title = item.note || '';
+            primary.textContent = hasActiveTask(item.id) && !['queued', 'running'].includes(status.status) ? '查看任务' : ['queued', 'running'].includes(status.status) ? info.label : status.status === 'success' ? '重新检查' : status.status === 'result-unknown' ? '检查结果' : status.status === 'failed' ? '重试' : ['needs-login', 'needs-foreground'].includes(status.status) ? '前台处理' : item.directApi ? '直签' : '打开';
+            primary.disabled = !item.enabled || ['running', 'queued'].includes(status.status) || directTasks.has(item.id);
+        };
+        row.patch(target);
         return row;
     }
 
+    function groupForStatus(status) {
+        if (['success', 'skipped'].includes(status)) return 'completed';
+        if (['queued', 'running', 'opened'].includes(status)) return 'processing';
+        if (['failed', 'result-unknown'].includes(status)) return 'failed';
+        if (['needs-login', 'needs-foreground'].includes(status)) return 'attention';
+        return 'unstarted';
+    }
+
     function getDashboardSummary(targets) {
-        const enabledTargets = targets.filter(target => target.enabled);
-        const summary = { total: enabledTargets.length, success: 0, pending: 0, failed: 0, todo: 0 };
-        for (const target of enabledTargets) {
+        const summary = { total: 0, success: 0, skipped: 0, pending: 0, failed: 0, todo: 0 };
+        for (const target of targets.filter(item => item.enabled)) {
+            summary.total++;
             const status = getNormalizedTargetStatus(target).status;
-            if (status === 'success') {
-                summary.success += 1;
-            } else if (status === 'failed') {
-                summary.failed += 1;
-            } else if (status === 'running' || status === 'opened' || status === 'needs-login' || status === 'needs-foreground') {
-                summary.pending += 1;
-            } else if (status !== 'skipped') {
-                summary.todo += 1;
-            }
+            if (status === 'success') summary.success++;
+            else if (status === 'skipped') summary.skipped++;
+            else if (status === 'failed') summary.failed++;
+            else if (groupForStatus(status) === 'unstarted') summary.todo++;
+            else summary.pending++;
         }
         return summary;
     }
 
     function splitDashboardTargets(targets) {
-        const groups = {
-            unopened: [],
-            openedPending: [],
-            completed: []
-        };
-
-        for (const target of targets) {
-            const status = getNormalizedTargetStatus(target).status;
-            if (status === 'not-started') {
-                groups.unopened.push(target);
-            } else if (status === 'success' || status === 'skipped') {
-                groups.completed.push(target);
-            } else {
-                groups.openedPending.push(target);
-            }
-        }
-
+        const groups = { attention: [], processing: [], failed: [], completed: [], unstarted: [] };
+        for (const target of targets) groups[groupForStatus(getNormalizedTargetStatus(target).status)].push(target);
         return groups;
     }
 
     function markTargetsSuccess(targets) {
+        const entries = [];
         for (const target of targets) {
-            setManualTargetStatus(target, 'success');
+            if (hasActiveTask(target.id) || ['running', 'queued'].includes(getNormalizedTargetStatus(target).status)) continue;
+            entries.push(setManualTargetStatus(target, 'success'));
         }
-    }
-
-    function createDashboardSection(title, targets, rerender, options = {}) {
-        const section = el('section', { className: 'bbs-sign-section' });
-        const headActions = [];
-        if (options.showBatchSuccess && targets.length) {
-            headActions.push(el('button', {
-                className: 'bbs-sign-button primary',
-                type: 'button',
-                text: '全部标记成功',
-                onClick: () => {
-                    markTargetsSuccess(targets);
-                    rerender();
-                }
-            }));
-        }
-        section.append(el('div', { className: 'bbs-sign-section-head' }, [
-            el('div', { className: 'bbs-sign-name-line' }, [
-                el('div', { className: 'bbs-sign-section-title', text: title }),
-                el('span', { className: 'bbs-sign-section-count', text: `${targets.length} 个` })
-            ]),
-            headActions.length ? el('div', { className: 'bbs-sign-row-actions' }, headActions) : null
-        ]));
-
-        if (!targets.length) {
-            section.append(el('div', { className: 'bbs-sign-card', text: options.emptyText || '暂无站点。' }));
-            return section;
-        }
-
-        const list = el('div', { className: 'bbs-sign-list' });
-        for (const target of targets) {
-            list.append(createTargetRow(target, rerender));
-        }
-        section.append(list);
-        return section;
+        rememberManualUndo(entries);
     }
 
     function renderDashboardView(body, rerender) {
-        const targets = getAllTargets().filter(target => target.enabled);
-        syncLaunchedAutoCloseTabs(targets);
-        const visibleTargets = targets.filter(target => targetMatchesSearch(target, dashboardSearchQuery));
-        const summary = getDashboardSummary(targets);
-        const launchableTargets = getLaunchableTargets();
-        const directRunnableTargets = getDirectRunnableTargets();
-        const groups = splitDashboardTargets(visibleTargets);
-        const autoRefreshLeft = getDashboardAutoRefreshLeftSeconds();
-        const searchInput = createSearchField(dashboardSearchQuery, '搜索站点名称、网址或备注', (event) => {
-            dashboardSearchQuery = event.target.value;
-            showDashboard('dashboard');
+        const search = createSearchField(dashboardSearchQuery, '搜索站点名称、网址或备注', event => {
+            dashboardSearchQuery = event.target.value; rerender();
         });
-
-        body.append(
-            el('div', { className: 'bbs-sign-summary' }, [
-                createSummaryCard('已成功', summary.success),
-                createSummaryCard('失败', summary.failed),
-                createSummaryCard('待处理', summary.pending),
-                createSummaryCard('未开始', summary.todo)
-            ]),
-            el('div', { className: 'bbs-sign-toolbar' }, [
-                el('div', { className: 'bbs-sign-search-wrap' }, [
-                    searchInput,
-                    el('span', { className: 'bbs-sign-message', text: `${visibleTargets.length}/${targets.length}` })
-                ]),
-                el('div', { className: 'bbs-sign-actions' }, [
-                    el('button', {
-                        className: 'bbs-sign-button primary',
-                        type: 'button',
-                        text: '一键处理未完成',
-                        onClick: async () => {
-                            startDashboardAutoRefresh(rerender);
-                            rerender();
-                            const directSignPromise = runDirectTargets(getDirectRunnableTargets(), rerender);
-                            for (const target of getLaunchableTargets()) {
-                                launchTarget(target);
-                            }
-                            rerender();
-                            await directSignPromise;
-                            startDashboardAutoRefresh(rerender);
-                            rerender();
-                        }
-                    }),
-                    el('button', {
-                        className: 'bbs-sign-button',
-                        type: 'button',
-                        text: '一键直签',
-                        onClick: async () => {
-                            startDashboardAutoRefresh(rerender);
-                            rerender();
-                            await runDirectTargets(getDirectRunnableTargets(), rerender);
-                            startDashboardAutoRefresh(rerender);
-                            rerender();
-                        }
-                    }),
-                    el('button', {
-                        className: 'bbs-sign-button',
-                        type: 'button',
-                        text: '刷新状态',
-                        onClick: rerender
-                    }),
-                    el('button', {
-                        className: 'bbs-sign-button',
-                        type: 'button',
-                        text: '配置清单',
-                        onClick: () => showDashboard('settings')
-                    })
-                ])
-            ])
-        );
-
-        body.append(el('div', {
-            className: 'bbs-sign-message',
-            text: `今天 ${getToday()}，还有 ${directRunnableTargets.length} 个目标可控制台直签，${launchableTargets.length} 个目标需要打开页面。${autoRefreshLeft ? `自动刷新状态中，约 ${autoRefreshLeft} 秒后停止。` : '已禁用站点已从控制台隐藏，可在配置清单中管理。'}`
-        }));
-
-        if (!targets.length) {
-            body.append(el('div', { className: 'bbs-sign-card', text: '暂无启用的签到目标，请到配置清单启用或添加自定义目标。' }));
-            return;
+        const summary = el('div', { className: 'bbs-sign-summary' });
+        const progressLabel = el('span', { className: 'bbs-sign-progress-label' });
+        const progressFill = el('div', { className: 'bbs-sign-progress-fill' });
+        const progress = el('div', { className: 'bbs-sign-progress' }, [progressFill]);
+        progress.setAttribute('role', 'progressbar');
+        progress.setAttribute('aria-label', '今日签到处理进度');
+        progress.setAttribute('aria-valuemin', '0');
+        progress.setAttribute('aria-valuemax', '100');
+        const overview = el('div', { className: 'bbs-sign-overview' }, [
+            el('div', { className: 'bbs-sign-overview-head' }, [el('span', { className: 'bbs-sign-overview-label', text: '今日概览' }), progressLabel]), progress, summary
+        ]);
+        const feedback = el('div', { className: 'bbs-sign-message bbs-sign-feedback' });
+        feedback.setAttribute('role', 'status');
+        const undo = el('button', { className: 'bbs-sign-button', text: '撤销人工操作（10秒）', type: 'button', onClick: () => {
+            const result = undoManualStatus();
+            feedback.textContent = `已撤销 ${result.restored} 项；${result.changed} 项已有后续更新或已过期，保持现状`;
+            rerender();
+        } });
+        const actions = el('div', { className: 'bbs-sign-actions' });
+        for (const [label, action, tone] of [
+            ['一键处理未完成', async () => { const direct = runDirectTargets(getDirectRunnableTargets(), rerender); for (const target of getLaunchableTargets()) launchTarget(target); rerender(); await direct; }, 'primary'],
+            ['一键直签', () => runDirectTargets(getDirectRunnableTargets(), rerender), ''],
+            ['刷新状态', rerender, 'ghost'],
+            ['配置清单', () => showDashboard('settings'), 'ghost']
+        ]) actions.append(el('button', { className: `bbs-sign-button ${tone}`, text: label, type: 'button', onClick: async () => { await action(); rerender(); } }));
+        search.setAttribute('aria-label', '搜索签到站点');
+        body.append(overview, el('div', { className: 'bbs-sign-toolbar' }, [el('div', { className: 'bbs-sign-search-wrap' }, [search]), actions]), undo, feedback);
+        const sections = new Map();
+        for (const [key, title, hint] of [['attention', '人工待办', '需要你完成最后一步'], ['processing', '自动处理中', '任务结果将自动更新'], ['failed', '失败与待检查', '检查结果后可重试'], ['completed', '已完成（含跳过）', '今日已处理'], ['unstarted', '未开始', '准备好后即可一键处理']]) {
+            const section = el('details', { className: 'bbs-sign-section' });
+            section.dataset.group = key;
+            section.open = key !== 'completed';
+            const count = el('span', { className: 'bbs-sign-section-count' });
+            const heading = el('summary', { className: 'bbs-sign-section-title' }, [el('span', { text: title }), count, el('span', { className: 'bbs-sign-section-hint', text: hint })]);
+            const list = el('div', { className: 'bbs-sign-list' });
+            section.append(heading, list);
+            if (key === 'attention') section.append(el('button', { className: 'bbs-sign-button ghost bbs-sign-batch', text: '批量人工确认成功', type: 'button', onClick: () => {
+                markTargetsSuccess(getAllTargets().filter(item => item.enabled && groupForStatus(getNormalizedTargetStatus(item).status) === 'attention' && targetMatchesSearch(item, dashboardSearchQuery)));
+                feedback.textContent = `已人工确认 ${manualUndo?.entries.length || 0} 项，可在十秒内撤销`; rerender();
+            } }));
+            body.append(section); sections.set(key, { section, count, list, title });
         }
+        const empty = el('div', { className: 'bbs-sign-empty' });
+        body.append(empty);
+        const rows = new Map();
+        body.refresh = () => {
+            syncLaunchedAutoCloseTabs();
+            const targets = getAllTargets().filter(item => item.enabled);
+            const values = getDashboardSummary(targets);
+            const done = values.success + values.skipped;
+            const percent = values.total ? Math.round(done / values.total * 100) : 0;
+            progressLabel.textContent = `${done} / ${values.total} 项已处理 · ${percent}%`;
+            progressFill.style.width = `${percent}%`;
+            progress.setAttribute('aria-valuenow', String(percent));
+            summary.replaceChildren(...[['已成功', values.success, 'success'], ['已跳过', values.skipped, ''], ['失败', values.failed, 'danger'], ['处理 / 待办', values.pending, 'pending'], ['未开始', values.todo, '']].map(([label, count, tone]) => createSummaryCard(label, count, tone)));
+            for (const target of targets) {
+                let row = rows.get(target.id);
+                if (!row) { row = createTargetRow(target, rerender); rows.set(target.id, row); }
+                else row.patch(target);
+                row.hidden = !targetMatchesSearch(target, dashboardSearchQuery);
+                const group = groupForStatus(getNormalizedTargetStatus(target).status);
+                // 有焦点或菜单展开时延后移动该行，保留键盘/鼠标操作现场。
+                if (!row.contains(document.activeElement) && !row.querySelector('details[open]') && row.parentNode !== sections.get(group).list) sections.get(group).list.append(row);
+                else if (!row.parentNode) sections.get(group).list.append(row);
+            }
+            for (const [id, row] of rows) if (!targets.some(item => item.id === id)) { row.remove(); rows.delete(id); }
+            let visibleCount = 0;
+            for (const section of sections.values()) {
+                // 延后移动的行仍属于当前显示分组，避免菜单或焦点随空分区一起消失。
+                const count = [...section.list.children].filter(row => !row.hidden).length;
+                section.count.textContent = String(count);
+                section.section.hidden = count === 0;
+                visibleCount += count;
+            }
+            empty.hidden = visibleCount > 0;
+            empty.textContent = dashboardSearchQuery.trim() ? '没有找到匹配的站点，试试其他名称、网址或备注。' : '还没有启用的签到站点，前往「配置清单」添加或启用。';
+            undo.hidden = !manualUndo || manualUndo.expiresAt < Date.now();
+        };
+        body.refresh();
+        body.addEventListener('focusout', () => setTimeout(rerender, 0));
+    }
 
-        if (!visibleTargets.length) {
-            body.append(el('div', { className: 'bbs-sign-card', text: '没有匹配当前搜索的启用站点。' }));
-            return;
-        }
-
-        body.append(
-            createDashboardSection('未打开', groups.unopened, rerender, {
-                emptyText: '所有匹配站点都已经打开或处理过。'
-            }),
-            createDashboardSection('已打开但未标记成功', groups.openedPending, rerender, {
-                showBatchSuccess: true,
-                emptyText: '暂无需要确认的已打开站点。'
-            }),
-            createDashboardSection('已完成', groups.completed, rerender, {
-                emptyText: '暂无已完成站点。'
-            })
-        );
+    function refreshDashboardData() {
+        const overlay = document.getElementById('bbs-sign-dashboard-overlay');
+        if (overlay?.dataset.view === 'dashboard') dashboardMounted?.body.refresh?.();
+        updateDashboardReminderButton();
     }
 
     function createField(label, input, full = false) {
@@ -4278,12 +4309,12 @@
         const config = getDashboardConfig();
         const allBuiltInTargets = getBuiltInTargets();
         const allCustomTargets = getCustomTargets();
-        const builtInTargets = allBuiltInTargets.filter(target => targetMatchesSearch(target, settingsSearchQuery));
-        const customTargets = allCustomTargets.filter(target => targetMatchesSearch(target, settingsSearchQuery));
+        const builtInTargets = allBuiltInTargets;
+        const customTargets = allCustomTargets;
         const editingTarget = allCustomTargets.find(target => target.id === editingId) || null;
         const searchInput = createSearchField(settingsSearchQuery, '搜索配置项、网址或备注', (event) => {
             settingsSearchQuery = event.target.value;
-            showDashboard('settings', editingId);
+            for (const row of body.querySelectorAll('[data-setting-target]')) row.hidden = !targetMatchesSearch(JSON.parse(row.dataset.settingTarget), settingsSearchQuery);
         });
 
         body.append(
@@ -4309,7 +4340,7 @@
             checked: config.preferences.autoOpenDashboardOnAttention,
             onChange: (event) => {
                 updateDashboardPreference({ autoOpenDashboardOnAttention: event.target.checked });
-                showDashboard('settings', editingId);
+                refreshDashboardData();
             }
         });
         const autoCloseInput = el('input', {
@@ -4317,7 +4348,7 @@
             checked: config.preferences.autoClosePageAfterSign,
             onChange: (event) => {
                 updateDashboardPreference({ autoClosePageAfterSign: event.target.checked });
-                showDashboard('settings', editingId);
+                refreshDashboardData();
             }
         });
         body.append(
@@ -4342,6 +4373,7 @@
         }
         for (const target of builtInTargets) {
             const row = el('div', { className: 'bbs-sign-setting-row' });
+            row.dataset.settingTarget = JSON.stringify(target);
             const checkbox = el('input', {
                 type: 'checkbox',
                 checked: target.enabled,
@@ -4415,7 +4447,7 @@
                             resultMode: resultSelect.value,
                             note: noteInput.value
                         });
-                        if (ok) showDashboard('settings');
+                        if (ok) { dashboardMounted.views.delete('settings'); showDashboard('settings'); }
                     }
                 }),
                 editingTarget ? el('button', {
@@ -4435,7 +4467,7 @@
             customList.append(el('div', { className: 'bbs-sign-card', text: '没有匹配当前搜索的自定义站点。' }));
         }
         for (const target of customTargets) {
-            customList.append(el('div', { className: 'bbs-sign-setting-row' }, [
+            const customRow = el('div', { className: 'bbs-sign-setting-row' }, [
                 el('div', { className: 'bbs-sign-row-main' }, [
                     el('div', { className: 'bbs-sign-name-line' }, [
                         el('span', { className: 'bbs-sign-name', text: target.name }),
@@ -4458,132 +4490,71 @@
                         onClick: () => {
                             if (confirm(`删除自定义目标「${target.name}」？`)) {
                                 deleteCustomTarget(target.id);
-                                showDashboard('settings');
+                                dashboardMounted.views.delete('settings'); showDashboard('settings');
                             }
                         }
                     })
                 ])
-            ]));
+            ]);
+            customRow.dataset.settingTarget = JSON.stringify(target);
+            customList.append(customRow);
         }
         body.append(customList);
-    }
-
-    function prepareDashboardOpenAnimation(panel, sourceRect) {
-        if (!sourceRect) return false;
-        const panelRect = panel.getBoundingClientRect();
-        if (!panelRect.width || !panelRect.height || !sourceRect.width || !sourceRect.height) return false;
-
-        const sourceCenterX = sourceRect.left + sourceRect.width / 2;
-        const sourceCenterY = sourceRect.top + sourceRect.height / 2;
-        const panelCenterX = panelRect.left + panelRect.width / 2;
-        const panelCenterY = panelRect.top + panelRect.height / 2;
-        const scaleX = Math.min(1, Math.max(0.08, sourceRect.width / panelRect.width));
-        const scaleY = Math.min(1, Math.max(0.06, sourceRect.height / panelRect.height));
-
-        panel.style.setProperty('--bbs-sign-enter-x', `${sourceCenterX - panelCenterX}px`);
-        panel.style.setProperty('--bbs-sign-enter-y', `${sourceCenterY - panelCenterY}px`);
-        panel.style.setProperty('--bbs-sign-enter-scale-x', String(scaleX));
-        panel.style.setProperty('--bbs-sign-enter-scale-y', String(scaleY));
-        panel.style.setProperty('--bbs-sign-enter-radius', '999px');
-        panel.classList.add('bbs-sign-panel-from-button');
-        return true;
+        appendBackupSettings(body);
     }
 
     function closeDashboardOverlay(overlay) {
-        stopDashboardAutoRefresh();
+        clearAutoOpenCountdown(true);
         overlay.remove();
+        refreshSyncPolling();
         updateDashboardReminderButton();
     }
 
     function showDashboard(view = 'dashboard', editingId = '') {
         addDashboardStyles();
-        if (view !== 'dashboard') stopDashboardAutoRefresh();
-        const existing = document.getElementById('bbs-sign-dashboard-overlay');
-        const hadExisting = Boolean(existing);
-        const launcherRect = !hadExisting
-            ? document.getElementById('bbs-sign-dashboard-button')?.getBoundingClientRect()
-            : null;
+        for (const target of getAllTargets()) releaseLegacyQueuedTask(target.id);
         clearAutoOpenCountdown(true);
-        const shouldRefocusSearch = existing?.contains(document.activeElement) &&
-            document.activeElement?.classList?.contains('bbs-sign-search');
-        const searchSelectionStart = shouldRefocusSearch ? document.activeElement.selectionStart : null;
-        const existingView = existing?.dataset?.view || view;
-        const existingBody = existing?.querySelector('.bbs-sign-body');
-        if (existingBody) {
-            if (existingView === 'settings') {
-                settingsBodyScrollTop = existingBody.scrollTop;
-            } else {
-                dashboardBodyScrollTop = existingBody.scrollTop;
-            }
+        if (!dashboardMounted) {
+            const overlay = el('div', { onClick: event => { if (event.target === overlay) closeDashboardOverlay(overlay); } });
+            overlay.id = 'bbs-sign-dashboard-overlay';
+            const panel = el('section', { className: 'bbs-sign-panel' });
+            const title = el('h2', { className: 'bbs-sign-title' });
+            title.id = 'bbs-sign-dashboard-title';
+            panel.setAttribute('role', 'dialog');
+            panel.setAttribute('aria-modal', 'true');
+            panel.setAttribute('aria-labelledby', title.id);
+            const subtitle = el('div', { className: 'bbs-sign-subtitle' });
+            const date = el('span', { className: 'bbs-sign-date' });
+            const close = el('button', { className: 'bbs-sign-close', type: 'button', text: '×', title: '关闭控制台', onClick: () => closeDashboardOverlay(overlay) });
+            close.setAttribute('aria-label', '关闭控制台');
+            panel.append(el('header', { className: 'bbs-sign-header' }, [
+                el('div', { className: 'bbs-sign-brand' }, [el('span', { className: 'bbs-sign-brand-mark', text: '签' }), el('div', {}, [title, subtitle])]),
+                el('div', { className: 'bbs-sign-header-tools' }, [date, close])
+            ]));
+            // 在冒泡阶段隔离宿主热键，不阻止目标输入事件抵达自己的监听器。
+            for (const name of ['keydown', 'keypress', 'keyup', 'input', 'compositionstart', 'compositionupdate', 'compositionend']) panel.addEventListener(name, event => event.stopPropagation());
+            overlay.append(panel);
+            dashboardMounted = { overlay, panel, title, subtitle, date, body: null, views: new Map(), editingId: '' };
         }
-        if (existing) existing.remove();
-
-        const overlay = el('div', { className: hadExisting ? 'bbs-sign-no-enter' : '', onClick: (event) => {
-            if (event.target === overlay) closeDashboardOverlay(overlay);
-        }});
-        overlay.id = 'bbs-sign-dashboard-overlay';
-        overlay.dataset.view = view;
-
-        const panel = el('section', { className: 'bbs-sign-panel' });
-        if (launcherRect) {
-            panel.style.visibility = 'hidden';
-            panel.style.animation = 'none';
+        const mounted = dashboardMounted;
+        if (view === 'settings' && editingId !== mounted.editingId) { mounted.views.delete('settings'); mounted.editingId = editingId; }
+        if (mounted.body) mounted.body.remove();
+        let body = mounted.views.get(view);
+        if (!body) {
+            body = el('div', { className: 'bbs-sign-body' });
+            mounted.views.set(view, body);
+            if (view === 'settings') renderSettingsView(body, editingId);
+            else renderDashboardView(body, refreshDashboardData);
         }
-        for (const eventName of ['keydown', 'keypress', 'keyup', 'input', 'compositionstart', 'compositionupdate', 'compositionend']) {
-            panel.addEventListener(eventName, (event) => {
-                if (event.target.closest('input, textarea, select')) {
-                    event.stopPropagation();
-                }
-            }, true);
-        }
-        const body = el('div', { className: 'bbs-sign-body' });
-        const rerender = () => showDashboard(view, editingId);
-        panel.append(
-            el('header', { className: 'bbs-sign-header' }, [
-                el('div', {}, [
-                    el('h2', { className: 'bbs-sign-title', text: view === 'settings' ? '签到清单配置' : '每日签到控制台' }),
-                    el('div', { className: 'bbs-sign-subtitle', text: '集中打开、查看和确认每日论坛签到状态' })
-                ]),
-                el('button', {
-                    className: 'bbs-sign-close',
-                    type: 'button',
-                    text: '关闭',
-                    onClick: () => closeDashboardOverlay(overlay)
-                })
-            ]),
-            body
-        );
-
-        if (view === 'settings') {
-            renderSettingsView(body, editingId);
-        } else {
-            renderDashboardView(body, rerender);
-        }
-
-        overlay.append(panel);
-        document.body.append(overlay);
-        if (launcherRect) {
-            const hasLauncherAnimation = prepareDashboardOpenAnimation(panel, launcherRect);
-            requestAnimationFrame(() => {
-                if (!hasLauncherAnimation) {
-                    panel.classList.remove('bbs-sign-panel-from-button');
-                }
-                panel.style.visibility = '';
-                panel.style.animation = '';
-            });
-        }
-        body.scrollTop = view === 'settings' ? settingsBodyScrollTop : dashboardBodyScrollTop;
-        if (shouldRefocusSearch) {
-            const searchInput = body.querySelector('.bbs-sign-search');
-            if (searchInput) {
-                setTimeout(() => {
-                    searchInput.focus();
-                    const caret = Number.isFinite(searchSelectionStart) ? searchSelectionStart : searchInput.value.length;
-                    searchInput.setSelectionRange(caret, caret);
-                }, 0);
-            }
-        }
-        updateDashboardReminderButton();
+        mounted.body = body;
+        mounted.overlay.dataset.view = view;
+        mounted.title.textContent = view === 'settings' ? '签到清单配置' : '每日签到控制台';
+        mounted.subtitle.textContent = view === 'settings' ? '管理站点、打开方式与确认偏好' : '每天一点，轻松完成';
+        mounted.date.textContent = new Date().toLocaleDateString('zh-CN', { month: 'long', day: 'numeric', weekday: 'long' });
+        mounted.panel.append(body);
+        if (!mounted.overlay.isConnected) document.body.append(mounted.overlay);
+        refreshDashboardData();
+        refreshSyncPolling();
     }
 
     function initDashboardEntry() {
@@ -4659,6 +4630,282 @@
         }
     }
 
+    function refreshSyncPolling() {
+        if (syncPollTimer) { clearInterval(syncPollTimer); syncPollTimer = null; }
+        if ((typeof GM_addValueChangeListener !== 'function' || typeof GM_removeValueChangeListener !== 'function') && (!document.hidden || directTasks.size || launchedAutoCloseTabs.size)) {
+            syncPollTimer = setInterval(checkSynchronizedState, 5000);
+        }
+    }
+
+    function scheduleSynchronizedRefresh() {
+        if (syncRefreshTimer) return;
+        syncRefreshTimer = setTimeout(() => { syncRefreshTimer = null; checkSynchronizedState(); }, 50);
+    }
+
+    function bindStateListeners() {
+        if (typeof GM_removeValueChangeListener === 'function') for (const id of syncListenerIds) GM_removeValueChangeListener(id);
+        syncListenerIds = [];
+        if (typeof GM_addValueChangeListener !== 'function' || typeof GM_removeValueChangeListener !== 'function') return;
+        const keys = new Set([STORAGE_KEYS.dashboardConfig, STORAGE_KEYS.dashboardStatus, STORAGE_KEYS.successData]);
+        for (const target of getAllTargets()) {
+            keys.add(getTargetStatusStorageKey(getToday(), target.id));
+            keys.add(getScopedStorageKey(STORAGE_KEYS.successData, target.id));
+            keys.add(getScopedStorageKey(STORAGE_KEYS.task, target.id));
+        }
+        for (const key of keys) syncListenerIds.push(GM_addValueChangeListener(key, () => {
+            if (key === STORAGE_KEYS.dashboardConfig) bindStateListeners();
+            scheduleSynchronizedRefresh();
+        }));
+    }
+
+    function scheduleMidnightCheck() {
+        clearTimeout(midnightTimer);
+        const next = new Date(); next.setHours(24, 0, 0, 50);
+        midnightTimer = setTimeout(() => { checkSynchronizedState(); scheduleMidnightCheck(); }, Math.max(50, next.getTime() - Date.now()));
+    }
+
+    function checkSynchronizedState() {
+        if (syncDay !== getToday()) {
+            syncDay = getToday();
+            bindStateListeners();
+            scheduleMidnightCheck();
+            clearAutoOpenCountdown(false);
+            runDailyHistoryCleanup();
+        }
+        refreshDashboardData();
+    }
+
+    function stopStateSynchronization() {
+        for (const id of syncListenerIds) GM_removeValueChangeListener(id);
+        syncListenerIds = [];
+        clearInterval(syncPollTimer); clearTimeout(midnightTimer); clearTimeout(syncRefreshTimer); clearTimeout(manualUndoTimer);
+        syncPollTimer = midnightTimer = syncRefreshTimer = null;
+        stopLaunchedAutoCloseMonitor(); clearAutoOpenCountdown(false);
+        for (const state of captchaAutoSubmitStates.values()) state.stop?.();
+        for (const stop of pageObserverStops) stop();
+    }
+
+    function startStateSynchronization() {
+        if (syncStarted) return;
+        syncStarted = true;
+        if (!isLimestartHost()) { window.addEventListener('pagehide', stopStateSynchronization); runDailyHistoryCleanup(); return; }
+        syncDay = getToday(); bindStateListeners(); scheduleMidnightCheck(); refreshSyncPolling(); runDailyHistoryCleanup();
+        window.addEventListener('focus', checkSynchronizedState);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) checkSynchronizedState(); refreshSyncPolling(); });
+        window.addEventListener('pagehide', stopStateSynchronization);
+        window.addEventListener('pageshow', () => { bindStateListeners(); checkSynchronizedState(); scheduleMidnightCheck(); refreshSyncPolling(); });
+    }
+
+    function listOwnedDataKeys() {
+        if (typeof GM_listValues !== 'function') throw new Error('当前脚本管理器不支持枚举存储，无法安全恢复或清理；请更新管理器');
+        return GM_listValues().filter(key => [STORAGE_KEYS.dashboardConfig, STORAGE_KEYS.successData, STORAGE_KEYS.dashboardStatus, STORAGE_KEYS.mutation, STORAGE_KEYS.task].some(base => key === base || key.startsWith(base + ':')));
+    }
+
+    function deleteStoredValue(key) {
+        if (typeof GM_deleteValue !== 'function') throw new Error('当前脚本管理器不支持同步删除存储，请更新管理器');
+        GM_deleteValue(key);
+    }
+
+    function isValidDay(day) {
+        try { return typeof day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(day) && new Date(day + 'T12:00:00Z').toISOString().slice(0, 10) === day; } catch (err) { return false; }
+    }
+
+    function backupUrl(value) {
+        const url = new URL(value);
+        url.username = ''; url.password = '';
+        for (const key of [...url.searchParams.keys()]) if (DEBUG_SENSITIVE_KEY_RE.test(key) || key === '__bbs_task') url.searchParams.delete(key);
+        return url.href;
+    }
+
+    function portableState(state) {
+        const transient = ['running', 'queued', 'opened'].includes(state.status);
+        return { schemaVersion: 1, status: STATUS_META[state.status] && !transient ? state.status : 'result-unknown',
+            stage: transient ? 'restore-check' : state.stage || '', confirmationSource: ['manual', 'automatic', 'legacy'].includes(state.confirmationSource) ? state.confirmationSource : 'legacy',
+            message: truncateDebugText(redactDebugText(transient ? '已恢复未完成记录，请重新检查结果' : state.message || ''), 500),
+            updatedAt: state.updatedAt || '', reasonCode: transient ? 'restored' : state.reasonCode || '' };
+    }
+
+    function structuredCopy(value) { return JSON.parse(JSON.stringify(value)); }
+
+    function createBackup(includeStates = false, snapshotEntries = null) {
+        const snapshot = snapshotEntries ? new Map(snapshotEntries) : null;
+        const config = snapshot ? normalizeDashboardConfig(snapshot.get(STORAGE_KEYS.dashboardConfig) || DEFAULT_DASHBOARD_CONFIG) : getDashboardConfig();
+        config.customTargets = config.customTargets.map(item => ({ id: item.id, name: item.name, url: backupUrl(item.url), enabled: item.enabled !== false, openMode: item.openMode || 'background', resultMode: item.resultMode || 'opened', note: redactDebugText(item.note || '') }));
+        config.targetSettings = Object.fromEntries(Object.entries(config.targetSettings).map(([id, item]) => [id, { enabled: item.enabled !== false, openMode: item.openMode || siteConfigs.find(site => site.key === id)?.dashboard.openMode || 'background', resultMode: item.resultMode || 'script', ...(item.url ? { url: backupUrl(item.url) } : {}) }]));
+        const backup = { type: 'BBSSignHelperBackup', schemaVersion: 1, exportedAt: getLocalDateTimeWithOffset(), config };
+        if (includeStates) {
+            const successDates = snapshot ? structuredCopy(snapshot.get(STORAGE_KEYS.successData) || {}) : readObject(STORAGE_KEYS.successData);
+            const dailyStatus = snapshot ? structuredCopy(snapshot.get(STORAGE_KEYS.dashboardStatus) || {}) : getStatusStore();
+            for (const key of snapshot ? snapshot.keys() : listOwnedDataKeys()) {
+                if (key.startsWith(STORAGE_KEYS.successData + ':')) successDates[key.slice(STORAGE_KEYS.successData.length + 1)] = snapshot ? snapshot.get(key) : GM_getValue(key);
+                if (key.startsWith(STORAGE_KEYS.dashboardStatus + ':')) {
+                    const rest = key.slice(STORAGE_KEYS.dashboardStatus.length + 1); const day = rest.slice(0, 10); const id = rest.slice(11);
+                    if (isValidDay(day)) { dailyStatus[day] = dailyStatus[day] || {}; dailyStatus[day][id] = snapshot ? snapshot.get(key) : GM_getValue(key); }
+                }
+            }
+            backup.states = { successDates: Object.fromEntries(Object.entries(successDates).filter(([, day]) => isValidDay(day))),
+                dailyStatus: Object.fromEntries(Object.entries(dailyStatus).filter(([day]) => isValidDay(day)).map(([day, values]) => [day, Object.fromEntries(Object.entries(values).filter(([, value]) => value && typeof value === 'object').map(([id, state]) => [id, portableState(state)]))])) };
+        }
+        return backup;
+    }
+
+    function validateBackup(text) {
+        if (typeof text !== 'string' || new Blob([text]).size > 5 * 1024 * 1024) throw new Error('备份不得超过 5 MiB');
+        let backup;
+        try { backup = JSON.parse(text); } catch (err) { throw new Error('备份不是合法 JSON'); }
+        const object = value => value && typeof value === 'object' && !Array.isArray(value);
+        const fail = () => { throw new Error('备份字段、网址、日期或枚举值无效'); };
+        if (!object(backup) || backup.type !== 'BBSSignHelperBackup' || backup.schemaVersion !== 1) throw new Error('不支持的备份类型或格式版本');
+        const config = backup.config;
+        if (!object(config) || !object(config.targetSettings) || !object(config.preferences) || !Array.isArray(config.customTargets) || config.customTargets.length > 200) fail();
+        const ids = new Set(siteConfigs.map(site => site.key));
+        const validId = id => typeof id === 'string' && id.length > 0 && id.length <= 120 && !['__proto__', 'constructor', 'prototype'].includes(id) && !/[\s:]/.test(id);
+        const validModes = item => ['background', 'foreground', 'manual'].includes(item.openMode) && ['script', 'opened', 'manual'].includes(item.resultMode) && typeof item.enabled === 'boolean';
+        for (const item of config.customTargets) {
+            if (!object(item) || !validId(item.id) || ids.has(item.id) || typeof item.name !== 'string' || !item.name.trim() || item.name.length > 200 || !safeUrl(item.url) || !validModes(item) || (item.note !== undefined && (typeof item.note !== 'string' || item.note.length > 2000))) fail();
+            ids.add(item.id);
+        }
+        for (const [id, item] of Object.entries(config.targetSettings)) if (!siteConfigs.some(site => site.key === id) || !object(item) || !validModes(item) || (item.url !== undefined && !safeUrl(item.url))) fail();
+        for (const key of ['autoClosePageAfterSign', 'autoOpenDashboardOnAttention']) if (typeof config.preferences[key] !== 'boolean') fail();
+        if (![undefined, 0, 7, 30, 90].includes(config.preferences.historyRetentionDays)) fail();
+        if (backup.states !== undefined) {
+            const states = backup.states;
+            if (!object(states) || !object(states.successDates) || !object(states.dailyStatus) || Object.keys(states.dailyStatus).length > 1000) fail();
+            for (const [id, day] of Object.entries(states.successDates)) if (!validId(id) || !isValidDay(day)) fail();
+            let count = 0;
+            for (const [day, values] of Object.entries(states.dailyStatus)) {
+                if (!isValidDay(day) || !object(values)) fail();
+                for (const [id, state] of Object.entries(values)) {
+                    if (++count > 20000 || !validId(id) || !object(state) || typeof state.status !== 'string' || (state.confirmationSource && !['automatic', 'manual', 'legacy'].includes(state.confirmationSource)) || (state.updatedAt && !Number.isFinite(Date.parse(state.updatedAt)))) fail();
+                    values[id] = portableState(state);
+                }
+            }
+        }
+        // 只接受声明字段，避免把未知对象带回配置或运行时状态。
+        return { type: backup.type, schemaVersion: 1, config: { targetSettings: Object.fromEntries(Object.entries(config.targetSettings).map(([id, item]) => [id, { enabled: item.enabled, openMode: item.openMode, resultMode: item.resultMode, ...(item.url ? { url: backupUrl(item.url) } : {}) }])),
+            customTargets: config.customTargets.map(item => ({ id: item.id, name: item.name, url: backupUrl(item.url), enabled: item.enabled, openMode: item.openMode, resultMode: item.resultMode, note: redactDebugText(item.note || '') })), preferences: { autoClosePageAfterSign: config.preferences.autoClosePageAfterSign, autoOpenDashboardOnAttention: config.preferences.autoOpenDashboardOnAttention, historyRetentionDays: config.preferences.historyRetentionDays || 0 } }, ...(backup.states ? { states: backup.states } : {}) };
+    }
+
+    function previewBackup(backup, sections = { config: true, states: false }) {
+        return { configTargets: sections.config ? siteConfigs.length + backup.config.customTargets.length : 0,
+            dates: sections.states && backup.states ? Object.keys(backup.states.successDates).length : 0,
+            records: sections.states && backup.states ? Object.values(backup.states.dailyStatus).reduce((sum, day) => sum + Object.keys(day).length, 0) : 0 };
+    }
+
+    function restoreImportSnapshot() {
+        const snapshot = GM_getValue(STORAGE_KEYS.recovery);
+        if (!snapshot || !Array.isArray(snapshot.entries)) throw new Error('未找到有效恢复快照');
+        GM_setValue(STORAGE_KEYS.importPending, { restoring: true });
+        for (const key of listOwnedDataKeys()) deleteStoredValue(key);
+        for (const [key, value] of snapshot.entries) GM_setValue(key, value);
+        GM_setValue(STORAGE_KEYS.importPending, null);
+    }
+
+    function recoverPendingImport() {
+        if (!GM_getValue(STORAGE_KEYS.importPending)) return true;
+        try { restoreImportSnapshot(); alert('已恢复上次未完成导入之前的数据。'); return true; }
+        catch (err) { alert('上次导入未完成，自动恢复失败；恢复快照仍保留，请在配置页重试恢复。' + stringifyDebugError(err)); return false; }
+    }
+
+    function applyBackup(backup, sections = { config: true, states: false }) {
+        if (GM_getValue(STORAGE_KEYS.importPending)) throw new Error('请先恢复上次未完成的导入，再应用新备份');
+        // API 入口再次验证，预览之后的对象也不能绕过校验。
+        backup = validateBackup(JSON.stringify(backup));
+        if (!sections.config && !(sections.states && backup.states)) throw new Error('请选择至少一个可恢复分区');
+        const entries = listOwnedDataKeys().map(key => [key, GM_getValue(key)]);
+        if (new Blob([JSON.stringify(entries)]).size > 5 * 1024 * 1024) throw new Error('当前恢复快照超过 5 MiB，请先导出备份并按保留策略清理历史');
+        GM_setValue(STORAGE_KEYS.recovery, { savedAt: getLocalDateTimeWithOffset(), entries });
+        GM_setValue(STORAGE_KEYS.importPending, { startedAt: getLocalDateTimeWithOffset() });
+        try {
+            if (sections.config) saveDashboardConfig(backup.config);
+            if (sections.states && backup.states) {
+                for (const target of getAllTargets()) invalidateTargetOperation(target.id);
+                for (const key of listOwnedDataKeys()) if ([STORAGE_KEYS.successData, STORAGE_KEYS.dashboardStatus].some(base => key === base || key.startsWith(base + ':'))) deleteStoredValue(key);
+                GM_setValue(STORAGE_KEYS.successData, backup.states.successDates);
+                GM_setValue(STORAGE_KEYS.dashboardStatus, backup.states.dailyStatus);
+                for (const [id, day] of Object.entries(backup.states.successDates)) GM_setValue(getScopedStorageKey(STORAGE_KEYS.successData, id), day);
+                for (const [day, values] of Object.entries(backup.states.dailyStatus)) for (const [id, value] of Object.entries(values)) {
+                    const context = invalidateTargetOperation(id);
+                    GM_setValue(getTargetStatusStorageKey(day, id), { ...portableState(value), mutationId: context.mutationId, writeId: newOperationId() });
+                }
+            }
+            GM_setValue(STORAGE_KEYS.importPending, null);
+            return { ...previewBackup(backup, sections), recovered: false };
+        } catch (err) {
+            try { restoreImportSnapshot(); } catch (recoveryError) { throw new Error('导入失败，自动恢复也失败；快照已保留，可重试恢复：' + stringifyDebugError(recoveryError)); }
+            throw new Error('导入失败，已恢复导入前数据：' + stringifyDebugError(err));
+        }
+    }
+
+    function previewHistoryCleanup(days = getDashboardConfig().preferences.historyRetentionDays) {
+        if (![7, 30, 90].includes(days)) return { dates: [], scopedKeys: [], records: 0 };
+        const cutoff = new Date(); cutoff.setDate(cutoff.getDate() - days + 1); const limit = `${cutoff.getFullYear()}-${String(cutoff.getMonth() + 1).padStart(2, '0')}-${String(cutoff.getDate()).padStart(2, '0')}`;
+        const dates = new Set(Object.keys(getStatusStore()).filter(day => isValidDay(day) && day < limit));
+        const scopedKeys = listOwnedDataKeys().filter(key => {
+            if (!key.startsWith(STORAGE_KEYS.dashboardStatus + ':')) return false;
+            const day = key.slice(STORAGE_KEYS.dashboardStatus.length + 1, STORAGE_KEYS.dashboardStatus.length + 11);
+            if (isValidDay(day) && day < limit) { dates.add(day); return true; } return false;
+        });
+        const pairs = new Set();
+        for (const day of dates) for (const id of Object.keys(getStatusStore()[day] || {})) pairs.add(day + ':' + id);
+        for (const key of scopedKeys) pairs.add(key.slice(STORAGE_KEYS.dashboardStatus.length + 1));
+        return { dates: [...dates].sort(), scopedKeys, records: pairs.size };
+    }
+
+    function cleanHistory(preview = previewHistoryCleanup(), maxDates = Infinity) {
+        const selected = new Set(preview.dates.slice(0, maxDates));
+        const store = getStatusStore();
+        for (const day of selected) delete store[day];
+        // 先移除汇总，再移除拆分；旧镜像不能复活已清理的数据。
+        saveStatusStore(store);
+        for (const key of preview.scopedKeys) if (selected.has(key.slice(STORAGE_KEYS.dashboardStatus.length + 1, STORAGE_KEYS.dashboardStatus.length + 11))) deleteStoredValue(key);
+        return selected.size;
+    }
+
+    function runDailyHistoryCleanup() {
+        if (!getDashboardConfig().preferences.historyRetentionDays || GM_getValue('BBSSignHelperHistoryCleanupDay') === getToday()) return;
+        try { cleanHistory(previewHistoryCleanup(), 20); GM_setValue('BBSSignHelperHistoryCleanupDay', getToday()); }
+        catch (err) { console.log('[签到助手] 历史自动清理未完成', stringifyDebugError(err)); }
+    }
+
+    function downloadJson(value, filename) {
+        const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: 'application/json;charset=utf-8' }));
+        const link = el('a', { href: url }); link.download = filename; link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function appendBackupSettings(body) {
+        const feedback = el('div', { className: 'bbs-sign-message' });
+        const include = el('input', { type: 'checkbox' });
+        const importConfig = el('input', { type: 'checkbox', checked: true });
+        const importStates = el('input', { type: 'checkbox' });
+        const input = shieldDashboardInput(el('input', { type: 'file' })); input.accept = '.json,application/json';
+        let pending = null;
+        const describe = () => {
+            if (!pending) return;
+            const count = previewBackup(pending, { config: importConfig.checked, states: importStates.checked });
+            feedback.textContent = `分区替换预览：配置目标 ${count.configTargets}，成功日期 ${count.dates}，每日记录 ${count.records}；未选分区保留。应用前会保存恢复快照。`;
+        };
+        input.addEventListener('change', async () => {
+            pending = null;
+            try { const file = input.files[0]; if (!file) return; if (file.size > 5 * 1024 * 1024) throw new Error('文件超过 5 MiB'); pending = validateBackup(await file.text()); describe(); }
+            catch (err) { feedback.textContent = stringifyDebugError(err); }
+        });
+        importConfig.addEventListener('change', describe); importStates.addEventListener('change', describe);
+        const safeAction = fn => () => { try { fn(); } catch (err) { feedback.textContent = stringifyDebugError(err); } };
+        body.append(el('div', { className: 'bbs-sign-section-title', text: '备份、恢复与历史' }), el('div', { className: 'bbs-sign-card' }, [
+            el('label', {}, [include, el('span', { text: '导出时包含日期和可恢复状态' })]),
+            el('button', { className: 'bbs-sign-button', text: '导出备份', onClick: safeAction(() => downloadJson(createBackup(include.checked), `bbs-sign-backup-${getToday()}.json`)) }),
+            input,
+            el('label', {}, [importConfig, el('span', { text: '替换配置' })]), el('label', {}, [importStates, el('span', { text: '替换备份中的状态' })]),
+            el('button', { className: 'bbs-sign-button', text: '应用已预览备份', onClick: safeAction(() => { if (!pending) throw new Error('请先选择有效备份并查看预览'); const result = applyBackup(pending, { config: importConfig.checked, states: importStates.checked }); feedback.textContent = `已恢复：配置目标 ${result.configTargets}，日期 ${result.dates}，记录 ${result.records}`; pending = null; bindStateListeners(); }) }),
+            el('button', { className: 'bbs-sign-button', text: '下载恢复快照', onClick: safeAction(() => { const snapshot = GM_getValue(STORAGE_KEYS.recovery); if (!snapshot?.entries) throw new Error('暂无恢复快照'); downloadJson(createBackup(true, snapshot.entries), `bbs-sign-recovery-${getToday()}.json`); }) }),
+            el('button', { className: 'bbs-sign-button', text: '恢复导入前快照', onClick: safeAction(() => { restoreImportSnapshot(); feedback.textContent = '已恢复导入前快照'; refreshDashboardData(); }) }),
+            createSelect(getDashboardConfig().preferences.historyRetentionDays, [{ value: 0, label: '历史保留全部（默认）' }, { value: 7, label: '保留7天' }, { value: 30, label: '保留30天' }, { value: 90, label: '保留90天' }], event => updateDashboardPreference({ historyRetentionDays: Number(event.target.value) })),
+            el('button', { className: 'bbs-sign-button', text: '预览并清理历史', onClick: safeAction(() => { const preview = previewHistoryCleanup(); feedback.textContent = `清理范围：${preview.dates.join('、') || '无'}，${preview.records} 条记录`; if (preview.dates.length && confirm(feedback.textContent + '。执行清理？')) { cleanHistory(preview); feedback.textContent = `已清理 ${preview.dates.length} 个日期、${preview.records} 条记录`; } }) }), feedback
+        ]));
+    }
+
     function registerSignDebugMenus() {
         GM_registerMenuCommand('下载签到失败调试日志（保留3天）', downloadSignDebugLogs);
         GM_registerMenuCommand('清空签到失败调试日志', clearSignDebugLogs);
@@ -4681,12 +4928,16 @@
     const todayStr = getToday();
     const currentHost = window.location.hostname;
 
+    const recoverySucceeded = recoverPendingImport();
     registerDashboardMenu();
+    if (recoverySucceeded) startStateSynchronization();
 
     if (isLimestartHost(currentHost)) {
         initDashboardEntry();
         return;
     }
+
+    if (!recoverySucceeded) return;
 
     for (const site of siteConfigs) {
         // 匹配域名
@@ -4694,9 +4945,25 @@
         if (isMatch) {
             console.log(`[签到助手] 进入 ${site.name} 模块`);
 
-            const lastSignDate = getData(site.key);
+            releaseLegacyQueuedTask(site.key);
+            const manualStatus = getRawTargetStatus(site.key);
+            let operation = bindPageTask(site.key);
+            if (manualStatus?.stage === 'manual' && ['failed', 'skipped'].includes(manualStatus.status) && !operation?.checkOnly) return;
+            // 验证前的入口点击、未完成状态不能阻止站点继续执行。
+            // ZodGame 已发出的签到表单只查结果；SS同盟按原站点流程自行检查和刷新重试。
+            const submittedForm = site.key === 'ZodGame' && (manualStatus?.status === 'result-unknown' || hasPageSubmittedAction(site.key, operation));
+            const recoveryOnly = Boolean(operation?.checkOnly || submittedForm);
+            if (!operation && hasActiveTask(site.key)) {
+                showPageSignToast(site.key, 'opened', { message: '此站点正在其他页面处理，请回到对应任务页' });
+                return;
+            }
+            operation = operation || acquireTaskLease(site.key, 'page');
+            if (!operation) return;
+            pageOperations.set(site.key, operation);
+            sessionStorage.setItem(`BBSSignHelperPageTask:${site.key}`, operation.taskId);
+            const hasConfirmedToday = isSignSuccessRecorded(site.key);
             const shouldRecheckUuGgSignPage = site.key === 'uugg' && /plugin\.php\?id=dsu_paulsign(?::|%3A)sign/i.test(location.href);
-            if (lastSignDate === todayStr && !shouldRecheckUuGgSignPage) {
+            if (hasConfirmedToday && !recoveryOnly && !shouldRecheckUuGgSignPage && site.key !== 'sstm') {
                 console.log(`[签到助手] ${site.name} 今日已完成，跳过。`);
                 recordTargetStatus(site.key, 'success', {
                     stage: 'skip',
@@ -4706,6 +4973,7 @@
                     countCompletedPageSignToast: true
                 });
                 maybeAutoClosePageAfterSign(site.key);
+                finishTaskLease(operation);
                 return; // 当日已执行，退出
             }
 
@@ -4718,19 +4986,18 @@
                 });
                 const beforeStatus = getRawTargetStatus(site.key);
                 // 运行该站点的特定逻辑，如果执行完成返回 true，则保存今天的日期
-                let isSuccess = await site.run();
-                if (!isSuccess) {
+                const pageResult = await runPageTask(site, debugContext, recoveryOnly);
+                let isSuccess = pageResult.outcome === 'success';
+                if (!isSuccess && site.key !== 'sstm' && pageResult.outcome !== 'not-completed' && !['needs-login', 'needs-foreground', 'failed'].includes(getRawTargetStatus(site.key)?.status)) {
                     isSuccess = await waitForSiteSuccessRecheck(site);
                 }
                 if (isSuccess) {
-                    if (getData(site.key) !== todayStr) {
-                        markSignSuccess(site.key);
-                    }
+                    if (!isSignSuccessRecorded(site.key)) await checkSiteResult(site, debugContext);
                 } else {
                     const rawAfterStatus = getRawTargetStatus(site.key);
-                    if (!rawAfterStatus || rawAfterStatus.updatedAt === beforeStatus?.updatedAt) {
+                    if (!rawAfterStatus || rawAfterStatus.writeId === beforeStatus?.writeId) {
                         const isSstm = site.key === 'sstm';
-                        recordTargetStatus(site.key, isSstm ? 'needs-foreground' : 'opened', {
+                        recordTargetStatus(site.key, isSstm ? 'needs-foreground' : debugContext.submitted || recoveryOnly ? 'result-unknown' : 'failed', {
                             stage: 'run',
                             message: isSstm
                                 ? '本次未确认成功，SS同盟可能需要前台页面继续处理'
@@ -4748,8 +5015,13 @@
                 }
             } catch (err) {
                 console.error(`[签到助手] ${site.name} 执行时发生错误:`, err);
-                recordTargetStatus(site.key, 'failed', {
-                    stage: 'error',
+                const reasonCode = err.reasonCode || 'adaptation';
+                let recovered = false;
+                if (debugContext.submitted && !['login', 'captcha', 'cancelled'].includes(reasonCode)) {
+                    try { recovered = (await site.check(debugContext)).outcome === 'success'; } catch (checkError) { /* 结果未知保留人工检查。 */ }
+                }
+                if (!recovered) recordTargetStatus(site.key, reasonCode === 'login' ? 'needs-login' : reasonCode === 'captcha' ? 'needs-foreground' : debugContext.submitted ? 'result-unknown' : 'failed', {
+                    reasonCode, stage: 'error',
                     message: `执行异常：${stringifyDebugError(err) || '未知错误'}`,
                     url: location.href
                 });
@@ -4761,6 +5033,8 @@
                 });
             } finally {
                 finishSignDebugCapture(debugContext);
+                // 人工验证码监视器可以继续保留到页面租约期限；不永久续租。
+                if (!['needs-foreground', 'needs-login', 'result-unknown', 'opened'].includes(getRawTargetStatus(site.key)?.status)) finishTaskLease(operation);
             }
             break; // 匹配到一个站点后就不再往下走了
         }
