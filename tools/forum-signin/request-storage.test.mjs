@@ -22,6 +22,7 @@ for (const [status, text, code] of [[401, '', 'login'], [403, 'captcha', 'captch
     assert.equal(timeout.run(`classifyHttpResponse(${status},${JSON.stringify(text)}).reasonCode`), code);
 }
 assert.equal(timeout.run("classifyHttpResponse(429,'','Retry-After: 99999').retryAfterMs"), 60000);
+await assert.rejects(timeout.run("fetchBuffered(async()=>new Response('Not found',{status:404}),'https://example.test/',{})"), error => error.httpStatus === 404 && error.reasonCode === 'adaptation');
 
 const retry = await createFixture();
 retry.run(`globalThis.calls=[];

@@ -277,6 +277,59 @@ try {
     assert.equal(new URL(ownRequests[0].url).pathname, '/topic/123-test/');
     await pagedSstm.close();
 
+    // 新一天本人尚无评论：IPS 的作者过滤可能返回 404，不能因此中断首次签到。
+    const newDayMarkup = ipsMarkup.replaceAll('2026/10/9', '2026/10/10').replace(' disabled', '') + '<a href="/topic/123-test/?view_author=11">只看该作者</a>';
+    const missingAuthorSstm = await pageFor('https://sstm.moe/topic/123-test/', newDayMarkup);
+    await missingAuthorSstm.evaluate(() => {
+        window.__now = new Date('2026-10-10T11:17:43+08:00').getTime();
+        window.__fetchResponses.push({ status: 404, text: '<h1>找不到此页面</h1>' });
+        window.__newDayPosts = 0;
+        document.querySelector('form').onsubmit = event => {
+            event.preventDefault(); __newDayPosts++;
+            document.querySelector('[data-role="commentFeed"]').innerHTML = '<article class="ipsComment"><aside class="cAuthorPane"><h3><a href="/profile/7-me/">本人</a></h3></aside><div data-role="commentContent">' + document.querySelector('[contenteditable]').innerHTML + '</div></article>';
+        };
+    });
+    await missingAuthorSstm.evaluate(engine);
+    assert.equal(await result(missingAuthorSstm, 'sstm'), 'success', '次日本人过滤404后继续填写提交并确认发布');
+    assert.equal(await missingAuthorSstm.evaluate(() => __newDayPosts), 1);
+    assert.equal(await missingAuthorSstm.evaluate(() => __requests.length), 1, '404不增加翻页或重试请求');
+    await missingAuthorSstm.close();
+
+    const pending404Sstm = await pageFor('https://sstm.moe/topic/123-test/', newDayMarkup);
+    await pending404Sstm.evaluate(() => {
+        window.__now = new Date('2026-10-10T11:17:43+08:00').getTime();
+        window.__fetchResponses.push(...Array.from({ length: 4 }, () => ({ status: 404, text: '找不到此页面' })));
+        window.__pending404Posts = 0;
+        document.querySelector('form').onsubmit = event => { event.preventDefault(); __pending404Posts++; };
+    });
+    await pending404Sstm.evaluate(engine);
+    assert.equal(await result(pending404Sstm, 'sstm'), 'result-unknown', '提交后过滤404仍是待确认，不能算成功');
+    await pending404Sstm.evaluate(engine);
+    assert.equal(await pending404Sstm.evaluate(() => __pending404Posts), 1, '再次执行过滤404时仍不重复提交');
+    const checked404 = await evaluate(pending404Sstm, "checkSiteResult(siteConfigs.find(s=>s.key==='sstm'), startSignDebugCapture('sstm','SS同盟','check'))");
+    assert.equal(checked404.outcome, 'unknown', '显式复查404不能宣称明确未签');
+    assert.equal(await pending404Sstm.evaluate(() => __pending404Posts), 1);
+    await pending404Sstm.close();
+
+    for (const [status, text, path, expected] of [
+        [403, 'Forbidden', '/topic/123-test/', 'failed'],
+        [404, 'Just a moment', '/topic/123-test/', 'needs-foreground'],
+        [404, '找不到此页面', '/topic/other-test/', 'failed']
+    ]) {
+        const blockedSstm = await pageFor('https://sstm.moe/topic/123-test/', newDayMarkup);
+        await blockedSstm.evaluate(({ status, text, path }) => {
+            window.__now = new Date('2026-10-10T11:17:43+08:00').getTime();
+            document.querySelector('a[href*="view_author="]').href = path + '?view_author=11';
+            window.__fetchResponses.push({ status, text });
+            window.__blockedPosts = 0;
+            document.querySelector('form').onsubmit = event => { event.preventDefault(); __blockedPosts++; };
+        }, { status, text, path });
+        await blockedSstm.evaluate(engine);
+        assert.equal(await result(blockedSstm, 'sstm'), expected, '权限、验证或其他帖子404不按空作者过滤放行');
+        assert.equal(await blockedSstm.evaluate(() => __blockedPosts), 0);
+        await blockedSstm.close();
+    }
+
     const unknownSstm = await pageFor('https://sstm.moe/topic/123-test/', ipsMarkup.replace(' disabled', ''));
     await unknownSstm.evaluate(() => { window.__pendingPosts = 0; document.querySelector('form').onsubmit = event => { event.preventDefault(); __pendingPosts++; }; });
     await unknownSstm.evaluate(engine);
@@ -372,11 +425,42 @@ try {
     assert.equal(await captchaWang.evaluate(() => __submits), 1);
     await captchaWang.close();
 
-    const manualHt = await pageFor('https://sehuatang.org/forum.php', '<div>98堂论坛</div>');
-    await runSite(manualHt, 'sehuatang');
+    const manualHt = await pageFor('https://www.sehuatang.org/forum.php', '<div>98堂论坛，先自行选择帖子回复</div>');
+    await seedLegacyPageTask(manualHt, 'sehuatang', 'opened');
+    await evaluate(manualHt, 'updateDashboardPreference({autoClosePageAfterSign:true})');
+    const oldHtStorage = await manualHt.evaluate(() => [...__storage]);
+    await manualHt.evaluate(() => { window.__closes = 0; window.close = () => __closes++; });
+    await manualHt.evaluate(engine);
     assert.equal(await result(manualHt, 'sehuatang'), 'needs-foreground');
+    assert.equal(await evaluate(manualHt, "hasActiveTask('sehuatang')"), false, '浏览和回复不占用98堂页面任务');
     assert.equal(await manualHt.evaluate(() => location.pathname), '/forum.php');
     assert.equal(await manualHt.evaluate(() => __requests.length), 0);
+
+    // 另一个标签仍带旧版独占租约时，人工签到页也必须能正常观察结果。
+    const signHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', '<div class="ddpc_sign_btna"><a id="signin-btn">今日未签到</a></div>');
+    await signHt.evaluate(records => {
+        window.__storage = new Map(records); window.__closes = 0; window.__clicks = 0; window.close = () => __closes++;
+        document.querySelector('#signin-btn').onclick = event => { __clicks++; event.currentTarget.classList.add('ddpc_sign_btn_grey'); event.currentTarget.textContent = '今日已签到'; };
+    }, oldHtStorage);
+    await signHt.evaluate(engine);
+    assert.equal(await result(signHt, 'sehuatang'), 'needs-foreground');
+    assert.equal(await evaluate(signHt, "getRawTargetStatus('sehuatang').stage"), 'captcha');
+    assert.equal(await evaluate(signHt, "getRawTargetStatus('sehuatang').taskId"), '', '人工结果检测不绑定其他标签的任务');
+    assert.equal(await signHt.evaluate(() => __clicks), 0, '点选验证码和签到由用户完成');
+    assert.equal(await signHt.locator('#bbs-sign-page-toast').innerText().then(text => text.includes('其他页面处理')), false);
+    await signHt.locator('#signin-btn').click();
+    await signHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
+    await signHt.waitForTimeout(850);
+    assert.equal(await signHt.evaluate(() => __clicks), 1);
+    assert.equal(await signHt.evaluate(() => __closes), 0, '手动签到页没有自动动作或任务关页许可');
+    const htSuccess = await signHt.evaluate(() => [...__storage]);
+    await manualHt.evaluate(records => { window.__storage = new Map(records); }, htSuccess);
+    await manualHt.evaluate(engine);
+    await manualHt.waitForTimeout(850);
+    assert.equal(await result(manualHt, 'sehuatang'), 'success');
+    assert.equal(await manualHt.evaluate(() => __closes), 0, '其他标签完成签到后不关闭浏览页');
+    assert.equal(await manualHt.evaluate(() => __requests.length), 0);
+    await signHt.close();
     await manualHt.close();
 
     // 跳转仅移除本脚本参数，同一标签 sessionStorage 续接；普通同站标签不能认领。
@@ -387,6 +471,36 @@ try {
     await linked.evaluate(() => history.replaceState(null, '', '/result'));
     assert.equal(await evaluate(linked, "bindPageTask('wcccc').taskId === op.taskId"), true);
     await linked.close();
+
+    // 控制台打开SS → 找帖失败并结束任务 → 用户过期后刷新 → 确认本人评论 → 原句柄关页。
+    const retryOrigin = await pageFor('https://www.limestart.cn/');
+    await evaluate(retryOrigin, "updateDashboardPreference({autoClosePageAfterSign:true}); launchTarget(getBuiltInTargets().find(t=>t.id==='sstm'))");
+    const launch = await retryOrigin.evaluate(() => ({ url: __tabs[0].url, records: [...__storage] }));
+    const refreshCloseSstm = await pageFor(launch.url, '<h1 class="ipsType_pageTitle">同盟签到区</h1><a id="elUserLink" href="/profile/7-me/">本人</a>');
+    await refreshCloseSstm.evaluate(records => {
+        window.__storage = new Map(records); window.__closes = 0; window.close = () => __closes++;
+    }, launch.records);
+    await refreshCloseSstm.evaluate(engine);
+    assert.equal(await result(refreshCloseSstm, 'sstm'), 'failed');
+    const failedSstmTask = await evaluate(refreshCloseSstm, "getTaskLease('sstm')");
+    assert.equal(failedSstmTask.expiresAt, 0);
+    await retryOrigin.evaluate(records => { window.__storage = new Map(records); window.__now += 601000; }, await refreshCloseSstm.evaluate(() => [...__storage]));
+    await evaluate(retryOrigin, 'syncLaunchedAutoCloseTabs()');
+    assert.equal(await evaluate(retryOrigin, 'launchedAutoCloseTabs.size'), 1, '失败后仍保留原标签句柄等待用户刷新');
+    await refreshCloseSstm.evaluate(() => {
+        window.__now += 601000;
+        history.replaceState(null, '', '/topic/123-test/');
+        document.body.innerHTML = '<h1 class="ipsType_pageTitle">【2026/10/9】签到</h1><a id="elUserLink" href="/profile/7-me/">本人</a><div data-role="commentFeed"><article class="ipsComment"><aside class="cAuthorPane"><h3><a href="/profile/7-me/">本人</a></h3></aside><div data-role="commentContent">2026年10月9日 12:12:00</div></article></div>';
+    });
+    await refreshCloseSstm.evaluate(engine);
+    assert.equal(await result(refreshCloseSstm, 'sstm'), 'success');
+    assert.equal(await evaluate(refreshCloseSstm, "getRawTargetStatus('sstm').taskId"), failedSstmTask.taskId);
+    await retryOrigin.evaluate(records => { window.__storage = new Map(records); }, await refreshCloseSstm.evaluate(() => [...__storage]));
+    await evaluate(retryOrigin, 'syncLaunchedAutoCloseTabs()');
+    assert.equal(await retryOrigin.evaluate(() => __tabs[0].closed), true, '刷新成功仍由原控制台句柄关闭');
+    await refreshCloseSstm.waitForFunction(() => __closes === 1);
+    assert.equal(await refreshCloseSstm.evaluate(() => __requests.length), 0, '已有本人评论不重复提交');
+    await refreshCloseSstm.close(); await retryOrigin.close();
 
     // 从旧版状态/租约进入完整主引擎，不能只验证直接调用站点函数的理想路径。
     const legacyHunt = await pageFor('https://www.fufugal.com/', '<div id="photo_wrap"><div class="user-infos"><button class="xbs">寻宝</button></div></div>');
@@ -531,5 +645,5 @@ try {
         await page.close();
     }
     assert.equal(new Set(verified).size, 17);
-    console.log('通过：17站隔离样例；SS新版完整引擎、CKEditor异步写入/隐藏字段同步/可用按钮、40页一次本人过滤、待确认不重发、刷新重试上限；青葱寻宝、老王验证后提交、显式复查、维咔令牌/Cookie回退、GBK及跨跳转关联。');
+    console.log('通过：17站隔离样例；SS新版完整引擎、CKEditor异步写入/隐藏字段同步/可用按钮、40页一次本人过滤、次日作者过滤404继续首次提交/待确认不重发/权限验证不放行、刷新重试上限；青葱寻宝、老王验证后提交、显式复查、维咔令牌/Cookie回退、GBK及跨跳转关联。');
 } finally { await context.close(); await browser.close(); }

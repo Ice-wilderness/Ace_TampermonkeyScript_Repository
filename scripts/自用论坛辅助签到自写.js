@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.20.0
+// @version      2.20.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -227,7 +227,19 @@
         url.hash = '';
         if (url.origin !== location.origin) return false;
         const pageFetch = typeof unsafeWindow !== 'undefined' && unsafeWindow.fetch ? unsafeWindow.fetch.bind(unsafeWindow) : fetch.bind(window);
-        const response = await debugPageFetch('SS同盟检查本人今日评论', pageFetch, url.href, { credentials: 'same-origin', cache: 'no-store' }, debugContext);
+        let response;
+        try {
+            response = await debugPageFetch('SS同盟检查本人今日评论', pageFetch, url.href, { credentials: 'same-origin', cache: 'no-store' }, debugContext);
+        } catch (err) {
+            // IPS 在该作者尚未回帖时可能返回 404；当前今日帖子有效才能按“未查到”继续。
+            // 不将其标记为明确未签，提交后的本标签记录仍会阻止重复发帖。
+            const now = new Date();
+            const today = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}`;
+            const currentTopic = location.pathname.match(/^\/topic\/([^/]+)/)?.[1];
+            const filterTopic = url.pathname.match(/^\/topic\/([^/]+)/)?.[1];
+            if (err.httpStatus === 404 && err.reasonCode === 'adaptation' && currentTopic && currentTopic === filterTopic && new RegExp(today + '(?![0-9])').test(document.querySelector('h1.ipsType_pageTitle')?.textContent || '')) return false;
+            throw err;
+        }
         const doc = new DOMParser().parseFromString(await response.text(), 'text/html');
         const now = new Date();
         const today = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}`;
@@ -943,13 +955,23 @@
         const token = url.searchParams.get('__bbs_task');
         const sessionKey = `BBSSignHelperPageTask:${key}`;
         const stored = sessionStorage.getItem(sessionKey);
-        const lease = getTaskLease(key);
+        const taskId = token || stored;
+        let lease = getTaskLease(key);
+        const context = captureOperation(key);
+        const status = getRawTargetStatus(key);
+        const manuallyStopped = status?.stage === 'manual' && ['failed', 'skipped'].includes(status.status);
+        // SS同盟失败页刷新仍属于原标签；续接过期任务，保留控制台持有的关页句柄关联。
+        if (key === 'sstm' && taskId && lease?.kind === 'page' && lease.taskId === taskId &&
+            lease.date === context.date && lease.mutationId === context.mutationId && lease.expiresAt <= Date.now() &&
+            (!manuallyStopped || (lease.checkOnly && ['explicit', 'manual'].includes(lease.checkOnlySource)))) {
+            GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, key), { ...lease, ownerId: executionOwnerId, updatedAt: Date.now(), expiresAt: Date.now() + AUTO_CLOSE_PENDING_TTL_MS });
+            lease = getTaskLease(key);
+        }
         if (token && lease?.taskId === token && lease.date === getToday() && lease.expiresAt > Date.now()) {
             sessionStorage.setItem(sessionKey, token);
             url.searchParams.delete('__bbs_task');
             try { history.replaceState(history.state, '', url.href); } catch (err) { /* 管理器可能禁止改写 URL。 */ }
         }
-        const taskId = token || stored;
         if (!taskId || lease?.taskId !== taskId || lease.date !== getToday() || lease.expiresAt <= Date.now()) return null;
         // 旧版会把结果未知或页面跳转隐式改成只读；升级后恢复正常页面流程。
         const checkOnly = lease.checkOnly === true && ['explicit', 'manual'].includes(lease.checkOnlySource);
@@ -1475,7 +1497,7 @@
                     const result = new Response([204, 205, 304].includes(response.status) ? null : buffer, { status: response.status, statusText: response.statusText, headers: response.headers });
                     Object.defineProperty(result, 'url', { value: response.url || String(url) });
                     const error = classifyHttpResponse(response.status, await result.clone().text(), [...response.headers].map(([k, v]) => `${k}: ${v}`).join('\n'), response.url || String(url));
-                    if (error) throw error;
+                    if (error) throw Object.assign(error, { httpStatus: response.status });
                     return result;
                 })(),
                 new Promise((resolve, reject) => {
@@ -3390,7 +3412,15 @@
         for (const [key, entry] of launchedAutoCloseTabs) {
             const status = getRawTargetStatus(key);
             const current = isOperationCurrent(entry.operation);
-            if (entry.tab?.closed || Date.now() - entry.openedAt > AUTO_CLOSE_PENDING_TTL_MS || !current) {
+            // 页面通常先结束租约，控制台下一次轮询才收到成功；已结束的同一任务仍可关闭其标签。
+            const confirmed = isOperationCurrent(entry.operation, true) && status?.status === 'success' &&
+                status.taskId === entry.operation.taskId && status.confirmationSource === 'automatic';
+            const lease = getTaskLease(key);
+            // SS失败页可能等待用户刷新；任务到期不代表这个仍打开的标签已经结束。
+            const resumableSstm = key === 'sstm' && typeof entry.tab?.close === 'function' && lease?.kind === 'page' &&
+                lease.taskId === entry.operation.taskId && isOperationCurrent({ ...entry.operation, taskId: '' }) &&
+                !(status?.stage === 'manual' && ['failed', 'skipped', 'success'].includes(status.status));
+            if (entry.tab?.closed || (!resumableSstm && (Date.now() - entry.openedAt > AUTO_CLOSE_PENDING_TTL_MS || (!current && !confirmed)))) {
                 if (current && !isTargetDone(status?.status)) recordTargetStatus(key, 'result-unknown', {
                     context: entry.operation, stage: 'page-recovery', reasonCode: 'page-ended', message: '页面已关闭或任务超期，请先重新检查结果'
                 });
@@ -3398,7 +3428,7 @@
                 launchedAutoCloseTabs.delete(key);
                 continue;
             }
-            if (status?.status === 'success' && status.taskId === entry.operation.taskId && status.confirmationSource === 'automatic') {
+            if (confirmed) {
                 if (getDashboardConfig().preferences.autoClosePageAfterSign && typeof entry.tab?.close === 'function') {
                     closeLaunchedAutoCloseTab(key, entry, '对应任务已自动确认成功');
                 } else launchedAutoCloseTabs.delete(key);
@@ -3543,6 +3573,7 @@
     }
 
     function finishTaskLease(operation) {
+        if (!operation?.taskId) return;
         const lease = getTaskLease(operation.key);
         if (lease?.taskId === operation.taskId) GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, operation.key), { ...lease, expiresAt: 0 });
     }
@@ -4949,6 +4980,15 @@
             const manualStatus = getRawTargetStatus(site.key);
             let operation = bindPageTask(site.key);
             if (manualStatus?.stage === 'manual' && ['failed', 'skipped'].includes(manualStatus.status) && !operation?.checkOnly) return;
+            if (site.key === 'sehuatang') {
+                // 98堂仅观察人工签到，浏览、回复和签到可以分处不同标签，无需独占页面任务。
+                const checkOnly = operation?.checkOnly === true;
+                const lease = getTaskLease(site.key);
+                if (lease?.kind === 'page') finishTaskLease(lease);
+                operation = { ...captureOperation(site.key), checkOnly };
+                sessionStorage.removeItem(`BBSSignHelperPageTask:${site.key}`);
+                sessionStorage.removeItem(`BBSSignHelperPageAction:${site.key}`);
+            }
             // 验证前的入口点击、未完成状态不能阻止站点继续执行。
             // ZodGame 已发出的签到表单只查结果；SS同盟按原站点流程自行检查和刷新重试。
             const submittedForm = site.key === 'ZodGame' && (manualStatus?.status === 'result-unknown' || hasPageSubmittedAction(site.key, operation));
@@ -4960,7 +5000,7 @@
             operation = operation || acquireTaskLease(site.key, 'page');
             if (!operation) return;
             pageOperations.set(site.key, operation);
-            sessionStorage.setItem(`BBSSignHelperPageTask:${site.key}`, operation.taskId);
+            if (operation.taskId) sessionStorage.setItem(`BBSSignHelperPageTask:${site.key}`, operation.taskId);
             const hasConfirmedToday = isSignSuccessRecorded(site.key);
             const shouldRecheckUuGgSignPage = site.key === 'uugg' && /plugin\.php\?id=dsu_paulsign(?::|%3A)sign/i.test(location.href);
             if (hasConfirmedToday && !recoveryOnly && !shouldRecheckUuGgSignPage && site.key !== 'sstm') {

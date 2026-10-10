@@ -93,8 +93,67 @@ const unrelated = await createFixture({ storage: tabs.storage });
 assert.equal(unrelated.run("bindPageTask('wcccc')"), null);
 tabs.run("setManualTargetStatus(t,'success'); syncLaunchedAutoCloseTabs()");
 assert.equal(tabs.tabs[0].closed, false);
-tabs.run("resetTargetStatus(t); launchTarget(t); globalThis.action={operation:getTaskLease('wcccc')}; taskActions(action).completeSign('wcccc','明确今日已签到'); syncLaunchedAutoCloseTabs()");
+tabs.run("resetTargetStatus(t); launchTarget(t); globalThis.action={operation:getTaskLease('wcccc')}; taskActions(action).completeSign('wcccc','明确今日已签到'); finishTaskLease(action.operation); syncLaunchedAutoCloseTabs()");
 assert.equal(tabs.tabs[1].closed, true);
+
+// 老王验证码页确认成功并结束租约后，原标签的延迟关页与控制台句柄都仍有效。
+const wang = await createFixture();
+wang.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.t=getBuiltInTargets().find(t=>t.id==='laowang'); launchTarget(t)");
+const wangPage = await createFixture({ storage: wang.storage });
+wangPage.context.location.hostname = 'laowang.vip';
+wangPage.context.location.href = 'https://laowang.vip/plugin.php?id=k_misign:sign&__bbs_task=' + wang.run("getTaskLease('laowang').taskId");
+wangPage.run("globalThis.closes=0; window.close=()=>closes++; globalThis.op=bindPageTask('laowang'); pageOperations.set('laowang',op); markPendingAutoCloseAfterSignAction('laowang','captcha-submit'); taskActions({operation:op}).completeSign('laowang','人工验证后已自动签到成功'); finishTaskLease(op)");
+assert.equal(wangPage.run("hasActiveTask('laowang')"), false);
+await wangPage.tick(800);
+assert.equal(wangPage.run('closes'), 1);
+wang.run('syncLaunchedAutoCloseTabs()');
+assert.equal(wang.tabs[0].closed, true, '成功不能因租约先结束而丢失关页句柄');
+for (const invalidate of [
+    "finishTaskLease(getTaskLease('laowang'))",
+    "setManualTargetStatus(t,'success')",
+    "taskActions({operation:getTaskLease('laowang')}).completeSign('laowang','明确成功'); finishTaskLease(getTaskLease('laowang')); acquireTaskLease('laowang','page')",
+    "taskActions({operation:getTaskLease('laowang')}).completeSign('laowang','明确成功'); resetTargetStatus(t)"
+]) {
+    const stale = await createFixture();
+    stale.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.t=getBuiltInTargets().find(t=>t.id==='laowang'); launchTarget(t);" + invalidate + '; syncLaunchedAutoCloseTabs()');
+    assert.equal(stale.tabs[0].closed, false, '无自动成功证据、人工成功、替换或重置不能关闭旧标签');
+}
+
+// SS失败页刷新：结束/过期的任务续接原编号，控制台保留原句柄直至真正完成。
+for (const ended of [false, true]) {
+    const sstm = await createFixture();
+    sstm.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.t=getBuiltInTargets().find(t=>t.id==='sstm'); launchTarget(t)");
+    const retry = await createFixture({ storage: sstm.storage });
+    const id = sstm.run("getTaskLease('sstm').taskId");
+    retry.context.location.hostname = 'sstm.moe';
+    retry.context.location.href = 'https://sstm.moe/topic/123-test/?__bbs_task=' + id;
+    retry.run("globalThis.op=bindPageTask('sstm'); recordTargetStatus('sstm','failed',{context:op,stage:'editor'})");
+    if (ended) retry.run('finishTaskLease(op)');
+    await sstm.tick(601000);
+    await retry.tick(601000);
+    assert.equal(sstm.run('launchedAutoCloseTabs.size'), 1, '待刷新失败标签不能因租约或十分钟等待被丢弃');
+    assert.equal(sstm.tabs[0].closed, false);
+    retry.context.location.href = 'https://sstm.moe/topic/123-test/';
+    retry.run("globalThis.resumed=bindPageTask('sstm')");
+    assert.equal(retry.run('resumed.taskId'), id, '刷新续接同一标签原任务');
+    assert.equal(retry.run("hasActiveTask('sstm')"), true);
+    retry.run("taskActions({operation:resumed}).completeSign('sstm','已确认本人今日发布的签到评论'); finishTaskLease(resumed)");
+    sstm.run('syncLaunchedAutoCloseTabs()');
+    assert.equal(sstm.tabs[0].closed, true, '刷新成功后通过原句柄关闭同一标签');
+}
+for (const invalidate of [
+    "resetTargetStatus(t)",
+    "finishTaskLease(getTaskLease('sstm')); acquireTaskLease('sstm','page')",
+    "setManualTargetStatus(t,'skipped')"
+]) {
+    const stale = await createFixture();
+    stale.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.t=getBuiltInTargets().find(t=>t.id==='sstm'); launchTarget(t); globalThis.original=getTaskLease('sstm'); finishTaskLease(original);" + invalidate + '; syncLaunchedAutoCloseTabs()');
+    stale.context.location.href = 'https://sstm.moe/topic/123-test/';
+    stale.sessions.set('BBSSignHelperPageTask:sstm', stale.run('original.taskId'));
+    assert.equal(stale.run("bindPageTask('sstm')"), null, '重置、替换和人工跳过后旧标签不能续接原任务');
+    assert.equal(stale.run('launchedAutoCloseTabs.size'), 0);
+    assert.equal(stale.tabs[0].closed, false);
+}
 
 // 两分钟以上监听继续工作，配置变化重绑后数量不积累。
 const sync = await createFixture({ storage: new Map() });
