@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import { source } from './fixture.mjs';
+import { southPlusPages, southPlusResponses, southPlusXml } from './southplus-fixtures.mjs';
 
 const isolated = source.slice(0, source.indexOf('    // ================== 主引擎核心')).replace('const delay =', 'let delay =') + '\n globalThis.__bbs = expression => eval(expression);\n})();';
 const engine = source.replace('const delay = (ms) => new Promise(res => setTimeout(res, ms));', 'const delay = async ms => { window.__now += ms; };');
@@ -140,6 +141,124 @@ try {
     await ui.close();
     console.log('通过：浏览器搜索/中文组合输入/节点与焦点、配置草稿、折叠、样式防重、关闭不重开、五列统计/空态/进度及390px窄屏菜单与布局。');
 
+    // South-Plus 按网站当前任务状态执行；今天完成昨天领取的任务后仍可能可申请。
+    for (const action of ['重新检查', '继续签到', '一键处理未完成', '一键直签']) {
+        const southRetry = await pageFor('https://www.limestart.cn/');
+        await evaluate(southRetry, "for (const target of getBuiltInTargets()) updateBuiltInTargetSetting(target.id,{enabled:target.id==='southplus'}); completeSign('southplus','旧的今日完成记录');");
+        if (action === '继续签到') await evaluate(southRetry, "recordTargetStatus('southplus','result-unknown',{reasonCode:'readonly-unavailable'})");
+        await evaluate(southRetry, 'showDashboard()');
+        const responses = southPlusResponses();
+        if (action !== '重新检查') responses.push(southPlusXml(action === '继续签到' ? 'confirm\t您申请过[日常]还未完成,不需要重新申请!' : 'success\t任务已经申请成功!'), { responseText: southPlusPages({ daily: 'claimable' }).active }, southPlusXml('success\t你[日常]已经完成!\t15'), ...southPlusResponses({ daily: 'cooldown' }));
+        await southRetry.evaluate(responses => __responses.push(...responses), responses);
+        if (action === '重新检查') await southRetry.locator('[data-group="completed"] > summary').click();
+        await southRetry.getByRole('button', { name: action, exact: true }).click();
+        const expected = action === '重新检查' ? 'not-started' : 'success';
+        await southRetry.waitForFunction(expected => __bbs("getRawTargetStatus('southplus')?.status") === expected, expected);
+        const requests = await southRetry.evaluate(() => __requests);
+        const submissions = requests.filter(request => /actions=job/.test(request.url)).map(request => {
+            const url = new URL(request.url); return `${url.searchParams.get('actions')}:${url.searchParams.get('cid')}`;
+        });
+        assert.deepEqual(submissions, action === '重新检查' ? [] : ['job:15', 'job2:15'], action);
+        assert.equal(requests.length, action === '重新检查' ? 3 : 9, '实际读取三个任务页面，申请后再查领取条件，领取后再次核对');
+        assert.equal(await evaluate(southRetry, "getData('southplus') === getToday()"), expected === 'success');
+        assert.ok((await evaluate(southRetry, "getRawTargetStatus('southplus').message")).includes('上次完成 2026-10-09 23:41:56'));
+        if (action !== '重新检查') {
+            await southRetry.evaluate(responses => __responses.push(...responses), southPlusResponses({ daily: 'cooldown' }));
+            await southRetry.getByRole('button', { name: '一键处理未完成', exact: true }).click();
+            await southRetry.waitForFunction(() => __requests.length === 12 && __bbs("getRawTargetStatus('southplus')?.status") === 'success');
+            assert.equal(await southRetry.evaluate(() => __requests.filter(request => /actions=job/.test(request.url)).length), 2, '再次一键处理只查询当前冷却，不重复提交');
+        }
+        await southRetry.close();
+    }
+    // 已申请的任务只领取，不再申请；未达领取条件/状态不明时仅展示实际状态。
+    for (const daily of ['claimable', 'in-progress', 'unknown', 'cooldown']) {
+        const southState = await pageFor('https://www.limestart.cn/');
+        const responses = southPlusResponses({ daily });
+        if (daily === 'claimable') responses.push(southPlusXml('success\t你[日常]已经完成!\t15'), ...southPlusResponses({ daily: 'cooldown' }));
+        await southState.evaluate(responses => __responses.push(...responses), responses);
+        await evaluate(southState, "runDirectTarget(getBuiltInTargets().find(t=>t.id==='southplus'))");
+        const submissions = await southState.evaluate(() => __requests.filter(request => /actions=job/.test(request.url)).map(request => new URL(request.url).searchParams.get('actions')));
+        assert.deepEqual(submissions, daily === 'claimable' ? ['job2'] : [], daily);
+        assert.equal(await result(southState, 'southplus'), ['claimable', 'cooldown'].includes(daily) ? 'success' : 'result-unknown');
+        await southState.close();
+    }
+    const unconfirmedSouth = await pageFor('https://www.limestart.cn/');
+    await unconfirmedSouth.evaluate(responses => __responses.push(...responses), [...southPlusResponses({ daily: 'claimable' }), southPlusXml('success\t你[日常]已经完成!\t15'), ...southPlusResponses({ daily: 'claimable' }), ...southPlusResponses({ daily: 'claimable' })]);
+    await evaluate(unconfirmedSouth, "runDirectTarget(getBuiltInTargets().find(t=>t.id==='southplus'))");
+    assert.equal(await result(unconfirmedSouth, 'southplus'), 'not-started', '网站仍显示可领取，不能凭成功回包标记成功');
+    assert.equal(await unconfirmedSouth.evaluate(() => __requests.filter(request => /actions=job2/.test(request.url)).length), 1, '提交后复查不自动再次领取');
+    await unconfirmedSouth.close();
+    for (const responseText of ['<form action="login.php"><input name="pwpwd"></form>', '<a href="login.php?action-quit-verify-fixture.html">退出</a><div id="main">任务页面发生变化</div>']) {
+        const invalidSouth = await pageFor('https://www.limestart.cn/');
+        await invalidSouth.evaluate(responseText => __responses.push({ responseText }), responseText);
+        await evaluate(invalidSouth, "runDirectTarget(getBuiltInTargets().find(t=>t.id==='southplus'))");
+        assert.equal(await result(invalidSouth, 'southplus'), responseText.includes('pwpwd') ? 'needs-login' : 'failed');
+        assert.equal(await invalidSouth.evaluate(() => __requests.length), 1, '登录失效/页面不匹配时不调用申请或领取接口');
+        await invalidSouth.close();
+    }
+    verified.push('southplus');
+    console.log('通过：South-Plus 三页真实结构查询、完成时间不作为领取冷却、已成功缓存仍查询、单站/两个一键入口、已申请只领取、未达条件/异常不提交及提交后只复查。');
+
+    // 普通访问遵循所有站点的今日成功跳过规则；显式检查仍查询网站。
+    for (const mode of ['cached', 'login', 'explicit', 'first-visit', 'in-progress', 'unknown', 'pagehide']) {
+        const southVisit = await pageFor('https://www.south-plus.net/');
+        if (['cached', 'explicit'].includes(mode)) await evaluate(southVisit, "completeSign('southplus','已有成功记录')");
+        if (mode === 'explicit') {
+            await seedLegacyPageTask(southVisit, 'southplus', 'success');
+            await evaluate(southVisit, "GM_setValue(getScopedStorageKey(STORAGE_KEYS.task,'southplus'),{...getTaskLease('southplus'),checkOnly:true,checkOnlySource:'explicit'})");
+        }
+        const responses = mode === 'cached' ? [] : mode === 'login' ? [{ responseText: '<form action="login.php"><input name="pwpwd"></form>' }] : southPlusResponses({ daily: ['in-progress', 'unknown'].includes(mode) ? mode : 'cooldown' });
+        await southVisit.evaluate(({ responses, mode }) => {
+            document.querySelector('#bbs-sign-page-toast')?.remove();
+            window.__toastAdded = 0; window.__requestToasts = [];
+            new MutationObserver(records => {
+                for (const record of records) for (const node of record.addedNodes) if (node.id === 'bbs-sign-page-toast') __toastAdded++;
+            }).observe(document.body, { childList: true });
+            const request = GM_xmlhttpRequest;
+            window.GM_xmlhttpRequest = details => {
+                __requestToasts.push({ url: details.url, title: document.querySelector('.bbs-sign-page-toast-title')?.textContent || '' });
+                if (mode === 'pagehide') window.dispatchEvent(new Event('pagehide'));
+                return request(details);
+            };
+            __responses.push(...responses);
+        }, { responses, mode });
+        await southVisit.evaluate(engine);
+        const observed = await southVisit.evaluate(() => ({ added: __toastAdded, requests: __requestToasts, title: document.querySelector('.bbs-sign-page-toast-title')?.textContent || '' }));
+        const incomplete = ['in-progress', 'unknown', 'pagehide'].includes(mode);
+        assert.equal(observed.requests.length, mode === 'cached' ? 0 : ['login', 'pagehide'].includes(mode) ? 1 : 3, mode + '不叠加通用轮询');
+        assert.equal(observed.title, incomplete ? '等待检查结果' : mode === 'login' ? '等待登录' : '签到成功', mode);
+        assert.equal(await result(southVisit, 'southplus'), incomplete ? 'result-unknown' : mode === 'login' ? 'needs-login' : 'success');
+        assert.equal(await evaluate(southVisit, "hasActiveTask('southplus')"), false, '查询结束/离开页面后立即释放任务：' + mode);
+        if (mode === 'cached') {
+            assert.equal(await evaluate(southVisit, "getRawTargetStatus('southplus').stage"), 'skip');
+            await southVisit.evaluate(engine);
+            assert.equal(await southVisit.evaluate(() => __requests.length), 0, '重复访问已签到网站也不查询');
+        }
+        await southVisit.close();
+    }
+    console.log('通过：South-Plus 今日成功普通访问零请求，显式复查/首次执行查询；未完成/异常/离页释放任务，无额外90秒轮询。');
+
+    // 同站任务防重只影响签到动作，普通浏览不提示切回；其他站点互不占用。
+    for (const kind of ['direct', 'page', 'other-site']) {
+        const browsing = await pageFor('https://www.south-plus.net/');
+        const ownerKey = kind === 'other-site' ? 'fxacg' : 'southplus';
+        await evaluate(browsing, `globalThis.owner=acquireTaskLease('${ownerKey}','${kind === 'page' ? 'page' : 'direct'}'); recordTargetStatus('${ownerKey}','running',{context:owner})`);
+        await browsing.evaluate(() => document.querySelector('#bbs-sign-page-toast')?.remove());
+        if (kind === 'other-site') await browsing.evaluate(responses => __responses.push(...responses), southPlusResponses({ daily: 'cooldown' }));
+        await browsing.evaluate(engine);
+        assert.equal(await browsing.evaluate(() => __requests.length), kind === 'other-site' ? 3 : 0, kind);
+        assert.equal(await evaluate(browsing, `getTaskLease('${ownerKey}').taskId === owner.taskId && hasActiveTask('${ownerKey}')`), true, '不能抢占或结束其他任务');
+        if (kind !== 'other-site') assert.equal(await browsing.locator('#bbs-sign-page-toast').count(), 0, '普通浏览不弹任务占用提示');
+        else assert.equal(await result(browsing, 'southplus'), 'success', '其他网站执行中不阻止South-Plus完成');
+        if (kind === 'direct') {
+            await evaluate(browsing, "showPageTaskInfo(getBuiltInTargets().find(t=>t.id==='southplus'))");
+            assert.ok((await browsing.getByRole('dialog').textContent()).includes('正在控制台后台执行'));
+            assert.equal((await browsing.getByRole('dialog').textContent()).includes('请切回'), false);
+        }
+        await browsing.close();
+    }
+    console.log('通过：同站任务期间普通浏览不提示占用，后台任务说明准确，跨站执行不阻塞且不抢占已有任务。');
+
     // 四个重点站点：点击、提交、草稿和无关通知都不是成功证据。
     const moon = await pageFor('https://bbs.wcccc.cc/plugin.php?id=k_misign:sign', '<button id="JD_sign">签到</button>');
     await moon.evaluate(() => { window.__clicks = 0; document.querySelector('#JD_sign').onclick = () => __clicks++; });
@@ -277,6 +396,46 @@ try {
     assert.equal(new URL(ownRequests[0].url).pathname, '/topic/123-test/');
     await pagedSstm.close();
 
+    // 从控制台点击检查 → 列表找今日帖 → 同标签跳转 → 检查本人评论，全程只读。
+    for (const outcome of ['found', 'missing', '404']) {
+        const origin = await pageFor('https://www.limestart.cn/');
+        await evaluate(origin, "for (const target of getBuiltInTargets()) updateBuiltInTargetSetting(target.id,{enabled:target.id==='sstm'}); recordTargetStatus('sstm','result-unknown',{message:'等待检查'}); showDashboard()");
+        await origin.getByRole('button', { name: '检查结果', exact: true }).click();
+        const launched = await origin.evaluate(() => ({ tab: __tabs[0], records: [...__storage] }));
+        assert.ok(launched.tab.url.includes('__bbs_task='));
+        const checkPage = await pageFor(launched.tab.url, '<h1 class="ipsType_pageTitle">同盟签到区</h1><a id="elUserLink" href="/profile/7-me/">本人</a><h4 class="ipsDataItem_title"><a href="/topic/yesterday/">签到【2026/10/8】</a></h4><h4 class="ipsDataItem_title"><a href="/topic/today-check/">签到【2026/10/9】</a></h4>');
+        await checkPage.evaluate(records => {
+            window.__storage = new Map(records);
+            window.addEventListener('beforeunload', () => localStorage.setItem('__ssCheckStore', JSON.stringify([...__storage])));
+        }, launched.records);
+        const navigation = checkPage.waitForEvent('framenavigated', { predicate: frame => frame === checkPage.mainFrame() && new URL(frame.url()).pathname === '/topic/today-check/' });
+        await checkPage.evaluate(engine).catch(error => { if (!/context.*destroyed|navigation/i.test(error.message)) throw error; });
+        await navigation;
+        await checkPage.waitForLoadState('domcontentloaded');
+        assert.equal(new URL(checkPage.url()).pathname, '/topic/today-check/', '检查也必须进入当天签到帖');
+        await checkPage.evaluate(({ outcome }) => {
+            window.__storage = new Map(JSON.parse(localStorage.getItem('__ssCheckStore')));
+            document.body.innerHTML = '<h1 class="ipsType_pageTitle">签到【2026/10/9】</h1><a id="elUserLink" href="/profile/7-me/">本人</a><a href="/topic/today-check/?view_author=11">只看该作者</a><article class="ipsComment"><aside class="cAuthorPane"><h3><a href="/profile/11-other/">其他用户</a></h3></aside><div data-role="commentContent">2026年10月9日</div></article><form id="elReplyForm"><div class="ipsComposeArea_dummy">回复此主题</div><div contenteditable="true">已有草稿</div><button type="submit">提交</button></form>';
+            window.__editorOpens = 0; window.__posts = 0;
+            document.querySelector('.ipsComposeArea_dummy').onclick = () => __editorOpens++;
+            document.querySelector('form').onsubmit = event => { event.preventDefault(); __posts++; };
+            __fetchResponses.push(outcome === '404' ? { status: 404, text: '找不到此页面' } : { text: '<h1 class="ipsType_pageTitle">签到【2026/10/9】</h1>' + (outcome === 'found' ? '<article class="ipsComment"><aside class="cAuthorPane"><h3><a href="/profile/7-me/">本人</a></h3></aside><div data-role="commentContent">2026年10月9日 11:00:00</div></article>' : '') });
+        }, { outcome });
+        await checkPage.evaluate(isolated);
+        assert.equal(await evaluate(checkPage, "getTaskLease('sstm').checkOnlySource"), 'explicit', '跨页仍是用户发起的只读检查');
+        await checkPage.evaluate(engine);
+        assert.equal(await result(checkPage, 'sstm'), outcome === 'found' ? 'success' : 'result-unknown');
+        const requests = await checkPage.evaluate(() => __requests);
+        assert.equal(requests.length, 1, '实际请求本人评论过滤，不逐页扫描');
+        assert.equal(new URL(requests[0].url).searchParams.get('view_author'), '7');
+        assert.equal(requests[0].method, 'GET');
+        assert.equal(await checkPage.evaluate(() => __editorOpens + __posts), 0, '检查不得激活或提交回复');
+        assert.equal(await checkPage.locator('[contenteditable]').textContent(), '已有草稿');
+        if (outcome !== 'found') assert.ok((await evaluate(checkPage, "getRawTargetStatus('sstm').message")).includes('已检查今日签到帖'));
+        await checkPage.close(); await origin.close();
+    }
+    console.log('通过：SS同盟控制台检查实际进入今日帖、跨跳转保持只读、一次本人过滤请求、成功/未查到/404反馈且不触碰回复编辑器。');
+
     // 新一天本人尚无评论：IPS 的作者过滤可能返回 404，不能因此中断首次签到。
     const newDayMarkup = ipsMarkup.replaceAll('2026/10/9', '2026/10/10').replace(' disabled', '') + '<a href="/topic/123-test/?view_author=11">只看该作者</a>';
     const missingAuthorSstm = await pageFor('https://sstm.moe/topic/123-test/', newDayMarkup);
@@ -341,7 +500,7 @@ try {
 
     // 其余13站保留各自证据和人工边界，所有响应均为脱敏构造样例。
     for (const [key, html, response] of [
-        ['fxacg', '', '今日已签到'], ['southplus', '', '还没超过刷新时间'], ['sl-asmr', '', '您已签到'],
+        ['fxacg', '', '今日已签到'], ['sl-asmr', '', '您已签到'],
         ['kfpromax', '', '已经领过了'], ['sijishe', '', 'discuz_uid=7;<a class="btnvisted">今日已签到</a>'],
         ['galGameXNew', '<button>今日已签到</button>', null]
     ]) {
@@ -628,7 +787,6 @@ try {
         ['uugg', 'https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign', '<div>签到服务台 今天未签到</div><form id="qiandao"></form>', null, null],
         ['acgndog', 'https://www.acgndog.com/', '', null, { user: { isLoggedIn: true }, _nonce: 'sample', customPointSignDaily: { signed: false } }],
         ['vik', 'https://www.vikacg.com/wallet/mission', '', null, { status: 'success', data: { basic: { id: 7 }, credit: { sign_time: 0 } } }],
-        ['southplus', 'https://www.south-plus.net/', '', null, null],
         ['sl-asmr', 'https://www.sl-asmr.com/', '', null, null],
         ['2dfan', 'https://2dfan.com/checkin', '<div class="checkin-info"><span class="pull-right">已连续签到12天</span></div>', null, null],
         ['laowang', 'https://laowang.vip/', '<div>其他用户已签到</div>', null, null],

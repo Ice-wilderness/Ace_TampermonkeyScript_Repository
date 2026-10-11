@@ -34,6 +34,12 @@ await q.tick(1);
 assert.equal(q.run('directTasks.size'), 0);
 
 // 跨上下文租约、过期恢复与昨日回包。
+const abandonedSouth = await createFixture();
+abandonedSouth.run("globalThis.op=acquireTaskLease('southplus','page'); recordTargetStatus('southplus','running',{context:op})");
+await abandonedSouth.tick(31000);
+assert.equal(abandonedSouth.run("hasActiveTask('southplus')"), false, '页面异常退出且无法发送离页事件时，South-Plus 不占用十分钟');
+assert.equal(abandonedSouth.run("getNormalizedTargetStatus(getBuiltInTargets().find(t=>t.id==='southplus')).status"), 'result-unknown');
+assert.ok(abandonedSouth.run("acquireTaskLease('southplus','page')"), '超期后可重新查询实际状态');
 const shared = new Map();
 const a = await createFixture({ storage: shared });
 const b = await createFixture({ storage: shared });

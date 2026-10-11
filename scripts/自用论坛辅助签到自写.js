@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.20.1
+// @version      2.20.2
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -247,7 +247,7 @@
         return Boolean(findSstmDailyComment(doc, user));
     }
 
-    async function runSstmPageSign(debugContext) {
+    async function runSstmPageSign(debugContext, checkOnly = false) {
         const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const now = new Date();
         const today = `${now.getFullYear()}/${now.getMonth() + 1}/${now.getDate()}`;
@@ -313,6 +313,12 @@
 
         status('running', 'verify', '正在检查本人今日是否已经回帖');
         if (await checkSstmPublished(debugContext, user)) return finish();
+        if (checkOnly) {
+            status('result-unknown', 'verify', pending
+                ? '已检查今日签到帖；本标签提交的评论尚未确认发布，不重复发帖'
+                : '已检查今日签到帖，尚未查到本人已发布的签到回复；本次检查未提交回复');
+            return false;
+        }
         if (pending) {
             status('result-unknown', 'verify', '本标签已提交过评论，尚未查到发布结果；重新检查不会重复发帖');
             return false;
@@ -419,7 +425,7 @@
         const text = selector => document.querySelector(selector)?.textContent || '';
         let signed = false;
         switch (site.key) {
-            case 'sstm': signed = await checkSstmPublished(debugContext); break;
+            case 'sstm': signed = await runSstmPageSign(debugContext, true); break;
             case 'wcccc':
             case 'laowang': signed = Boolean(document.querySelector('.qdleft .btnvisted, #JD_sign.btnvisted, .btnvisted'));
                 debugContext.unsignedConfirmed = !signed && !debugContext.submitted && !hasPageSubmittedAction(site.key, debugContext.operation) && /今日未签到|今天未签到/.test(text('#JD_sign, .qdleft .btn')); break;
@@ -434,12 +440,12 @@
             case 'sijishe': signed = await runSijisheApiSign(debugContext, true); break;
             case 'fxacg': signed = await runFeixueApiSign(debugContext, true); break;
             case 'galGameXNew': signed = Boolean(getGalgameXNewSignedText()); break;
-            case 'southplus':
+            case 'southplus': signed = await runSouthPlusApiSign(debugContext, true); break;
             case 'sl-asmr': actions.recordTargetStatus(site.key, 'result-unknown', { stage: 'verify', reasonCode: 'readonly-unavailable', message: '此站点暂无可靠的只读结果入口；请前台核对并人工确认，不重复领取奖励' }); break;
             case 'soushuba': signed = Boolean(document.querySelector('a[href*="member.php?mod=logging"][href*="action=logout"]')) || Number(unsafeWindow.discuz_uid) > 0; break;
         }
         if (signed && !(getRawTargetStatus(site.key)?.status === 'success' && getRawTargetStatus(site.key)?.confirmationSource === 'automatic' && getRawTargetStatus(site.key)?.taskId === (debugContext.operation?.taskId || ''))) actions.completeSign(site.key, '重新检查确认今日已完成');
-        else if (debugContext.unsignedConfirmed) actions.recordTargetStatus(site.key, 'not-started', { stage: 'verify', reasonCode: 'confirmed-unsigned', message: '已确认今日尚未完成，可再次执行签到' });
+        else if (debugContext.unsignedConfirmed) actions.recordTargetStatus(site.key, 'not-started', { stage: 'verify', reasonCode: 'confirmed-unsigned', message: debugContext.southPlusSummary || '已确认今日尚未完成，可再次执行签到' });
         return { outcome: signed ? 'success' : debugContext.unsignedConfirmed ? 'not-completed' : 'unknown', evidenceDate: getToday() };
     }
 
@@ -1654,47 +1660,117 @@
         return false;
     }
 
-    async function runSouthPlusApiSign(debugContext) {
-        const { completeSign, recordTargetStatus } = taskActions(debugContext);
-        let completedByAction = false;
-        const fetchTask = async (id) => {
-            let res = await gmRequest({
-                url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job&cid=${id}`,
-                debugContext
-            });
-            let text = res.responseText || '';
-            if (/请先登录|您还没有登录|尚未登录/.test(text)) { recordTargetStatus('southplus', 'needs-login', { stage: 'login', message: 'South-Plus 需要先登录账号' }); return false; }
-            if (text.includes('还没超过')) {
-                console.log(`[南+] 任务${id} 刷新时间未到`);
-                return true;
-            }
-            if (text.includes('已经申请')) {
-                completedByAction = true;
-                res = await gmRequest({
-                    url: `https://www.south-plus.net/plugin.php?H_name=tasks&action=ajax&actions=job2&cid=${id}`,
-                    debugContext
-                });
-                text = res.responseText || '';
-                if (text.includes('已经完成')) {
-                    console.log(`[南+] 成功完成任务${id}`);
-                    return true;
+    const SOUTHPLUS_TASKS = [{ id: '14', name: '周常' }, { id: '15', name: '日常' }];
+    const SOUTHPLUS_TASK_URL = 'https://www.south-plus.net/plugin.php?H_name=tasks';
+
+    function parseSouthPlusTaskPage(html, kind) {
+        const doc = new DOMParser().parseFromString(html, 'text/html');
+        if (!doc.querySelector('a[href*="login.php"][href*="action-quit"], a[href*="login.php"][href*="action=quit"]')) {
+            if (/请先登录|您还没有登录|尚未登录|name=["']?pwpwd|action=["'][^"']*login\.php/i.test(html)) throw signRequestError('login', 'South-Plus 需要先登录账号');
+            throw signRequestError('adaptation', 'South-Plus 任务页缺少登录账号标记，无法确认任务归属');
+        }
+        const heading = { available: '社区论坛任务', active: '您在进行中任务', completed: '您已完成任务' }[kind];
+        const table = Array.from(doc.querySelectorAll('#main td.h')).find(cell => cell.textContent.trim() === heading)?.closest('table');
+        if (!table) throw signRequestError('adaptation', `South-Plus 未识别到${heading}列表`);
+        const tasks = {};
+        for (const row of table.rows) {
+            const task = SOUTHPLUS_TASKS.find(item => row.querySelector('b')?.textContent.trim() === item.name);
+            if (!task) continue;
+            const text = `${row.textContent} ${row.nextElementSibling?.textContent || ''}`;
+            const time = text.match(/完成时间\s*(\d{4}-\d{2}-\d{2})\s*(?:(AM|PM)\s*[:：]\s*)?(\d{1,2}):(\d{2}):(\d{2})/i);
+            let completedAt = '';
+            if (time && isValidDay(time[1])) {
+                let hour = Number(time[3]);
+                if (time[2]?.toUpperCase() === 'PM' && hour < 12) hour += 12;
+                if (time[2]?.toUpperCase() === 'AM' && hour === 12) hour = 0;
+                if (hour < 24 && Number(time[4]) < 60 && Number(time[5]) < 60) {
+                    completedAt = `${time[1]} ${String(hour).padStart(2, '0')}:${time[4]}:${time[5]}`;
                 }
             }
-            console.log(`[南+] 任务${id}提交异常`, text);
-            return false;
-        };
-
-        const [w14, w15] = await Promise.all([
-            fetchTask('14'),
-            fetchTask('15')
-        ]);
-        if (w14 && w15) {
-            return completeSign(
-                'southplus',
-                '接口返回任务已完成',
-                completedByAction ? CLOSE_PAGE_AFTER_SIGN_ACTION : {}
-            );
+            const apply = row.querySelector(`[id="p_${task.id}"] a[onclick]`);
+            const validity = text.match(/任务时效\s*(\d{4}-\d{2}-\d{2})\s*~\s*(\d{4}-\d{2}-\d{2})/);
+            tasks[task.id] = {
+                canApply: new RegExp(`\\bstartjob\\s*\\(\\s*['"]${task.id}['"]\\s*\\)`).test(apply?.getAttribute('onclick') || '') &&
+                    Boolean(validity && isValidDay(validity[1]) && isValidDay(validity[2]) && validity[1] <= getToday() && getToday() <= validity[2]),
+                cooldownHours: Number(text.match(/上次领取未超过\s*(\d+(?:\.\d+)?)\s*小时/)?.[1] || 0),
+                claimable: /已完成\s*100\s*%/.test(text),
+                completedAt
+            };
         }
+        const links = {};
+        if (kind === 'available') {
+            for (const [key, label] of [['active', '进行中任务'], ['completed', '已完成任务']]) {
+                const href = Array.from(doc.querySelectorAll('#main a[href]')).find(link => link.textContent.trim() === label)?.getAttribute('href');
+                const url = href && new URL(href, SOUTHPLUS_TASK_URL);
+                if (!url || url.origin !== new URL(SOUTHPLUS_TASK_URL).origin || url.pathname !== '/plugin.php' || /actions(?:=|-)(?:job|job2)(?:&|\.|$)/i.test(url.search)) throw signRequestError('adaptation', `South-Plus 缺少可靠的${label}查询入口`);
+                links[key] = url.href;
+            }
+        }
+        return { tasks, links };
+    }
+
+    function getSouthPlusTaskStates(pages) {
+        return SOUTHPLUS_TASKS.map(task => {
+            const available = pages.available.tasks[task.id];
+            const active = pages.active.tasks[task.id];
+            const completed = pages.completed.tasks[task.id];
+            let state = 'unknown';
+            // 冷却按领取任务的时间计算；完成时间只作历史信息，不能覆盖当前可申请入口。
+            if (active) state = active.claimable ? 'claimable' : 'in-progress';
+            else if (available?.cooldownHours) state = 'cooldown';
+            else if (available?.canApply && !available.cooldownHours) state = 'available';
+            return { ...task, state, completedAt: completed?.completedAt || '', cooldownHours: available?.cooldownHours || 0 };
+        });
+    }
+
+    async function requestSouthPlusTaskPage(url, kind, debugContext) {
+        const response = await gmRequest({ url, headers: { 'Cache-Control': 'no-cache' }, debugContext });
+        return parseSouthPlusTaskPage(response.responseText || '', kind);
+    }
+
+    async function readSouthPlusTasks(debugContext) {
+        const available = await requestSouthPlusTaskPage(SOUTHPLUS_TASK_URL, 'available', debugContext);
+        const [active, completed] = await Promise.all([
+            requestSouthPlusTaskPage(available.links.active, 'active', debugContext),
+            requestSouthPlusTaskPage(available.links.completed, 'completed', debugContext)
+        ]);
+        return { states: getSouthPlusTaskStates({ available, active, completed }), activeUrl: available.links.active };
+    }
+
+    async function runSouthPlusApiSign(debugContext, checkOnly = false) {
+        debugContext = debugContext || { operation: pageOperations.get('southplus') || captureOperation('southplus') };
+        const { completeSign, recordTargetStatus } = taskActions(debugContext);
+        let snapshot = await readSouthPlusTasks(debugContext);
+        let completedByAction = false;
+        const describe = states => states.map(task => `${task.name}：${({ cooldown: `冷却中（领取任务未超过 ${task.cooldownHours} 小时）`, claimable: '可领取奖励', 'in-progress': '进行中，尚不可领取', available: '可申请', unknown: '状态无法确认' })[task.state]}${task.completedAt ? `，上次完成 ${task.completedAt}` : ''}`).join('；');
+        const done = task => task.state === 'cooldown';
+        const action = async (id, name) => {
+            const response = await gmRequest({ url: `${SOUTHPLUS_TASK_URL}&action=ajax&actions=${name}&cid=${id}`, debugContext });
+            const text = extractCdata(response.responseText || '');
+            if (/请先登录|您还没有登录|尚未登录/.test(text)) throw signRequestError('login', 'South-Plus 登录状态已失效');
+            return text;
+        };
+        const incomplete = snapshot.states.some(task => ['available', 'claimable', 'in-progress'].includes(task.state));
+        if (incomplete) clearSignSuccess('southplus', '网站任务状态显示尚未全部完成', debugContext.operation);
+        if (!checkOnly && !snapshot.states.some(task => task.state === 'unknown')) {
+            for (const task of snapshot.states) {
+                if (task.state === 'available') {
+                    const text = await action(task.id, 'job');
+                    if (!/已经申请|您申请过[^\r\n]*还未完成/.test(text)) continue;
+                    // 申请回包只说明已接任务，重新读进行中列表确认是否具备领取条件。
+                    const active = await requestSouthPlusTaskPage(snapshot.activeUrl, 'active', debugContext);
+                    if (!active.tasks[task.id]?.claimable) continue;
+                } else if (task.state !== 'claimable') continue;
+                completedByAction = true;
+                await action(task.id, 'job2');
+            }
+            // 领取回包不能替代网站当前状态；完成时间不参与冷却推算。
+            if (debugContext.submitted) snapshot = await readSouthPlusTasks(debugContext);
+        }
+        debugContext.southPlusSummary = describe(snapshot.states);
+        if (snapshot.states.every(done)) return completeSign('southplus', debugContext.southPlusSummary, completedByAction ? CLOSE_PAGE_AFTER_SIGN_ACTION : {});
+        debugContext.unsignedConfirmed = snapshot.states.every(task => task.state !== 'unknown') && snapshot.states.some(task => !done(task));
+        recordTargetStatus('southplus', 'result-unknown', { stage: 'verify', reasonCode: debugContext.unsignedConfirmed ? 'task-incomplete' : 'adaptation', message: debugContext.southPlusSummary });
         return false;
     }
 
@@ -3464,10 +3540,15 @@
         const entry = launchedAutoCloseTabs.get(target.id);
         if (typeof entry?.tab?.focus === 'function') { entry.tab.focus(); return; }
         const lease = getTaskLease(target.id);
+        const message = !hasActiveTask(target.id)
+            ? '当前没有有效任务，可从目标行重新检查或打开。'
+            : lease.kind === 'direct'
+                ? `${target.name} 正在控制台后台执行，结果会自动更新，无需切换标签页。`
+                : `已打开 ${target.name} 任务页面，期限至 ${new Date(lease.expiresAt).toLocaleTimeString()}；需要人工操作时可在对应页面继续。`;
         const dialog = el('dialog');
         dialog.style.cssText = 'max-width:min(90vw,600px);z-index:2147483647';
         dialog.append(el('h3', { text: `${target.name} · 当前任务` }),
-            el('p', { text: hasActiveTask(target.id) ? `已存在有效任务，期限至 ${new Date(lease.expiresAt).toLocaleTimeString()}。请切回已打开的 ${target.name} 标签页；当前管理器无法直接激活它。` : '当前没有有效任务，可从目标行重新检查或打开。' }),
+            el('p', { text: message }),
             el('p', { text: target.url }),
             el('button', { text: '关闭', onClick: () => dialog.remove() }));
         document.body.append(dialog); dialog.addEventListener('close', () => dialog.remove()); dialog.showModal();
@@ -3515,8 +3596,8 @@
             const result = checkOnly ? await site.check(debugContext) : await site.execute(debugContext, true);
             if ((result === true || result?.outcome === 'success') && isOperationCurrent(operation) && getRawTargetStatus(target.id)?.status === 'success' && getRawTargetStatus(target.id)?.taskId === operation.taskId) return { isSuccess: true, debugContext };
             const status = getRawTargetStatus(target.id);
-            if (checkOnly && result?.outcome === 'not-completed') return { isSuccess: false, debugContext, reason: { status: 'not-started', stage: 'verify', reasonCode: 'confirmed-unsigned', message: '已确认今日尚未完成，可再次执行签到', retryable: false } };
-            return { isSuccess: false, debugContext, reason: { status: ['needs-login', 'needs-foreground', 'failed'].includes(status?.status) ? status.status : debugContext.submitted || checkOnly ? 'result-unknown' : 'failed', stage: status?.stage || 'verify', message: status?.status === 'running' ? '本次未获得明确成功证据，请检查结果' : status?.message || '结果未确认', reasonCode: status?.reasonCode || (debugContext.submitted || checkOnly ? 'unknown' : 'adaptation'), retryable: false } };
+            if (checkOnly && result?.outcome === 'not-completed') return { isSuccess: false, debugContext, reason: { status: 'not-started', stage: 'verify', reasonCode: 'confirmed-unsigned', message: result.message || '已确认今日尚未完成，可再次执行签到', retryable: false } };
+            return { isSuccess: false, debugContext, reason: { status: ['needs-login', 'needs-foreground', 'failed', 'result-unknown'].includes(status?.status) ? status.status : debugContext.submitted || checkOnly ? 'result-unknown' : 'failed', stage: status?.stage || 'verify', message: status?.status === 'running' ? '本次未获得明确成功证据，请检查结果' : status?.message || '结果未确认', reasonCode: status?.reasonCode || (debugContext.submitted || checkOnly ? 'unknown' : 'adaptation'), retryable: false } };
         } catch (error) {
             const code = error.reasonCode || (error instanceof SyntaxError ? 'adaptation' : 'network');
             return { isSuccess: false, debugContext, reason: { status: code === 'login' ? 'needs-login' : code === 'captcha' ? 'needs-foreground' : debugContext.submitted ? 'result-unknown' : 'failed', stage: 'request', message: stringifyDebugError(error), reasonCode: code, retryable: error.retryable === true || code === 'network', retryAfterMs: error.retryAfterMs || 0 } };
@@ -3567,7 +3648,7 @@
     function acquireTaskLease(key, kind = 'direct', taskId = newOperationId()) {
         if (hasActiveTask(key)) return null;
         const operation = { ...captureOperation(key), taskId };
-        const lease = { ...operation, kind, ownerId: executionOwnerId, updatedAt: Date.now(), expiresAt: Date.now() + (kind === 'page' ? AUTO_CLOSE_PENDING_TTL_MS : 30000) };
+        const lease = { ...operation, kind, ownerId: executionOwnerId, updatedAt: Date.now(), expiresAt: Date.now() + (kind === 'page' && key !== 'southplus' ? AUTO_CLOSE_PENDING_TTL_MS : 30000) };
         GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, key), lease);
         return getTaskLease(key)?.taskId === taskId ? operation : null;
     }
@@ -3584,11 +3665,13 @@
         const operation = acquireTaskLease(target.id);
         if (!operation) return Promise.resolve(false);
         const wasUnknown = ['result-unknown', 'running', 'opened'].includes(getNormalizedTargetStatus(target).status);
+        // South-Plus 执行入口先查询网站任务状态，再决定申请/领取；显式复查不提交。
+        const checkBeforeRetry = wasUnknown && target.siteKey !== 'southplus';
         const heartbeat = setInterval(() => {
             const lease = getTaskLease(target.id);
             if (isOperationCurrent(operation) && lease?.taskId === operation.taskId) GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, target.id), { ...lease, expiresAt: Date.now() + 30000 });
         }, 10000);
-        const promise = executeDirectTarget(target, onProgress, operation, checkOnly || wasUnknown)
+        const promise = executeDirectTarget(target, onProgress, operation, checkOnly || checkBeforeRetry)
             .catch(error => { console.error('[签到助手] 任务异常', error); return false; })
             .finally(() => {
                 clearInterval(heartbeat);
@@ -3603,7 +3686,8 @@
     async function runDirectTargets(targets, rerender) {
         const runnableTargets = targets.filter(target => {
             if (!target.enabled || !target.directApi) return false;
-            return !isTargetDone(getNormalizedTargetStatus(target).status) && !hasActiveTask(target.id);
+            const status = getNormalizedTargetStatus(target).status;
+            return (!isTargetDone(status) || (target.siteKey === 'southplus' && status === 'success')) && !hasActiveTask(target.id);
         });
         if (!runnableTargets.length) return;
 
@@ -3633,7 +3717,8 @@
         return getAllTargets().filter(target => {
             if (!target.enabled || !target.directApi) return false;
             const targetStatus = getNormalizedTargetStatus(target).status;
-            return !isTargetDone(targetStatus) && !hasActiveTask(target.id);
+            // South-Plus 今天的完成记录不代表当前仍在冷却，每次一键操作都查询网站。
+            return (!isTargetDone(targetStatus) || (target.siteKey === 'southplus' && targetStatus === 'success')) && !hasActiveTask(target.id);
         });
     }
 
@@ -4157,7 +4242,8 @@
             const item = row.target;
             if (hasActiveTask(item.id)) { showPageTaskInfo(item); return; }
             const status = getNormalizedTargetStatus(item).status;
-            if (item.directApi && !['needs-login', 'needs-foreground'].includes(status)) await runDirectTarget(item, rerender, ['result-unknown', 'success'].includes(status));
+            const checkOnly = status === 'success' || (status === 'result-unknown' && item.siteKey !== 'southplus');
+            if (item.directApi && !['needs-login', 'needs-foreground'].includes(status)) await runDirectTarget(item, rerender, checkOnly);
             else launchTarget(item, ['result-unknown', 'success'].includes(status));
             rerender();
         } });
@@ -4193,7 +4279,7 @@
             const source = { automatic: '自动确认', manual: '人工标记', legacy: '旧版记录' }[status.confirmationSource] || '';
             meta.textContent = [item.directApi ? '控制台直签' : OPEN_MODE_LABELS[item.openMode], source, status.updatedAt ? `更新于 ${getTimeLabel(status.updatedAt)}` : '今日尚未执行'].filter(Boolean).join(' · ');
             meta.title = item.note || '';
-            primary.textContent = hasActiveTask(item.id) && !['queued', 'running'].includes(status.status) ? '查看任务' : ['queued', 'running'].includes(status.status) ? info.label : status.status === 'success' ? '重新检查' : status.status === 'result-unknown' ? '检查结果' : status.status === 'failed' ? '重试' : ['needs-login', 'needs-foreground'].includes(status.status) ? '前台处理' : item.directApi ? '直签' : '打开';
+            primary.textContent = hasActiveTask(item.id) && !['queued', 'running'].includes(status.status) ? '查看任务' : ['queued', 'running'].includes(status.status) ? info.label : status.status === 'success' ? '重新检查' : status.status === 'result-unknown' ? item.siteKey === 'southplus' ? '继续签到' : '检查结果' : status.status === 'failed' ? '重试' : ['needs-login', 'needs-foreground'].includes(status.status) ? '前台处理' : item.directApi ? '直签' : '打开';
             primary.disabled = !item.enabled || ['running', 'queued'].includes(status.status) || directTasks.has(item.id);
         };
         row.patch(target);
@@ -4994,7 +5080,8 @@
             const submittedForm = site.key === 'ZodGame' && (manualStatus?.status === 'result-unknown' || hasPageSubmittedAction(site.key, operation));
             const recoveryOnly = Boolean(operation?.checkOnly || submittedForm);
             if (!operation && hasActiveTask(site.key)) {
-                showPageSignToast(site.key, 'opened', { message: '此站点正在其他页面处理，请回到对应任务页' });
+                // 仅复用同一站点的在途签到；普通浏览无需切回任务页，也不重复提交。
+                console.log(`[签到助手] ${site.name} 已有签到任务，本页不重复执行。`);
                 return;
             }
             operation = operation || acquireTaskLease(site.key, 'page');
@@ -5017,6 +5104,22 @@
                 return; // 当日已执行，退出
             }
 
+            // South-Plus 没有跨页人工步骤；查询结束或页面离开后立即释放任务。
+            const southPlusHeartbeat = site.key === 'southplus' ? setInterval(() => {
+                const lease = getTaskLease(site.key);
+                if (isOperationCurrent(operation)) GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, site.key), { ...lease, expiresAt: Date.now() + 30000 });
+            }, 10000) : null;
+            const releaseSouthPlusPage = () => {
+                clearInterval(southPlusHeartbeat);
+                if (!isOperationCurrent(operation)) return;
+                const status = getRawTargetStatus(site.key);
+                if (status?.taskId === operation.taskId && status.status === 'running') recordTargetStatus(site.key, 'result-unknown', {
+                    context: operation, stage: 'page-ended', reasonCode: 'page-ended', message: '页面已离开，任务已结束；请重新检查网站实际状态'
+                });
+                finishTaskLease(operation);
+            };
+            if (site.key === 'southplus') window.addEventListener('pagehide', releaseSouthPlusPage, { once: true });
+
             const debugContext = startSignDebugCapture(site.key, site.name, 'site-run');
             try {
                 recordTargetStatus(site.key, 'running', {
@@ -5028,7 +5131,7 @@
                 // 运行该站点的特定逻辑，如果执行完成返回 true，则保存今天的日期
                 const pageResult = await runPageTask(site, debugContext, recoveryOnly);
                 let isSuccess = pageResult.outcome === 'success';
-                if (!isSuccess && site.key !== 'sstm' && pageResult.outcome !== 'not-completed' && !['needs-login', 'needs-foreground', 'failed'].includes(getRawTargetStatus(site.key)?.status)) {
+                if (!isSuccess && !['sstm', 'southplus'].includes(site.key) && pageResult.outcome !== 'not-completed' && !['needs-login', 'needs-foreground', 'failed'].includes(getRawTargetStatus(site.key)?.status)) {
                     isSuccess = await waitForSiteSuccessRecheck(site);
                 }
                 if (isSuccess) {
@@ -5073,6 +5176,11 @@
                 });
             } finally {
                 finishSignDebugCapture(debugContext);
+                if (site.key === 'southplus') {
+                    clearInterval(southPlusHeartbeat);
+                    window.removeEventListener('pagehide', releaseSouthPlusPage);
+                    finishTaskLease(operation);
+                }
                 // 人工验证码监视器可以继续保留到页面租约期限；不永久续租。
                 if (!['needs-foreground', 'needs-login', 'result-unknown', 'opened'].includes(getRawTargetStatus(site.key)?.status)) finishTaskLease(operation);
             }
