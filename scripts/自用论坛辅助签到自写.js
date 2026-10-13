@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.20.3
+// @version      2.21.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -431,7 +431,7 @@
                 debugContext.unsignedConfirmed = !signed && !debugContext.submitted && !hasPageSubmittedAction(site.key, debugContext.operation) && /今日未签到|今天未签到/.test(text('#JD_sign, .qdleft .btn')); break;
             case 'ZodGame': signed = /已经签到过了|今日已签到/.test(text('#ct > div.mn > h1:nth-child(1)')); debugContext.unsignedConfirmed = !signed && !debugContext.submitted && !hasPageSubmittedAction(site.key, debugContext.operation) && Boolean(document.querySelector('#qiandao')) && /今天签到了吗/.test(document.body?.innerText || ''); break;
             case '2dfan': signed = Array.from(document.querySelectorAll('.checkin-action button')).some(button => button.textContent.trim() === '今日已签到') || /今日已签到|今天已签到/.test(text('.checkin-info .pull-right')); break;
-            case 'sehuatang': signed = isSehuatangSignPage() && getSehuatangSignControlState().isSigned; break;
+            case 'sehuatang': signed = isSehuatangSignPage() && Boolean(getSehuatangSignSuccessMessage()); break;
             case 'fufugal': signed = await runFufugalApiSign(debugContext, true); break;
             case 'uugg': signed = await runUuGgPageSign(debugContext, true); break;
             case 'acgndog': signed = await runAcgndogApiSign(debugContext, true); break;
@@ -523,6 +523,7 @@
             confirmationSource: options.source || 'automatic',
             evidence: options.evidence?.summary || message,
             context,
+            taskId: key === 'sehuatang' && getSehuatangPendingAction(context) ? context?.closeTaskId : undefined,
             message,
             url: location.href
         });
@@ -1006,13 +1007,16 @@
         if (options.source === 'manual' || !getDashboardConfig().preferences.autoClosePageAfterSign || !isCurrentPageForSite(key)) return;
         const operation = options.context || pageOperations.get(key);
         if (!operation || !isOperationCurrent(operation)) return;
+        if (key === 'sehuatang' && (!isSehuatangSignPage() || !getSehuatangPendingAction(operation))) return;
         let action;
         try { action = JSON.parse(sessionStorage.getItem(`BBSSignHelperPageAction:${key}`) || 'null'); } catch (err) { return; }
         if (!operation.pageTask && (!action || action.date !== operation.date || action.mutationId !== operation.mutationId)) return;
         if (operation.pageTask && sessionStorage.getItem(`BBSSignHelperPageTask:${key}`) !== operation.taskId) return;
-        sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
+        // 98堂成功浮层后会立即刷新；关页计时真正执行前保留本标签的签到关联。
+        if (key !== 'sehuatang') sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
         setTimeout(() => {
             if (!isOperationCurrent(operation, true) || getRawTargetStatus(key)?.confirmationSource !== 'automatic') return;
+            if (key === 'sehuatang') sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
             try { window.close(); } catch (err) { /* 下方提示手动关闭。 */ }
             showPageSignToast(key, 'success', { message: '已确认成功；若页面未关闭，可手动关闭' });
         }, 800);
@@ -2665,20 +2669,50 @@
         };
     }
 
+    function getSehuatangSignSuccessMessage() {
+        if (getSehuatangSignControlState().isSigned) return '页面显示今日已签到';
+        const dialogs = document.querySelectorAll('[id^="fwin_"], .alert_right, .layui-layer-content, .ui-dialog-content, .el-message__content, .el-notification__content, [role="dialog"], [role="alert"]');
+        for (const dialog of dialogs) {
+            if (!dialog.getClientRects().length || getComputedStyle(dialog).visibility === 'hidden' || dialog.closest('#bbs-sign-page-toast, #bbs-sign-dashboard-overlay')) continue;
+            const text = (dialog.innerText || dialog.textContent || '').trim();
+            if (/签到成功/.test(text) && !/失败|错误|异常|未成功|不成功/.test(text)) return '站点浮层提示签到成功';
+        }
+        return '';
+    }
+
+    function getSehuatangPendingAction(operation) {
+        try {
+            const action = JSON.parse(sessionStorage.getItem('BBSSignHelperPageAction:sehuatang') || 'null');
+            return action?.source === 'sehuatang-manual-sign' && action.date === operation?.date && action.mutationId === operation?.mutationId &&
+                Number.isFinite(action.createdAt) && action.createdAt <= Date.now() && Date.now() - action.createdAt < AUTO_CLOSE_PENDING_TTL_MS ? action : null;
+        } catch (err) { return null; }
+    }
+
     function monitorSehuatangManualSign(debugContext) {
-        const container = document.querySelector('.ddpc_sign_btna');
+        // 成功浮层在按钮容器之外；观察正文，同时保留按钮变灰的刷新后兜底。
+        const container = document.body;
         if (!container || container.dataset.bbsSignMonitor === '1') return;
         const operation = debugContext?.operation || pageOperations.get('sehuatang') || captureOperation('sehuatang');
         const actions = taskActions({ operation });
         container.dataset.bbsSignMonitor = '1';
         let timeout;
-        const stop = () => { observer.disconnect(); clearTimeout(timeout); delete container.dataset.bbsSignMonitor; pageObserverStops.delete(stop); };
+        const onClick = event => {
+            if (!isOperationCurrent(operation) || !isSehuatangSignPage() || !getSehuatangSignControlState().canSign) return;
+            const control = event.target.closest?.('.ddpc_sign_btna #signin-btn, .ddpc_sign_btna > a');
+            if (!control || control.classList.contains('ddpc_sign_btn_grey')) return;
+            if (markPendingAutoCloseAfterSignAction('sehuatang', 'sehuatang-manual-sign')) {
+                sessionStorage.setItem('BBSSignHelperPageAction:sehuatang', JSON.stringify({ ...operation, source: 'sehuatang-manual-sign', createdAt: Date.now() }));
+            }
+        };
+        const stop = () => { observer.disconnect(); container.removeEventListener('click', onClick, true); clearTimeout(timeout); delete container.dataset.bbsSignMonitor; pageObserverStops.delete(stop); };
         const observer = new MutationObserver(() => {
             if (!isOperationCurrent(operation)) { stop(); return; }
-            if (!getSehuatangSignControlState().isSigned) return;
-            stop(); actions.completeSign('sehuatang', '页面显示今日已签到');
+            const message = getSehuatangSignSuccessMessage();
+            if (!message) return;
+            stop(); actions.completeSign('sehuatang', message);
         });
-        observer.observe(container, { attributes: true, attributeFilter: ['class', 'id'], childList: true, characterData: true, subtree: true });
+        container.addEventListener('click', onClick, true);
+        observer.observe(container, { attributes: true, attributeFilter: ['class', 'id', 'style', 'hidden'], childList: true, characterData: true, subtree: true });
         timeout = setTimeout(stop, AUTO_CLOSE_PENDING_TTL_MS);
         pageObserverStops.add(stop);
     }
@@ -2696,8 +2730,9 @@
 
         await delay(500);
         const signState = getSehuatangSignControlState();
-        if (signState.isSigned) {
-            return completeSign('sehuatang', '页面显示今日已签到');
+        const successMessage = getSehuatangSignSuccessMessage();
+        if (successMessage) {
+            return completeSign('sehuatang', successMessage);
         }
         if (signState.canSign) {
             monitorSehuatangManualSign(debugContext);
@@ -3475,11 +3510,11 @@
             const confirmed = isOperationCurrent(entry.operation, true) && status?.status === 'success' &&
                 status.taskId === entry.operation.taskId && status.confirmationSource === 'automatic';
             const lease = getTaskLease(key);
-            // SS失败页可能等待用户刷新；任务到期不代表这个仍打开的标签已经结束。
-            const resumableSstm = key === 'sstm' && typeof entry.tab?.close === 'function' && lease?.kind === 'page' &&
+            // SS失败页可等待刷新；98堂释放独占租约后，短期保留原标签句柄用于成功后关页。
+            const resumablePage = (key === 'sstm' || (key === 'sehuatang' && Date.now() - entry.openedAt < AUTO_CLOSE_PENDING_TTL_MS)) && typeof entry.tab?.close === 'function' && lease?.kind === 'page' &&
                 lease.taskId === entry.operation.taskId && isOperationCurrent({ ...entry.operation, taskId: '' }) &&
                 !(status?.stage === 'manual' && ['failed', 'skipped', 'success'].includes(status.status));
-            if (entry.tab?.closed || (!resumableSstm && (Date.now() - entry.openedAt > AUTO_CLOSE_PENDING_TTL_MS || (!current && !confirmed)))) {
+            if (entry.tab?.closed || (!resumablePage && (Date.now() - entry.openedAt > AUTO_CLOSE_PENDING_TTL_MS || (!current && !confirmed)))) {
                 if (current && !isTargetDone(status?.status)) recordTargetStatus(key, 'result-unknown', {
                     context: entry.operation, stage: 'page-recovery', reasonCode: 'page-ended', message: '页面已关闭或任务超期，请先重新检查结果'
                 });
@@ -5060,13 +5095,14 @@
             let operation = bindPageTask(site.key);
             if (manualStatus?.stage === 'manual' && ['failed', 'skipped'].includes(manualStatus.status) && !operation?.checkOnly) return;
             if (site.key === 'sehuatang') {
-                // 98堂仅观察人工签到，浏览和签到可以分处不同标签，无需独占页面任务。
+                // 98堂独立观察各标签；只保留本标签实际发起签到的关页关联，不占用独占任务。
                 const checkOnly = operation?.checkOnly === true;
+                const pendingAction = getSehuatangPendingAction(captureOperation(site.key));
                 const lease = getTaskLease(site.key);
                 if (lease?.kind === 'page') finishTaskLease(lease);
-                operation = { ...captureOperation(site.key), checkOnly };
+                operation = { ...captureOperation(site.key), checkOnly, closeTaskId: operation?.taskId || pendingAction?.closeTaskId || '' };
                 sessionStorage.removeItem(`BBSSignHelperPageTask:${site.key}`);
-                sessionStorage.removeItem(`BBSSignHelperPageAction:${site.key}`);
+                if (!isSehuatangSignPage() || !getSehuatangPendingAction(operation)) sessionStorage.removeItem(`BBSSignHelperPageAction:${site.key}`);
             }
             // 验证前的入口点击、未完成状态不能阻止站点继续执行。
             // ZodGame 已发出的签到表单只查结果；SS同盟按原站点流程自行检查和刷新重试。
@@ -5087,6 +5123,7 @@
                 console.log(`[签到助手] ${site.name} 今日已完成，跳过。`);
                 recordTargetStatus(site.key, 'success', {
                     stage: 'skip',
+                    taskId: site.key === 'sehuatang' && getSehuatangPendingAction(operation) ? operation.closeTaskId : undefined,
                     message: '今日已完成，跳过执行',
                     url: location.href,
                     autoClosePageSignToastAfterMs: PAGE_COMPLETED_TOAST_AUTO_CLOSE_MS,

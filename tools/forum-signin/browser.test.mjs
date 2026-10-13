@@ -648,7 +648,7 @@ try {
     await signHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
     await signHt.waitForTimeout(850);
     assert.equal(await signHt.evaluate(() => __clicks), 1);
-    assert.equal(await signHt.evaluate(() => __closes), 0, '手动签到页没有自动动作或任务关页许可');
+    assert.equal(await signHt.evaluate(() => __closes), 1, '本标签实际点击并完成签到后，按设置尝试自动关闭');
     const htSuccess = await signHt.evaluate(() => [...__storage]);
     await manualHt.evaluate(records => { window.__storage = new Map(records); }, htSuccess);
     await manualHt.evaluate(engine);
@@ -658,6 +658,70 @@ try {
     assert.equal(await manualHt.evaluate(() => __requests.length), 0);
     await signHt.close();
     await manualHt.close();
+
+    const htUnsigned = '<div class="ddpc_sign_btna"><a id="signin-btn">今日未签到</a></div>';
+    const popupHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
+    await evaluate(popupHt, 'updateDashboardPreference({autoClosePageAfterSign:true})');
+    await popupHt.evaluate(() => { window.__closes = 0; window.close = () => __closes++; });
+    await runSite(popupHt, 'sehuatang');
+    await runSite(popupHt, 'sehuatang');
+    assert.equal(await evaluate(popupHt, 'pageObserverStops.size'), 1, '重复执行不叠加成功监听');
+    await popupHt.locator('#signin-btn').click();
+    await popupHt.evaluate(() => { const dialog = document.createElement('div'); dialog.id = 'fwin_dialog'; dialog.textContent = '签到成功，获得奖励！'; document.body.append(dialog); });
+    await popupHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
+    assert.equal(await evaluate(popupHt, 'getSehuatangSignControlState().isSigned'), false, '按钮尚未更新时，已由独立成功浮层确认');
+    assert.equal(await evaluate(popupHt, 'pageObserverStops.size'), 0, '成功后停止监听并移除点击事件');
+    const popupRefreshState = await popupHt.evaluate(() => ({ records: [...__storage], action: sessionStorage.getItem('BBSSignHelperPageAction:sehuatang'), now: __now }));
+    assert.ok(popupRefreshState.action, '刷新前保留本标签关页许可');
+    await popupHt.close();
+    const refreshedHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', '<div class="ddpc_sign_btna"><a class="ddpc_sign_btn_grey">今日已签到</a></div>');
+    await refreshedHt.evaluate(state => {
+        window.__storage = new Map(state.records); window.__now = state.now; sessionStorage.setItem('BBSSignHelperPageAction:sehuatang', state.action);
+        window.__closes = 0; window.close = () => __closes++;
+    }, popupRefreshState);
+    await refreshedHt.evaluate(engine);
+    await refreshedHt.waitForFunction(() => __closes === 1);
+    assert.equal(await refreshedHt.evaluate(() => sessionStorage.getItem('BBSSignHelperPageAction:sehuatang')), null, '关页后消费许可');
+    await refreshedHt.close();
+
+    for (const [autoClose, click] of [[false, true], [true, false]]) {
+        const gatedHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
+        await evaluate(gatedHt, `updateDashboardPreference({autoClosePageAfterSign:${autoClose}})`);
+        await gatedHt.evaluate(() => { window.__closes = 0; window.close = () => __closes++; });
+        await gatedHt.evaluate(engine);
+        if (click) await gatedHt.locator('#signin-btn').click();
+        await gatedHt.evaluate(() => { const dialog = document.createElement('div'); dialog.className = 'alert_right'; dialog.textContent = '签到成功'; document.body.append(dialog); });
+        await gatedHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
+        await gatedHt.waitForTimeout(850);
+        assert.equal(await gatedHt.evaluate(() => __closes), 0, '未启用设置或本标签未发起签到时不自动关闭');
+        await gatedHt.close();
+    }
+    const rejectedHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
+    await rejectedHt.evaluate(engine);
+    await rejectedHt.locator('#signin-btn').click();
+    await rejectedHt.evaluate(() => {
+        const wrapper = document.createElement('div');
+        wrapper.innerHTML = '<p>签到成功是正常情况</p><div role="dialog">签到成功失败，发生错误</div><div class="alert_right" style="display:none">签到成功</div>';
+        document.body.append(wrapper);
+    });
+    assert.notEqual(await result(rejectedHt, 'sehuatang'), 'success', '普通正文、失败提示和隐藏浮层不能误判成功');
+    await rejectedHt.close();
+
+    const closeHtPortal = await pageFor('https://www.limestart.cn/');
+    await evaluate(closeHtPortal, "updateDashboardPreference({autoClosePageAfterSign:true}); launchTarget(getBuiltInTargets().find(t=>t.id==='sehuatang'))");
+    const linkedHt = await pageFor(await closeHtPortal.evaluate(() => __tabs[0].url), htUnsigned);
+    await linkedHt.evaluate(records => { window.__storage = new Map(records); window.close = () => {}; }, await closeHtPortal.evaluate(() => [...__storage]));
+    await linkedHt.evaluate(engine);
+    await closeHtPortal.evaluate(records => { window.__storage = new Map(records); }, await linkedHt.evaluate(() => [...__storage]));
+    await evaluate(closeHtPortal, 'syncLaunchedAutoCloseTabs()');
+    assert.equal(await evaluate(closeHtPortal, 'launchedAutoCloseTabs.size'), 1, '释放独占任务后仍保留控制台标签句柄');
+    await linkedHt.locator('#signin-btn').click();
+    await linkedHt.evaluate(() => { const dialog = document.createElement('div'); dialog.id = 'fwin_dialog'; dialog.textContent = '签到成功'; document.body.append(dialog); });
+    await linkedHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
+    await closeHtPortal.evaluate(records => { window.__storage = new Map(records); }, await linkedHt.evaluate(() => [...__storage]));
+    await evaluate(closeHtPortal, 'syncLaunchedAutoCloseTabs()');
+    assert.equal(await closeHtPortal.evaluate(() => __tabs[0].closed), true, '自身关页被拒绝时控制台可关闭实际签到任务的标签');
+    await linkedHt.close(); await closeHtPortal.close();
 
     // 跳转仅移除本脚本参数，同一标签 sessionStorage 续接；普通同站标签不能认领。
     const linked = await pageFor('https://bbs.wcccc.cc/plugin.php?id=k_misign:sign&foo=keep');
