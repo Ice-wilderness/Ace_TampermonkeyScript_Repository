@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.20.2
+// @version      2.20.3
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -432,7 +432,7 @@
             case 'ZodGame': signed = /已经签到过了|今日已签到/.test(text('#ct > div.mn > h1:nth-child(1)')); debugContext.unsignedConfirmed = !signed && !debugContext.submitted && !hasPageSubmittedAction(site.key, debugContext.operation) && Boolean(document.querySelector('#qiandao')) && /今天签到了吗/.test(document.body?.innerText || ''); break;
             case '2dfan': signed = Array.from(document.querySelectorAll('.checkin-action button')).some(button => button.textContent.trim() === '今日已签到') || /今日已签到|今天已签到/.test(text('.checkin-info .pull-right')); break;
             case 'sehuatang': signed = isSehuatangSignPage() && getSehuatangSignControlState().isSigned; break;
-            case 'fufugal': signed = isFufugalConfirmed(getFufugalNotice()); break;
+            case 'fufugal': signed = await runFufugalApiSign(debugContext, true); break;
             case 'uugg': signed = await runUuGgPageSign(debugContext, true); break;
             case 'acgndog': signed = await runAcgndogApiSign(debugContext, true); break;
             case 'vik': signed = await runVikApiSign(debugContext, true); break;
@@ -1488,7 +1488,7 @@
 
     function isSignActionRequest(url, method) {
         if (/getUserInfo|getMissionList/.test(url)) return false;
-        return method.toUpperCase() === 'POST' || /[?&](?:actions=job2?|ok=3|operation=qiandao)(?:&|$)|type=goSign/.test(url);
+        return method.toUpperCase() === 'POST' || /^https?:\/\/www\.fufugal\.com\/hunt(?:[?#]|$)/i.test(url) || /[?&](?:actions=job2?|ok=3|operation=qiandao)(?:&|$)|type=goSign/.test(url);
     }
 
     async function fetchBuffered(fetchFn, url, options, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -2590,74 +2590,63 @@
         return false;
     }
 
-    async function runFufugalPageSign(debugContext) {
+    async function runFufugalApiSign(debugContext, checkOnly = false) {
         const { completeSign, recordTargetStatus } = taskActions(debugContext);
-        const getNoticeText = getFufugalNotice;
-        const waitForNoticeText = async (beforeText = '', timeout = 5000) => {
-            const startedAt = Date.now();
-            let lastText = '';
-            while (Date.now() - startedAt < timeout) {
-                const text = getNoticeText();
-                if (text && text !== beforeText && (isSuccessText(text) || isLoginText(text) || isFailureText(text))) return text;
-                if (text) lastText = text;
-                await delay(250);
-            }
-            return lastText;
-        };
-        const isSuccessText = isFufugalConfirmed;
-        const isLoginText = (text) => /请先登录|登录后|登陆后|未登录|未登陆/.test(text);
-        const isFailureText = (text) => /失败|错误|异常|无法|请稍后|error/i.test(text);
+        const noticeText = getFufugalNotice();
+        if (isFufugalConfirmed(noticeText)) {
+            return completeSign('fufugal', noticeText);
+        }
+        // /hunt 虽然使用 GET，仍会实际派遣寻宝，不能作为只读复查接口。
+        if (checkOnly) {
+            recordTargetStatus('fufugal', 'result-unknown', {
+                stage: 'verify', reasonCode: 'readonly-unavailable',
+                message: '未发现已完成的寻宝报告，无法只读确认结果；如需执行，请回控制台点击“继续寻宝”'
+            });
+            return false;
+        }
 
-        const bodyText = document.body?.innerText || '';
-        const hasLoginForm = Boolean(document.querySelector('input[type="password"], input[name="username"], input[name="password"]'));
-        const hasUserPanel = Boolean(document.querySelector('#photo_wrap .user-infos, .user-infos'));
-        if (!hasUserPanel && hasLoginForm && /登录|登陆/.test(bodyText)) {
+        let token = '';
+        try {
+            const user = JSON.parse(localStorage.getItem('user') || 'null');
+            token = typeof user?.token === 'string' ? user.token.trim() : '';
+        } catch (err) { /* 异常登录缓存按未登录处理，不清除站点数据。 */ }
+        if (!token) {
             recordTargetStatus('fufugal', 'needs-login', {
-                stage: 'login',
-                message: '初音的青葱需要先登录账号',
-                url: location.href
+                stage: 'login', message: '初音的青葱需要先登录账号，登录后刷新页面重试'
             });
             return false;
         }
 
-        const beforeNoticeText = getNoticeText();
-        if (isSuccessText(beforeNoticeText)) {
-            return completeSign('fufugal', beforeNoticeText);
-        }
-
-        const btn = await waitForElement(
-            '#photo_wrap > figure > div.user-infos > div.xbs.el-tooltip__trigger.el-tooltip__trigger, #photo_wrap .user-infos .xbs',
-            5000
-        );
-        if (!btn) {
-            console.log('[初音的青葱] 未找到寻宝按钮');
+        recordTargetStatus('fufugal', 'running', { stage: 'api', message: '正在通过 API 派遣寻宝，等待服务器返回结果' });
+        const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+            ? unsafeWindow.fetch.bind(unsafeWindow) : window.fetch.bind(window);
+        const response = await debugPageFetch('fufugal-hunt', pageFetch, new URL('/hunt', location.origin).href, {
+            method: 'GET', credentials: 'same-origin', cache: 'no-store',
+            headers: { Accept: 'application/json', 'X-Auth-Token': token }
+        }, debugContext);
+        let json;
+        try { json = await response.json(); }
+        catch (err) { throw signRequestError('adaptation', '寻宝接口未返回有效 JSON，请前台检查网站状态'); }
+        if (json?.code === 5 || json?.code === 601) {
+            recordTargetStatus('fufugal', 'needs-login', { stage: 'login', message: '初音的青葱登录已失效，请重新登录后重试' });
             return false;
         }
-
-        if (!markPendingAutoCloseAfterSignAction('fufugal', 'hunt-click')) return false;
-        btn.click();
-        console.log('执行寻宝(签到)点击');
-        const noticeText = await waitForNoticeText(beforeNoticeText);
-        if (isSuccessText(noticeText)) {
-            return completeSign('fufugal', noticeText || '寻宝按钮状态已确认', CLOSE_PAGE_AFTER_SIGN_ACTION);
-        }
-        if (isLoginText(noticeText)) {
-            recordTargetStatus('fufugal', 'needs-login', {
-                stage: 'login',
-                message: '初音的青葱需要先登录账号',
-                url: location.href
+        if (json?.code === 602) {
+            recordTargetStatus('fufugal', 'needs-foreground', {
+                stage: 'prerequisite', message: '请先在守护灵管理中设置出战位置，再重新执行寻宝'
             });
             return false;
         }
-        if (isFailureText(noticeText)) {
-            recordTargetStatus('fufugal', 'failed', {
-                stage: 'notice',
-                message: noticeText,
-                url: location.href
-            });
-            return false;
+        if (json?.code === 688) {
+            return completeSign('fufugal', '寻宝 API 确认今日已完成，请明日再来');
         }
-        recordTargetStatus('fufugal', 'result-unknown', { stage: 'verify', message: '寻宝已点击但结果未确认，请重新检查' });
+        const report = Array.isArray(json?.obj) && json.obj.every(item => typeof item === 'string') ? json.obj.join('\n') : '';
+        if (json?.code === 200 && report && isFufugalConfirmed(`寻宝报告\n${report}`)) {
+            return completeSign('fufugal', `寻宝 API 确认完成：${report}`, CLOSE_PAGE_AFTER_SIGN_ACTION);
+        }
+        recordTargetStatus('fufugal', 'result-unknown', {
+            stage: 'verify', message: '寻宝请求已发送，但接口未返回明确的完成报告；请前台核对结果，不自动重复派遣'
+        });
         return false;
     }
 
@@ -2698,8 +2687,8 @@
         const { completeSign, recordTargetStatus } = taskActions(debugContext);
         if (!isSehuatangSignPage()) {
             recordTargetStatus('sehuatang', 'needs-foreground', {
-                stage: 'prerequisite',
-                message: '请先在 98堂 回复 1 次，再手动进入签到页完成验证码',
+                stage: 'navigate',
+                message: '请直接进入 98堂 签到页，点击签到并完成验证码',
                 url: location.href
             });
             return false;
@@ -3322,16 +3311,10 @@
                 url: "https://www.fufugal.com/",
                 openMode: "background",
                 resultMode: "script",
-                note: "后台打开页面后点击寻宝按钮"
+                note: "后台打开页面后使用登录状态调用寻宝 API，无需等待按钮或报告弹窗"
             },
             async run(debugContext) {
-                const { completeSign, recordTargetStatus } = taskActions(debugContext);
-                try {
-                    return await runFufugalPageSign(debugContext);
-                } catch (err) {
-                    console.log('[初音的青葱] 页面寻宝异常', err);
-                }
-                return false;
+                return await runFufugalApiSign(debugContext);
             }
         },
         {
@@ -3339,10 +3322,10 @@
             matches: ["www.sehuatang.org"],
             key: "sehuatang",
             dashboard: {
-                url: "https://www.sehuatang.org/forum.php",
+                url: "https://www.sehuatang.org/plugin.php?id=dd_sign",
                 openMode: "foreground",
                 resultMode: "script",
-                note: "需先回复 1 次，再手动进入签到页完成点选验证码；脚本只检测结果"
+                note: "直接进入签到页，手动点击签到并完成点选验证码；脚本自动检测结果"
             },
             async run(debugContext) {
                 const { completeSign, recordTargetStatus } = taskActions(debugContext);
@@ -3562,8 +3545,17 @@
         recordTargetStatus(key, 'not-started', { context: captureOperation(key), stage: 'queue-removed', message: '已取消旧排队，可立即执行' });
     }
 
+    function canContinueFufugalSign(target, status = getNormalizedTargetStatus(target)) {
+        return target.siteKey === 'fufugal' && status.status === 'result-unknown' && status.reasonCode === 'readonly-unavailable';
+    }
+
     function launchTarget(target, checkOnly = false) {
         releaseLegacyQueuedTask(target.id);
+        // 旧版已结束的只读复查仍可能占有租约；仅解除该次复查，不打断正在提交的任务。
+        if (canContinueFufugalSign(target)) {
+            const lease = getTaskLease(target.id);
+            if (lease?.kind === 'page' && lease.checkOnly === true && lease.taskId === getRawTargetStatus(target.id)?.taskId) finishTaskLease(lease);
+        }
         if (hasActiveTask(target.id)) return false;
         const raw = getRawTargetStatus(target.id);
         const manualCheck = raw?.stage === 'manual' && ['failed', 'skipped'].includes(raw.status);
@@ -4240,6 +4232,7 @@
         const main = el('div', { className: 'bbs-sign-row-main' }, [el('div', { className: 'bbs-sign-name-line' }, [name, badge, url]), message, meta]);
         const primary = el('button', { className: 'bbs-sign-button primary', type: 'button', onClick: async () => {
             const item = row.target;
+            if (canContinueFufugalSign(item)) { launchTarget(item); rerender(); return; }
             if (hasActiveTask(item.id)) { showPageTaskInfo(item); return; }
             const status = getNormalizedTargetStatus(item).status;
             const checkOnly = status === 'success' || (status === 'result-unknown' && item.siteKey !== 'southplus');
@@ -4279,7 +4272,7 @@
             const source = { automatic: '自动确认', manual: '人工标记', legacy: '旧版记录' }[status.confirmationSource] || '';
             meta.textContent = [item.directApi ? '控制台直签' : OPEN_MODE_LABELS[item.openMode], source, status.updatedAt ? `更新于 ${getTimeLabel(status.updatedAt)}` : '今日尚未执行'].filter(Boolean).join(' · ');
             meta.title = item.note || '';
-            primary.textContent = hasActiveTask(item.id) && !['queued', 'running'].includes(status.status) ? '查看任务' : ['queued', 'running'].includes(status.status) ? info.label : status.status === 'success' ? '重新检查' : status.status === 'result-unknown' ? item.siteKey === 'southplus' ? '继续签到' : '检查结果' : status.status === 'failed' ? '重试' : ['needs-login', 'needs-foreground'].includes(status.status) ? '前台处理' : item.directApi ? '直签' : '打开';
+            primary.textContent = canContinueFufugalSign(item, status) ? '继续寻宝' : hasActiveTask(item.id) && !['queued', 'running'].includes(status.status) ? '查看任务' : ['queued', 'running'].includes(status.status) ? info.label : status.status === 'success' ? '重新检查' : status.status === 'result-unknown' ? item.siteKey === 'southplus' ? '继续签到' : '检查结果' : status.status === 'failed' ? '重试' : ['needs-login', 'needs-foreground'].includes(status.status) ? '前台处理' : item.directApi ? '直签' : '打开';
             primary.disabled = !item.enabled || ['running', 'queued'].includes(status.status) || directTasks.has(item.id);
         };
         row.patch(target);
@@ -5067,7 +5060,7 @@
             let operation = bindPageTask(site.key);
             if (manualStatus?.stage === 'manual' && ['failed', 'skipped'].includes(manualStatus.status) && !operation?.checkOnly) return;
             if (site.key === 'sehuatang') {
-                // 98堂仅观察人工签到，浏览、回复和签到可以分处不同标签，无需独占页面任务。
+                // 98堂仅观察人工签到，浏览和签到可以分处不同标签，无需独占页面任务。
                 const checkOnly = operation?.checkOnly === true;
                 const lease = getTaskLease(site.key);
                 if (lease?.kind === 'page') finishTaskLease(lease);
@@ -5120,7 +5113,7 @@
             };
             if (site.key === 'southplus') window.addEventListener('pagehide', releaseSouthPlusPage, { once: true });
 
-            const debugContext = startSignDebugCapture(site.key, site.name, 'site-run');
+            const debugContext = startSignDebugCapture(site.key, site.name, site.key === 'fufugal' && recoveryOnly ? 'check' : 'site-run');
             try {
                 recordTargetStatus(site.key, 'running', {
                     stage: 'run',
@@ -5131,7 +5124,7 @@
                 // 运行该站点的特定逻辑，如果执行完成返回 true，则保存今天的日期
                 const pageResult = await runPageTask(site, debugContext, recoveryOnly);
                 let isSuccess = pageResult.outcome === 'success';
-                if (!isSuccess && !['sstm', 'southplus'].includes(site.key) && pageResult.outcome !== 'not-completed' && !['needs-login', 'needs-foreground', 'failed'].includes(getRawTargetStatus(site.key)?.status)) {
+                if (!isSuccess && !['sstm', 'southplus', 'fufugal'].includes(site.key) && pageResult.outcome !== 'not-completed' && !['needs-login', 'needs-foreground', 'failed'].includes(getRawTargetStatus(site.key)?.status)) {
                     isSuccess = await waitForSiteSuccessRecheck(site);
                 }
                 if (isSuccess) {
@@ -5181,6 +5174,7 @@
                     window.removeEventListener('pagehide', releaseSouthPlusPage);
                     finishTaskLease(operation);
                 }
+                if (site.key === 'fufugal') finishTaskLease(operation);
                 // 人工验证码监视器可以继续保留到页面租约期限；不永久续租。
                 if (!['needs-foreground', 'needs-login', 'result-unknown', 'opened'].includes(getRawTargetStatus(site.key)?.status)) finishTaskLease(operation);
             }

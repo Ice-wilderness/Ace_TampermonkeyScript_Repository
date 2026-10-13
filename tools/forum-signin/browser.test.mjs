@@ -286,26 +286,60 @@ try {
     await hunt.evaluate(() => { document.querySelector('.el-message__content').textContent = '寻宝结束，最终携带回了 20 积分'; });
     await runSite(hunt, 'fufugal'); assert.equal(await result(hunt, 'fufugal'), 'success'); verified.push('fufugal'); await hunt.close();
 
-    // 真实截图中的自绘报告没有 role/Element UI 类，且报告会逐步更新。
-    const customHunt = await pageFor('https://www.fufugal.com/', '<div id="photo_wrap"><div class="user-infos"><button class="xbs">寻宝</button></div></div>');
+    // API 不依赖 Vue 按钮和报告渲染；中途战斗失败仍以最终寻宝结束为准。
+    const customHunt = await pageFor('https://www.fufugal.com/');
     await customHunt.evaluate(() => {
-        window.__huntClicks = 0; window.__huntTicks = 0;
-        document.querySelector('button').onclick = () => {
-            __huntClicks++;
-            const report = document.createElement('div'); report.id = 'custom-report';
-            report.innerHTML = '<h3>寻宝报告</h3><p>守护灵开始锻炼，进入小世界</p>'; document.body.append(report);
-        };
+        localStorage.setItem('user', JSON.stringify({ token: 'HUNT_TOKEN_SECRET' }));
+        __fetchResponses.push({ text: JSON.stringify({ code: 200, obj: ['战斗失败，离开小世界', '最后携带回了1积分', '寻宝结束，守护灵进入休息状态'], wrap: 1, config: 3424 }) });
     });
-    await evaluate(customHunt, `delay = async ms => { window.__now += ms; if (++window.__huntTicks === 3) document.querySelector('#custom-report').innerHTML = '<h3>寻宝报告</h3><p>战斗失败，离开小世界</p><p>最后携带回了1积分</p><p>寻宝结束，守护灵进入休息状态</p><button>确定</button>'; }`);
     await runSite(customHunt, 'fufugal');
-    assert.equal(await result(customHunt, 'fufugal'), 'success', '自绘报告中的结束状态应确认完成');
-    assert.equal(await customHunt.evaluate(() => __huntClicks), 1);
+    assert.equal(await result(customHunt, 'fufugal'), 'success', '无按钮和弹窗仍由 API 完成报告确认成功');
+    assert.deepEqual(await customHunt.evaluate(() => __requests), [{ url: 'https://www.fufugal.com/hunt', method: 'GET' }]);
+    assert.equal(await evaluate(customHunt, "requestContexts.get('fufugal').submitted"), true, 'GET 寻宝也必须记作提交动作');
+    assert.equal((await evaluate(customHunt, "JSON.stringify(requestContexts.get('fufugal').entries)")).includes('HUNT_TOKEN_SECRET'), false, '请求日志不得泄露认证令牌');
+    await customHunt.evaluate(() => { document.body.innerHTML = '<h3>寻宝报告</h3><p>战斗失败，离开小世界</p><p>寻宝结束，守护灵进入休息状态</p><button>确定</button>'; });
     await evaluate(customHunt, "checkSiteResult(siteConfigs.find(s=>s.key==='fufugal'))");
-    assert.equal(await customHunt.evaluate(() => __huntClicks), 1, '报告复查不能重复寻宝');
-    await customHunt.evaluate(() => document.querySelector('#photo_wrap').remove());
-    await runSite(customHunt, 'fufugal');
-    assert.equal(await result(customHunt, 'fufugal'), 'success', '已显示完成报告时不要求寻宝按钮仍存在');
+    assert.equal(await result(customHunt, 'fufugal'), 'success');
+    assert.equal(await customHunt.evaluate(() => __requests.length), 1, '结果复查不能再次调用寻宝接口');
     await customHunt.close();
+
+    for (const [payload, expected] of [
+        [{ code: 601 }, 'needs-login'], [{ code: 5 }, 'needs-login'],
+        [{ code: 602 }, 'needs-foreground'], [{ code: 688 }, 'success'],
+        [{ code: 200, obj: ['守护灵们为了更好的寻宝，拉着你一起开始锻炼', '咚咚咚......', '经过努力，你的等级提升到了3434级', '守护灵们分别提升到了930级,2265级,2055级,1903级,1713级', '进入小世界', '守护灵在草原上击败了一只野怪，获得了一颗珍贵的精灵珠！(๑•̀ㅂ•́)و✧', '离开小世界', '最终携带回了3积分', '寻宝结束,守护灵们进入休息状态'], wrap: 3, config: 3434 }, 'success'],
+        [{ code: 200, obj: ['守护灵进入小世界'] }, 'result-unknown'],
+        [{ code: 200, obj: { message: '寻宝结束' } }, 'result-unknown'],
+        [{ code: 0, obj: ['寻宝结束'] }, 'result-unknown'],
+        [{ code: 799, obj: ['寻宝结束'] }, 'result-unknown']
+    ]) {
+        const apiHunt = await pageFor('https://www.fufugal.com/');
+        await apiHunt.evaluate(payload => {
+            localStorage.setItem('user', JSON.stringify({ token: 'HUNT_TOKEN_SECRET' }));
+            __fetchResponses.push({ text: JSON.stringify(payload) });
+        }, payload);
+        await apiHunt.evaluate(engine);
+        assert.equal(await result(apiHunt, 'fufugal'), expected, `寻宝回包 ${JSON.stringify(payload)}`);
+        assert.equal(await apiHunt.evaluate(() => __requests.length), 1, 'API 返回后不重复派遣');
+        assert.equal(await apiHunt.evaluate(() => __now - new Date('2026-10-09T12:00:00+08:00').getTime()) < 1000, true, '不进入90秒 DOM 复查等待');
+        await apiHunt.close();
+    }
+    for (const cachedUser of [null, '{broken', JSON.stringify({ token: 123 })]) {
+        const noAuthHunt = await pageFor('https://www.fufugal.com/');
+        await noAuthHunt.evaluate(value => { localStorage.removeItem('user'); if (value !== null) localStorage.setItem('user', value); }, cachedUser);
+        await noAuthHunt.evaluate(engine);
+        assert.equal(await result(noAuthHunt, 'fufugal'), 'needs-login');
+        assert.equal(await noAuthHunt.evaluate(() => __requests.length), 0);
+        await noAuthHunt.close();
+    }
+    const failedHunt = await pageFor('https://www.fufugal.com/');
+    await failedHunt.evaluate(() => {
+        localStorage.setItem('user', JSON.stringify({ token: 'HUNT_TOKEN_SECRET' }));
+        window.fetch = async (url, options) => { __requests.push({ url: String(url), method: options.method }); throw new TypeError('Failed to fetch'); };
+    });
+    await failedHunt.evaluate(engine);
+    assert.equal(await result(failedHunt, 'fufugal'), 'result-unknown', '已发送的寻宝请求失败后保持待核对');
+    assert.equal(await failedHunt.evaluate(() => __requests.length), 1, '提交后网络失败不能自动重试寻宝');
+    await failedHunt.close();
 
     const sstm = await pageFor('https://sstm.moe/topic/123-test/', '<h1 class="ipsType_pageTitle">【2026/10/9】签到</h1><a id="elUserLink" href="/profile/me/">本人</a><div class="ipsComposeArea"><div contenteditable="true">2026年10月9日 草稿</div></div><article class="ipsComment"><aside class="cAuthorPane"><h3><a href="/profile/other/">他人</a></h3></aside><div class="ipsComment_content">2026年10月9日</div></article>');
     assert.equal(await evaluate(sstm, 'isSstmSignedToday()'), false);
@@ -584,14 +618,17 @@ try {
     assert.equal(await captchaWang.evaluate(() => __submits), 1);
     await captchaWang.close();
 
-    const manualHt = await pageFor('https://www.sehuatang.org/forum.php', '<div>98堂论坛，先自行选择帖子回复</div>');
+    const manualHt = await pageFor('https://www.sehuatang.org/forum.php', '<div>98堂论坛</div>');
+    assert.equal(await evaluate(manualHt, "getBuiltInTargets().find(t=>t.id==='sehuatang').url"), 'https://www.sehuatang.org/plugin.php?id=dd_sign', '控制台直接打开98堂签到页');
     await seedLegacyPageTask(manualHt, 'sehuatang', 'opened');
     await evaluate(manualHt, 'updateDashboardPreference({autoClosePageAfterSign:true})');
     const oldHtStorage = await manualHt.evaluate(() => [...__storage]);
     await manualHt.evaluate(() => { window.__closes = 0; window.close = () => __closes++; });
     await manualHt.evaluate(engine);
     assert.equal(await result(manualHt, 'sehuatang'), 'needs-foreground');
-    assert.equal(await evaluate(manualHt, "hasActiveTask('sehuatang')"), false, '浏览和回复不占用98堂页面任务');
+    assert.equal(await evaluate(manualHt, "getRawTargetStatus('sehuatang').stage"), 'navigate');
+    assert.match(await evaluate(manualHt, "getRawTargetStatus('sehuatang').message"), /直接进入.*签到页/);
+    assert.equal(await evaluate(manualHt, "hasActiveTask('sehuatang')"), false, '浏览不占用98堂页面任务');
     assert.equal(await manualHt.evaluate(() => location.pathname), '/forum.php');
     assert.equal(await manualHt.evaluate(() => __requests.length), 0);
 
@@ -665,11 +702,14 @@ try {
     const legacyHunt = await pageFor('https://www.fufugal.com/', '<div id="photo_wrap"><div class="user-infos"><button class="xbs">寻宝</button></div></div>');
     await legacyHunt.evaluate(() => {
         window.__huntClicks = 0;
-        document.querySelector('button').onclick = () => { __huntClicks++; const report = document.createElement('div'); report.innerHTML = '<h3>寻宝报告</h3><p>最后携带回了1积分</p><p>寻宝结束，守护灵进入休息状态</p><button>确定</button>'; document.body.append(report); };
+        document.querySelector('button').onclick = () => __huntClicks++;
+        localStorage.setItem('user', JSON.stringify({ token: 'HUNT_TOKEN_SECRET' }));
+        __fetchResponses.push({ text: JSON.stringify({ code: 200, obj: ['寻宝结束，守护灵进入休息状态'] }) });
     });
     await seedLegacyPageTask(legacyHunt, 'fufugal', 'result-unknown', 'hunt-click');
     await legacyHunt.evaluate(engine);
-    assert.equal(await legacyHunt.evaluate(() => __huntClicks), 1, '旧未知状态和隐式只读租约不能阻止寻宝点击');
+    assert.equal(await legacyHunt.evaluate(() => __huntClicks), 0, '改用 API 后不再点击寻宝按钮');
+    assert.equal(await legacyHunt.evaluate(() => __requests.length), 1, '旧未知状态和隐式只读租约不能阻止寻宝 API');
     assert.equal(await result(legacyHunt, 'fufugal'), 'success');
     await legacyHunt.close();
 
@@ -763,7 +803,43 @@ try {
     await evaluate(explicitHunt, "GM_setValue(getScopedStorageKey(STORAGE_KEYS.task,'fufugal'),{...getTaskLease('fufugal'),checkOnly:true,checkOnlySource:'explicit'})");
     await explicitHunt.evaluate(engine);
     assert.equal(await explicitHunt.evaluate(() => __huntClicks), 0, '用户显式重新检查仍不能触发寻宝动作');
+    assert.equal(await explicitHunt.evaluate(() => __requests.length), 0, '只读复查不得发送 GET /hunt');
+    assert.equal(await evaluate(explicitHunt, "getRawTargetStatus('fufugal').reasonCode"), 'readonly-unavailable');
+    assert.equal(await evaluate(explicitHunt, "hasActiveTask('fufugal')"), false, '只读复查结束后释放页面租约');
+    assert.equal(await evaluate(explicitHunt, "buildSignDebugExport().logs.at(-1).mode"), 'check', '诊断区分只读检查和实际执行');
+    const checkedHuntStorage = await explicitHunt.evaluate(() => [...__storage]);
     await explicitHunt.close();
+
+    // 用户日志中的空请求复查必须能从控制台继续执行，且兼容旧版遗留的只读租约。
+    const huntPortal = await pageFor('https://www.limestart.cn/');
+    await huntPortal.evaluate(records => { window.__storage = new Map(records); }, checkedHuntStorage);
+    await evaluate(huntPortal, `
+        const oldCheck = getTaskLease('fufugal');
+        GM_setValue(getScopedStorageKey(STORAGE_KEYS.task,'fufugal'), {...oldCheck, checkOnly:true, checkOnlySource:'explicit', expiresAt:Date.now()+600000});
+        showDashboard();
+    `);
+    assert.equal(await evaluate(huntPortal, "hasActiveTask('fufugal')"), true, '模拟尚未释放的旧复查租约');
+    const huntRow = huntPortal.locator('[data-target="fufugal"]');
+    await huntRow.getByRole('button', { name: '继续寻宝', exact: true }).click();
+    assert.equal(await huntPortal.evaluate(() => __tabs.length), 1, '继续入口解除旧复查并打开执行页面');
+    assert.equal(await evaluate(huntPortal, "getTaskLease('fufugal').checkOnly"), false, '继续寻宝启动实际执行任务');
+    assert.notEqual(await evaluate(huntPortal, "getTaskLease('fufugal').taskId"), checkedHuntStorage.find(([key]) => key === 'BBSSignHelperTask:fufugal')[1].taskId);
+    const resumedHunt = await pageFor(await huntPortal.evaluate(() => __tabs[0].url));
+    await resumedHunt.evaluate(records => {
+        window.__storage = new Map(records);
+        localStorage.setItem('user', JSON.stringify({ token: 'HUNT_TOKEN_SECRET' }));
+        __fetchResponses.push({ text: JSON.stringify({ code: 688 }) });
+    }, await huntPortal.evaluate(() => [...__storage]));
+    await resumedHunt.evaluate(engine);
+    assert.equal(await resumedHunt.evaluate(() => __requests.length), 1, '控制台继续入口实际发送寻宝 API');
+    assert.equal(await result(resumedHunt, 'fufugal'), 'success', '已完成响应也能结束待检查状态');
+    assert.equal(await evaluate(resumedHunt, "hasActiveTask('fufugal')"), false);
+    await huntPortal.evaluate(records => { window.__storage = new Map(records); }, await resumedHunt.evaluate(() => [...__storage]));
+    await evaluate(huntPortal, 'refreshDashboardData()');
+    await huntRow.locator('summary').click();
+    await huntRow.getByRole('button', { name: '重新检查', exact: true }).last().click();
+    assert.equal(await evaluate(huntPortal, "getTaskLease('fufugal').checkOnly"), true, '更多菜单的重新检查仍启动只读任务');
+    await resumedHunt.close(); await huntPortal.close();
 
     const refresh = await pageFor('https://zodgame.xyz/plugin.php?id=dsu_paulsign:sign', '<div>今天签到了吗 写下今天最想说的话</div><form id="qiandao"></form>');
     await refresh.evaluate(() => {
