@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.3.0
-// @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、官方历史页同步及可选 WebDAV 云同步与日期备份。
+// @version      4.4.0
+// @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -1584,6 +1584,109 @@
     const SHARD_COUNT = 64;
     const STATUS_MAP = { 0: '已访问', 1: '已观看', 2: '已删除' };
     const STATUS_REVERSE = { '已访问': 0, '已观看': 1, '已删除': 2 };
+    const HistoryCSV = {
+        headers: ['标题', 'UP主', '分类', '视频链接', '观看时间', '视频时长', '观看进度', '完成度', '是否收藏'],
+        exportHeaders: ['标题', '视频链接', '观看时间', '观看进度', '完成度'],
+        parse(text) {
+            const rows = [], row = [];
+            let field = '', quoted = false, closed = false;
+            const pushField = () => { row.push(field); field = ''; closed = false; };
+            for (let i = 0; i < text.length; i++) {
+                const c = text[i];
+                if (quoted) {
+                    if (c !== '"') field += c;
+                    else if (text[i + 1] === '"') { field += '"'; i++; }
+                    else { quoted = false; closed = true; }
+                } else if (c === ',') pushField();
+                else if (c === '\r' || c === '\n') {
+                    pushField(); rows.push(row.splice(0));
+                    if (c === '\r' && text[i + 1] === '\n') i++;
+                } else if (c === '"' && !field && !closed) quoted = true;
+                else {
+                    if (closed || c === '"') throw new Error('CSV 引号格式错误');
+                    field += c;
+                }
+            }
+            if (quoted) throw new Error('CSV 存在未闭合的引号');
+            if (field || closed || row.length) { pushField(); rows.push(row); }
+            return rows.filter(cells => cells.length !== 1 || cells[0] !== '');
+        },
+        duration(value, fail) {
+            if (!value) return null;
+            if (value === '-1秒') return -1;
+            const match = value.match(/^(?:(\d+)小时)?(?:(\d+)分钟)?(?:(\d+)秒)?$/);
+            if (!match || !match.slice(1).some(v => v !== undefined)) fail('时长');
+            const seconds = Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0);
+            if (!Number.isSafeInteger(seconds)) fail('时长');
+            return seconds;
+        },
+        validate(text) {
+            const table = HistoryCSV.parse(text), header = table.shift();
+            if (!header || ![HistoryCSV.headers, HistoryCSV.exportHeaders].some(expected => header.length === expected.length && header.every((v, i) => v === expected[i]))) throw new Error('CSV 表头不匹配，请选择本脚本或历史记录导出工具的 CSV 文件');
+            const records = new Map();
+            let duplicateCount = 0;
+            table.forEach((cells, index) => {
+                const fail = field => { throw new Error(`CSV 第 ${index + 2} 条：${field} 无效`); };
+                if (cells.length !== header.length) fail('列数');
+                const valuesByHeader = Object.fromEntries(header.map((name, i) => [name, cells[i]]));
+                const { 标题: title, 视频链接: link, 观看时间: time, 视频时长: durationText = '', 观看进度: progressText, 完成度: completion } = valuesByHeader;
+                let url;
+                try { url = new URL(link); } catch { fail('视频链接'); }
+                if (!['http:', 'https:'].includes(url.protocol) || url.hostname !== 'www.bilibili.com'
+                    || !/^\/video\/(?:[Bb][Vv][A-Za-z0-9]{10}|av\d+)\/?$/.test(url.pathname)) fail('视频链接');
+                if (url.searchParams.has('p') && !/^[1-9]\d*$/.test(url.searchParams.get('p'))) fail('分 P 编号');
+                const key = VideoKey.fromUrl(link);
+                const duration = HistoryCSV.duration(durationText, fail), progress = HistoryCSV.duration(progressText, fail);
+                if (duration !== null && duration < 0) fail('视频时长');
+                let percent = null;
+                if (completion) {
+                    if (/^\d+(?:\.\d+)?%$/.test(completion)) percent = Math.min(100, Math.round(parseFloat(completion)));
+                    else if (!(progress === -1 && (/^-\d+(?:\.\d+)?%$/.test(completion) || duration === 0 && completion === '-Infinity%')
+                        || duration === 0 && ['NaN%', 'Infinity%'].includes(completion))) fail('完成度');
+                }
+                // B 站以 -1 表示已看完；附件脚本会将其写为 -1秒和负百分比。
+                if (progress === -1) percent = 100;
+                else if (percent === null && duration > 0 && progress !== null) percent = Math.min(100, Math.round(progress / duration * 100));
+                let timestamp = null;
+                if (time) {
+                    const parts = time.match(/^(\d{4})[/-](\d{1,2})[/-](\d{1,2})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
+                    if (!parts) fail('观看时间');
+                    const values = parts.slice(1).map(Number), [y, m, d, h, min, s] = values;
+                    const date = new Date(y, m - 1, d, h, min, s);
+                    if ([date.getFullYear(), date.getMonth() + 1, date.getDate(), date.getHours(), date.getMinutes(), date.getSeconds()].some((v, i) => v !== values[i])) fail('观看时间');
+                    timestamp = date.getTime() / 1000;
+                }
+                const seconds = progress === -1 ? duration : progress;
+                const pad = n => String(n).padStart(2, '0');
+                const currentTime = seconds === null ? '' : (seconds >= 3600 ? pad(Math.floor(seconds / 3600)) + ':' : '') + pad(Math.floor(seconds % 3600 / 60)) + ':' + pad(seconds % 60);
+                const record = { s: progress !== null || percent !== null ? 1 : 0, t: currentTime, p: percent ?? 0, a: timestamp, n: title };
+                const previous = records.get(key);
+                if (previous) duplicateCount++;
+                if (!previous || (timestamp ?? -Infinity) > (previous.a ?? -Infinity)
+                    || timestamp === previous.a && record.p > previous.p) records.set(key, record);
+            });
+            return { rows: [...records].map(([key, record]) => ({ key, record })), duplicateCount };
+        },
+        formatDuration(seconds) {
+            if (seconds >= 3600) return `${Math.floor(seconds / 3600)}小时${Math.floor(seconds % 3600 / 60)}分钟${seconds % 60}秒`;
+            if (seconds >= 60) return `${Math.floor(seconds / 60)}分钟${seconds % 60}秒`;
+            return `${seconds}秒`;
+        },
+        serialize(records) {
+            const escape = value => '"' + String(value).replace(/"/g, '""') + '"';
+            const rows = records.map(({ key, record }) => {
+                const seconds = record.currentTime ? Utils.timeToSeconds(record.currentTime) : null;
+                return [record.title || '', `https://www.bilibili.com/video/${key}`, record.savedAt || '',
+                    seconds !== null ? HistoryCSV.formatDuration(seconds) : '', record.percent || ''].map(escape).join(',');
+            });
+            return '\uFEFF' + [HistoryCSV.exportHeaders.join(','), ...rows].join('\r\n');
+        },
+        async download() {
+            await StorageManager.initialize();
+            const url = URL.createObjectURL(new Blob([HistoryCSV.serialize(StorageManager.getAllRecords())], { type: 'text/csv;charset=utf-8' }));
+            const a = document.createElement('a'); a.href = url; a.download = `bilibili-history-${new Date().toISOString().slice(0, 10)}.csv`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+    };
     const StorageManager = {
         _store: new HistoryCommitStore(),
         _tabId: crypto.randomUUID(),
@@ -1978,6 +2081,13 @@
             const rows = StorageManager.validateImport(data);
             const count = await StorageManager.saveRecords(rows, true, { source: 'import' });
             return { count, skipCount: rows.length - count };
+        },
+        async importFile(text, filename = '') {
+            text = text.replace(/^\uFEFF/, '');
+            if (!/\.csv$/i.test(filename)) return StorageManager.importRecords(JSON.parse(text));
+            const { rows, duplicateCount } = HistoryCSV.validate(text);
+            const count = await StorageManager.saveRecords(rows, true, { source: 'import' });
+            return { count, skipCount: rows.length - count + duplicateCount };
         },
         deleteRecord(key, notify = true) { return StorageManager.deleteRecords([key], notify); },
         deleteRecords(keys, notify = true, options = {}) {
@@ -3619,7 +3729,7 @@
             this.root.querySelectorAll('[data-preview]').forEach(el => el.setAttribute('aria-pressed', el.dataset.preview === state));
         }
         historyShell() {
-            this.q('[data-pane="history"]').innerHTML = `<div class="bvh-search-row"><label class="bvh-search">${workbenchIcon('history')}<input data-query aria-label="搜索标题或视频编号" placeholder="搜索视频标题、BV / AV 编号…"></label><button data-action="clear-query">清除</button></div><div class="bvh-history-tools"><label>状态 <select data-filter="status"><option value="all">全部记录</option><option>已观看</option><option>已访问</option></select></label><label>排序 <select data-filter="sort"><option value="savedAt-desc">最近保存优先</option><option value="savedAt-asc">最早保存优先</option><option value="percent-desc">进度从高到低</option><option value="percent-asc">进度从低到高</option><option value="title-asc">标题顺序</option></select></label><div class="bvh-tool-spacer"></div><button data-action="import">导入</button><button data-action="export">导出记录</button></div><div class="bvh-selection-bar"><span data-selection-info>选择记录后可批量操作</span><button data-action="clear-selection">取消选择</button><button class="danger" data-action="delete-selected" disabled>删除选中</button></div><div data-results aria-live="polite"></div><details class="bvh-retention"><summary>数据维护 · 清理久远记录</summary><div><label>保留最近 <input data-retention-value type="number" min="1" step="1" value="6" aria-label="保留数量"></label><select data-retention-unit aria-label="保留时间单位"><option value="months">个月</option><option value="days">天</option><option value="years">年</option></select><button class="danger" data-action="retention">检查清理范围</button></div><p>清理全部历史中的过期记录，不受搜索、筛选或勾选范围影响；确认前会显示截止时间和记录数量。</p></details>`;
+            this.q('[data-pane="history"]').innerHTML = `<div class="bvh-search-row"><label class="bvh-search">${workbenchIcon('history')}<input data-query aria-label="搜索标题或视频编号" placeholder="搜索视频标题、BV / AV 编号…"></label><button data-action="clear-query">清除</button></div><div class="bvh-history-tools"><label>状态 <select data-filter="status"><option value="all">全部记录</option><option>已观看</option><option>已访问</option></select></label><label>排序 <select data-filter="sort"><option value="savedAt-desc">最近保存优先</option><option value="savedAt-asc">最早保存优先</option><option value="percent-desc">进度从高到低</option><option value="percent-asc">进度从低到高</option><option value="title-asc">标题顺序</option></select></label><div class="bvh-tool-spacer"></div><button data-action="import">导入</button><button data-action="export">导出 JSON</button><button data-action="export-csv">导出 CSV</button></div><div class="bvh-selection-bar"><span data-selection-info>选择记录后可批量操作</span><button data-action="clear-selection">取消选择</button><button class="danger" data-action="delete-selected" disabled>删除选中</button></div><div data-results aria-live="polite"></div><details class="bvh-retention"><summary>数据维护 · 清理久远记录</summary><div><label>保留最近 <input data-retention-value type="number" min="1" step="1" value="6" aria-label="保留数量"></label><select data-retention-unit aria-label="保留时间单位"><option value="months">个月</option><option value="days">天</option><option value="years">年</option></select><button class="danger" data-action="retention">检查清理范围</button></div><p>清理全部历史中的过期记录，不受搜索、筛选或勾选范围影响；确认前会显示截止时间和记录数量。</p></details>`;
         }
         async refresh() {
             if (this.tab === 'settings' || this.disposed) return;
@@ -3730,6 +3840,7 @@
                 if (action === 'delete-selected') await this.deleteKeys([...this.selected]);
                 if (action === 'retention') await this.retention();
                 if (action === 'export') await this.export();
+                if (action === 'export-csv') await this.export('csv');
                 if (action === 'import') this.import();
                 if (action === 'download-log') Utils.downloadDebugLog();
                 if (action === 'clear-log') { Utils.clearDebugLogs(); UIComponent.toast('日志已清空', 'success'); }
@@ -3882,7 +3993,8 @@
             } finally { this.closing = false; }
         }
         dispose() { if (this.disposed) return; this.disposed = true; this.generation++; clearTimeout(this.searchTimer); this.unsubscribe?.(); this.unsubscribeCloud?.(); this.closeLayer?.(); if (HistoryManagerPanel.active === this) HistoryManagerPanel.active = null; }
-        async export() {
+        async export(format = 'json') {
+            if (format === 'csv') return HistoryCSV.download();
             await StorageManager.initialize();
             const data = Object.fromEntries(StorageManager.getAllRecords().map(({ key, record }) => [key, record]));
             const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
@@ -3890,11 +4002,11 @@
         }
         import() {
             if (this.busy) return;
-            const input = document.createElement('input'); input.type = 'file'; input.accept = '.json';
+            const input = document.createElement('input'); input.type = 'file'; input.accept = '.json,.csv';
             input.onchange = async () => {
                 if (!input.files[0]) return; this.busy = true;
                 const feedback = UIComponent.progressToast('正在校验并导入记录…');
-                try { const result = await StorageManager.importRecords(JSON.parse(await input.files[0].text())); feedback.close(`导入 ${result.count} 条，跳过 ${result.skipCount} 条已有记录`, 'success', 4000); if (!this.disposed) this.refresh(); }
+                try { const result = await StorageManager.importFile(await input.files[0].text(), input.files[0].name); feedback.close(`导入 ${result.count} 条，跳过 ${result.skipCount} 条已有或重复记录`, 'success', 4000); if (!this.disposed) this.refresh(); }
                 catch (error) { feedback.close('导入失败：' + error.message, 'error', 6000); }
                 finally { this.busy = false; }
             }; input.click();
@@ -5639,6 +5751,8 @@
                 URL.revokeObjectURL(url);
             });
 
+            GM_registerMenuCommand('导出历史记录（CSV）', () => HistoryCSV.download().catch(error => UIComponent.toast('导出失败：' + error.message, 'error', 5000)));
+
             GM_registerMenuCommand('恢复面板默认位置', () => {
                 FloatingEntry.resetPosition();
                 UIComponent.toast('面板位置已恢复默认', 'success', 2000);
@@ -5647,18 +5761,17 @@
             GM_registerMenuCommand('导入历史记录', () => {
                 const input = document.createElement('input');
                 input.type = 'file';
-                input.accept = '.json';
+                input.accept = '.json,.csv';
                 input.onchange = e => {
                     const file = e.target.files[0];
                     if (!file) return;
                     const reader = new FileReader();
                     reader.onload = async ev => {
                         try {
-                            const data = JSON.parse(ev.target.result);
-                            const result = await StorageManager.importRecords(data);
-                            UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有记录)`, 'success', 4000);
+                            const result = await StorageManager.importFile(ev.target.result, file.name);
+                            UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有或重复记录)`, 'success', 4000);
                         } catch (err) {
-                            UIComponent.toast('导入失败：文件格式错误', 'error');
+                            UIComponent.toast('导入失败：' + err.message, 'error', 5000);
                         }
                     };
                     reader.readAsText(file);
