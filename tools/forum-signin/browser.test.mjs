@@ -659,7 +659,7 @@ try {
     await signHt.close();
     await manualHt.close();
 
-    const htUnsigned = '<div class="ddpc_sign_btna"><a id="signin-btn">今日未签到</a></div>';
+    const htUnsigned = '<div class="ddpc_sign_btna"><a class="ddpc_sign_btn_red" id="signin-btn">今日未签到，点击签到</a></div><div id="toast" class="toast"><span class="toast-text"></span></div>';
     const popupHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
     await evaluate(popupHt, 'updateDashboardPreference({autoClosePageAfterSign:true})');
     await popupHt.evaluate(() => { window.__closes = 0; window.close = () => __closes++; });
@@ -667,7 +667,7 @@ try {
     await runSite(popupHt, 'sehuatang');
     assert.equal(await evaluate(popupHt, 'pageObserverStops.size'), 1, '重复执行不叠加成功监听');
     await popupHt.locator('#signin-btn').click();
-    await popupHt.evaluate(() => { const dialog = document.createElement('div'); dialog.id = 'fwin_dialog'; dialog.textContent = '签到成功，获得奖励！'; document.body.append(dialog); });
+    await popupHt.evaluate(() => { const toast = document.querySelector('#toast'); toast.querySelector('.toast-text').textContent = '签到成功，获得奖励！'; toast.className = 'toast show success'; });
     await popupHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
     assert.equal(await evaluate(popupHt, 'getSehuatangSignControlState().isSigned'), false, '按钮尚未更新时，已由独立成功浮层确认');
     assert.equal(await evaluate(popupHt, 'pageObserverStops.size'), 0, '成功后停止监听并移除点击事件');
@@ -703,8 +703,11 @@ try {
         const wrapper = document.createElement('div');
         wrapper.innerHTML = '<p>签到成功是正常情况</p><div role="dialog">签到成功失败，发生错误</div><div class="alert_right" style="display:none">签到成功</div>';
         document.body.append(wrapper);
+        const toast = document.querySelector('#toast'); toast.querySelector('.toast-text').textContent = '签到成功'; toast.className = 'toast success';
     });
     assert.notEqual(await result(rejectedHt, 'sehuatang'), 'success', '普通正文、失败提示和隐藏浮层不能误判成功');
+    await rejectedHt.evaluate(() => { document.querySelector('#toast').className = 'toast show error'; });
+    assert.notEqual(await result(rejectedHt, 'sehuatang'), 'success', '错误类型的站点 toast 不可作为成功证据');
     await rejectedHt.close();
 
     const closeHtPortal = await pageFor('https://www.limestart.cn/');
@@ -756,8 +759,13 @@ try {
     assert.equal(await result(refreshCloseSstm, 'sstm'), 'success');
     assert.equal(await evaluate(refreshCloseSstm, "getRawTargetStatus('sstm').taskId"), failedSstmTask.taskId);
     await retryOrigin.evaluate(records => { window.__storage = new Map(records); }, await refreshCloseSstm.evaluate(() => [...__storage]));
+    await retryOrigin.evaluate(() => { window.__closeAttempts = 0; __tabs[0].close = () => { if (++__closeAttempts === 2) __tabs[0].closed = true; }; });
     await evaluate(retryOrigin, 'syncLaunchedAutoCloseTabs()');
-    assert.equal(await retryOrigin.evaluate(() => __tabs[0].closed), true, '刷新成功仍由原控制台句柄关闭');
+    assert.equal(await retryOrigin.evaluate(() => __tabs[0].closed), false, '首次关页尚未生效');
+    assert.equal(await evaluate(retryOrigin, 'launchedAutoCloseTabs.size'), 1, '真实引擎确认成功后仍保留尚未关闭的句柄');
+    await retryOrigin.evaluate(() => { window.__now += 2000; });
+    await evaluate(retryOrigin, 'syncLaunchedAutoCloseTabs()');
+    assert.equal(await retryOrigin.evaluate(() => __tabs[0].closed), true, '刷新成功后通过原控制台句柄重试关闭');
     await refreshCloseSstm.waitForFunction(() => __closes === 1);
     assert.equal(await refreshCloseSstm.evaluate(() => __requests.length), 0, '已有本人评论不重复提交');
     await refreshCloseSstm.close(); await retryOrigin.close();

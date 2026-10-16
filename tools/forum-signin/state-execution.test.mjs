@@ -114,6 +114,61 @@ await wangPage.tick(800);
 assert.equal(wangPage.run('closes'), 1);
 wang.run('syncLaunchedAutoCloseTabs()');
 assert.equal(wang.tabs[0].closed, true, '成功不能因租约先结束而丢失关页句柄');
+// SS同盟关页不一定同步生效；不能调用一次后立即丢弃句柄。
+for (const throwFirst of [false, true]) {
+    const closing = await createFixture();
+    closing.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.t=getBuiltInTargets().find(t=>t.id==='sstm'); launchTarget(t); globalThis.op=getTaskLease('sstm'); taskActions({operation:op}).completeSign('sstm','已确认本人今日发布的签到评论'); finishTaskLease(op)");
+    let attempts = 0;
+    closing.tabs[0].close = () => {
+        attempts++;
+        if (attempts === 1) { if (throwFirst) throw new Error('标签正在跳转'); return; }
+        closing.tabs[0].closed = true;
+    };
+    closing.run('syncLaunchedAutoCloseTabs(); syncLaunchedAutoCloseTabs()');
+    assert.equal(attempts, 1, '关页重试有间隔，状态回调不会密集重复关闭');
+    assert.equal(closing.run('launchedAutoCloseTabs.size'), 1, '未确认关闭时保留原标签句柄');
+    await closing.tick(1999);
+    assert.equal(attempts, 1);
+    await closing.tick(1);
+    assert.equal(attempts, 2);
+    assert.equal(closing.tabs[0].closed, true, '首次未生效或抛错后仍可重试关闭');
+    assert.equal(closing.run('launchedAutoCloseTabs.size'), 0);
+}
+const closeLimited = await createFixture();
+closeLimited.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.t=getBuiltInTargets().find(t=>t.id==='sstm'); launchTarget(t); globalThis.op=getTaskLease('sstm'); taskActions({operation:op}).completeSign('sstm','已确认本人今日发布的签到评论'); finishTaskLease(op)");
+let limitedAttempts = 0;
+closeLimited.tabs[0].close = () => { limitedAttempts++; };
+closeLimited.run('syncLaunchedAutoCloseTabs()');
+await closeLimited.tick(5999);
+assert.equal(limitedAttempts, 3, '关页最多尝试三次');
+assert.equal(closeLimited.run('launchedAutoCloseTabs.size'), 1, '最后一次请求仍等待结果确认');
+await closeLimited.tick(1);
+assert.equal(closeLimited.run('launchedAutoCloseTabs.size'), 0, '达到上限后结束监听');
+assert.equal(closeLimited.run("getRawTargetStatus('sstm').status"), 'success', '关闭失败不改变签到成功状态');
+assert.equal(closeLimited.run("getRawTargetStatus('sstm').reasonCode"), 'close-failed');
+assert.match(closeLimited.run("getRawTargetStatus('sstm').evidence"), /本人今日发布的签到评论/, '保留原有签到完成证据');
+assert.match(closeLimited.run("getRawTargetStatus('sstm').message"), /请手动关闭/);
+
+for (const stop of ["resetTargetStatus(t)", "acquireTaskLease('sstm','page')", "setManualTargetStatus(t,'success')", "updateDashboardPreference({autoClosePageAfterSign:false})"]) {
+    const cancelledClose = await createFixture();
+    cancelledClose.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.t=getBuiltInTargets().find(t=>t.id==='sstm'); launchTarget(t); globalThis.op=getTaskLease('sstm'); taskActions({operation:op}).completeSign('sstm','已确认本人今日发布的签到评论'); finishTaskLease(op)");
+    let attempts = 0;
+    cancelledClose.tabs[0].close = () => { attempts++; };
+    cancelledClose.run('syncLaunchedAutoCloseTabs(); ' + stop);
+    await cancelledClose.tick(7000);
+    assert.equal(attempts, 1, '重置、任务替换、人工确认或关闭设置后停止旧关页重试');
+    assert.equal(cancelledClose.run('launchedAutoCloseTabs.size'), 0);
+}
+
+const sstmBeforeNavigate = await createFixture();
+sstmBeforeNavigate.context.location.hostname = 'sstm.moe';
+sstmBeforeNavigate.context.location.href = 'https://sstm.moe/topic/123-test/';
+sstmBeforeNavigate.run("updateDashboardPreference({autoClosePageAfterSign:true}); globalThis.op=acquireTaskLease('sstm','page'); pageOperations.set('sstm',op); markPendingAutoCloseAfterSignAction('sstm','reply-submit'); globalThis.closes=0; window.close=()=>closes++; taskActions({operation:op}).completeSign('sstm','已确认本人今日发布的签到评论'); finishTaskLease(op)");
+assert.ok(sstmBeforeNavigate.sessions.get('BBSSignHelperPageAction:sstm'), '延迟关页前保留本标签动作，兼容IPS提交后跳转');
+await sstmBeforeNavigate.tick(800);
+assert.equal(sstmBeforeNavigate.run('closes'), 1);
+assert.equal(sstmBeforeNavigate.sessions.has('BBSSignHelperPageAction:sstm'), false, '执行关页后消费动作关联');
+
 for (const invalidate of [
     "finishTaskLease(getTaskLease('laowang'))",
     "setManualTargetStatus(t,'success')",

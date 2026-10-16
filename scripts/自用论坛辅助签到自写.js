@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.21.0
+// @version      2.21.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1012,11 +1012,12 @@
         try { action = JSON.parse(sessionStorage.getItem(`BBSSignHelperPageAction:${key}`) || 'null'); } catch (err) { return; }
         if (!operation.pageTask && (!action || action.date !== operation.date || action.mutationId !== operation.mutationId)) return;
         if (operation.pageTask && sessionStorage.getItem(`BBSSignHelperPageTask:${key}`) !== operation.taskId) return;
-        // 98堂成功浮层后会立即刷新；关页计时真正执行前保留本标签的签到关联。
-        if (key !== 'sehuatang') sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
+        // SS同盟提交后可能跳转，98堂成功后会刷新；关页计时执行前保留本标签的签到关联。
+        const preserveActionUntilClose = key === 'sstm' || key === 'sehuatang';
+        if (!preserveActionUntilClose) sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
         setTimeout(() => {
             if (!isOperationCurrent(operation, true) || getRawTargetStatus(key)?.confirmationSource !== 'automatic') return;
-            if (key === 'sehuatang') sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
+            if (preserveActionUntilClose) sessionStorage.removeItem(`BBSSignHelperPageAction:${key}`);
             try { window.close(); } catch (err) { /* 下方提示手动关闭。 */ }
             showPageSignToast(key, 'success', { message: '已确认成功；若页面未关闭，可手动关闭' });
         }, 800);
@@ -2671,7 +2672,8 @@
 
     function getSehuatangSignSuccessMessage() {
         if (getSehuatangSignControlState().isSigned) return '页面显示今日已签到';
-        const dialogs = document.querySelectorAll('[id^="fwin_"], .alert_right, .layui-layer-content, .ui-dialog-content, .el-message__content, .el-notification__content, [role="dialog"], [role="alert"]');
+        // 当前站点通过 showToast 更新 #toast；仅识别正在展示的成功类型，忽略已隐藏的旧内容。
+        const dialogs = document.querySelectorAll('#toast.show.success, [id^="fwin_"], .alert_right, .layui-layer-content, .ui-dialog-content, .el-message__content, .el-notification__content, [role="dialog"], [role="alert"]');
         for (const dialog of dialogs) {
             if (!dialog.getClientRects().length || getComputedStyle(dialog).visibility === 'hidden' || dialog.closest('#bbs-sign-page-toast, #bbs-sign-dashboard-overlay')) continue;
             const text = (dialog.innerText || dialog.textContent || '').trim();
@@ -3492,14 +3494,31 @@
     }
 
     function closeLaunchedAutoCloseTab(key, entry, reason) {
+        // GM 标签句柄的 close 可能尚未生效，SS同盟跳转期间保留句柄，间隔两秒最多尝试三次。
+        const retryClose = key === 'sstm';
+        if (retryClose) {
+            if (Date.now() < (entry.nextCloseAt || 0)) return;
+            if ((entry.closeAttempts || 0) >= 3) {
+                recordTargetStatus(key, 'success', {
+                    context: { ...entry.operation, taskId: '' }, taskId: entry.operation.taskId,
+                    confirmationSource: 'automatic', stage: 'close', reasonCode: 'close-failed',
+                    evidence: getRawTargetStatus(key)?.evidence,
+                    message: 'SS同盟签到已成功，但三次自动关闭后标签仍未确认关闭，请手动关闭本次签到页面'
+                });
+                launchedAutoCloseTabs.delete(key);
+                return;
+            }
+            entry.closeAttempts = (entry.closeAttempts || 0) + 1;
+            entry.nextCloseAt = Date.now() + 2000;
+        }
         try {
             entry.tab.close();
-            console.log(`[签到助手] ${key} 已由控制台关闭签到页面：${reason}`);
+            console.log(`[签到助手] ${key} 已请求关闭签到页面：${reason}${retryClose ? `（${entry.closeAttempts}/3）` : ''}`);
         } catch (err) {
             console.log(`[签到助手] ${key} 控制台关闭签到页面失败，可能是浏览器限制。`, err);
-            recordTargetStatus(key, 'success', { context: entry.operation, stage: 'close', message: `${reason}；自动关闭受限，请手动关闭对应页面` });
+            if (!retryClose) recordTargetStatus(key, 'success', { context: entry.operation, stage: 'close', message: `${reason}；自动关闭受限，请手动关闭对应页面` });
         }
-        launchedAutoCloseTabs.delete(key);
+        if (!retryClose || entry.tab.closed) launchedAutoCloseTabs.delete(key);
     }
 
     function syncLaunchedAutoCloseTabs(targets = getAllTargets()) {
