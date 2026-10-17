@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.21.1
+// @version      2.21.2
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1238,11 +1238,11 @@
 
     function showTargetDiagnostics(target) {
         const status = getNormalizedTargetStatus(target);
-        const data = buildSignDebugExport(target.id);
+        const data = { ...buildSignDebugExport(target.id), targetStatus: sanitizeDebugValue(status) };
         const dialog = el('dialog', { className: 'bbs-sign-diagnostics' });
         dialog.style.cssText = 'max-width:min(90vw,900px);max-height:85vh;overflow:auto;z-index:2147483647';
         dialog.append(el('h3', { text: `${target.name} · 单站诊断` }),
-            el('p', { text: `状态：${STATUS_META[status.status]?.label}；阶段：${status.stage || '未开始'}；原因：${status.message || '暂无请求'}。${data.logs.length ? '' : '没有保存失败请求日志；打开、人工等待或尚未请求时仅显示阶段说明。'}` }),
+            el('p', { text: `状态：${STATUS_META[status.status]?.label}；阶段：${status.stage || '未开始'}；原因：${status.message || '暂无请求'}。${data.logs.length ? '' : '没有保存失败请求日志；日志可能已过期、被清空或尚未保存，不能据此判断是否发过请求。可重新执行后查看；当前状态已附在导出内容中。'}` }),
             el('pre', { text: JSON.stringify(data, null, 2) }),
             el('button', { text: '导出本站日志', onClick: () => downloadJson(data, `bbs-sign-debug-${target.id}-${getToday()}.json`) }),
             el('button', { text: '清空本站日志', onClick: () => { writeObject(STORAGE_KEYS.signDebugLogs, buildSignDebugExport().logs.filter(item => item.siteKey !== target.id)); dialog.remove(); } }),
@@ -1496,7 +1496,7 @@
         return method.toUpperCase() === 'POST' || /^https?:\/\/www\.fufugal\.com\/hunt(?:[?#]|$)/i.test(url) || /[?&](?:actions=job2?|ok=3|operation=qiandao)(?:&|$)|type=goSign/.test(url);
     }
 
-    async function fetchBuffered(fetchFn, url, options, timeoutMs = REQUEST_TIMEOUT_MS) {
+    async function fetchBuffered(fetchFn, url, options, timeoutMs = REQUEST_TIMEOUT_MS, onResponse) {
         const Controller = typeof unsafeWindow !== 'undefined' && unsafeWindow.AbortController || (typeof AbortController !== 'undefined' ? AbortController : null);
         const controller = Controller ? new Controller() : null;
         let timeoutId;
@@ -1507,6 +1507,8 @@
                     const buffer = await response.arrayBuffer();
                     const result = new Response([204, 205, 304].includes(response.status) ? null : buffer, { status: response.status, statusText: response.statusText, headers: response.headers });
                     Object.defineProperty(result, 'url', { value: response.url || String(url) });
+                    // 先保留回包，再按HTTP状态抛错，避免验证页只剩错误文案。
+                    await onResponse?.(result);
                     const error = classifyHttpResponse(response.status, await result.clone().text(), [...response.headers].map(([k, v]) => `${k}: ${v}`).join('\n'), response.url || String(url));
                     if (error) throw Object.assign(error, { httpStatus: response.status });
                     return result;
@@ -1534,28 +1536,30 @@
         }, debugContext);
 
         try {
-            const response = await fetchBuffered(fetchFn, url, options);
-            if (debugEntry) {
-                debugEntry.status = response.status;
-                debugEntry.ok = response.ok;
-                debugEntry.responseType = response.headers?.get?.('content-type') || '';
-                debugEntry.durationMs = Date.now() - startedAt;
-                if (DEBUG_TEXT_RESPONSE_RE.test(debugEntry.responseType)) {
-                    try {
-                        const text = await response.clone().text();
-                        debugEntry.response = truncateDebugText(redactDebugText(text));
-                    } catch (err) {
-                        debugEntry.responseError = err?.message || String(err);
+            return await fetchBuffered(fetchFn, url, options, REQUEST_TIMEOUT_MS, async response => {
+                if (debugEntry) {
+                    debugEntry.status = response.status;
+                    debugEntry.ok = response.ok;
+                    debugEntry.finalUrl = sanitizeDebugUrl(response.url || url);
+                    debugEntry.responseHeaders = truncateDebugText(redactDebugText([...response.headers].map(([k, v]) => `${k}: ${v}`).join('\n')), 3000);
+                    debugEntry.responseType = response.headers?.get?.('content-type') || '';
+                    debugEntry.durationMs = Date.now() - startedAt;
+                    if (!response.ok || !debugEntry.responseType || DEBUG_TEXT_RESPONSE_RE.test(debugEntry.responseType)) {
+                        try {
+                            const text = await response.clone().text();
+                            debugEntry.response = truncateDebugText(redactDebugText(text));
+                        } catch (err) {
+                            debugEntry.responseError = err?.message || String(err);
+                        }
+                    } else {
+                        debugEntry.response = debugEntry.responseType ? `[${debugEntry.responseType} body omitted]` : '[body omitted]';
                     }
-                } else {
-                    debugEntry.response = debugEntry.responseType ? `[${debugEntry.responseType} body omitted]` : '[body omitted]';
                 }
-            }
-            return response;
+            });
         } catch (err) {
             if (!err.reasonCode) err = signRequestError('network', stringifyDebugError(err));
             if (debugEntry) {
-                debugEntry.status = 'error';
+                if (debugEntry.status === 'pending') debugEntry.status = 'error';
                 debugEntry.error = stringifyDebugError(err);
                 debugEntry.durationMs = Date.now() - startedAt;
             }
@@ -1897,11 +1901,20 @@
     async function runSijisheApiSign(debugContext, checkOnly = false) {
         const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const requestText = async (url) => {
+            const targetUrl = new URL(url, 'https://sjs96.com/').href;
+            const headers = { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' };
+            if (location.hostname === 'sjs96.com' && new URL(targetUrl).origin === location.origin) {
+                const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
+                    ? unsafeWindow.fetch.bind(unsafeWindow)
+                    : window.fetch.bind(window);
+                const response = await debugPageFetch('sijishe-page', pageFetch, targetUrl, {
+                    credentials: 'include', cache: 'no-store', headers
+                }, debugContext);
+                return response.text();
+            }
             const response = await gmRequest({
-                url: new URL(url, 'https://sjs96.com/').href,
-                headers: {
-                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-                },
+                url: targetUrl,
+                headers,
                 debugContext
             });
             return response.responseText || '';
@@ -3675,8 +3688,8 @@
             await delay(wait);
         }
         if (result?.reason && isOperationCurrent(operation)) {
-            recordTargetStatus(target.id, result.reason.status, { ...result.reason, context: operation, url: target.url });
             persistSignDebugFailure(result.debugContext, result.reason);
+            recordTargetStatus(target.id, result.reason.status, { ...result.reason, context: operation, url: target.url });
         }
         return false;
     }

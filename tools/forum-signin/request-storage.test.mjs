@@ -24,6 +24,47 @@ for (const [status, text, code] of [[401, '', 'login'], [403, 'captcha', 'captch
 assert.equal(timeout.run("classifyHttpResponse(429,'','Retry-After: 99999').retryAfterMs"), 60000);
 await assert.rejects(timeout.run("fetchBuffered(async()=>new Response('Not found',{status:404}),'https://example.test/',{})"), error => error.httpStatus === 404 && error.reasonCode === 'adaptation');
 
+// 司机社403须在状态通知前保存；本站请求使用页面会话，失败回包仍能诊断。
+const blockedStorage = new Map();
+let blockedRequests = 0, logsAtNotification;
+const blocked = await createFixture({ storage: blockedStorage,
+    request: details => { blockedRequests++; queueMicrotask(() => details.onload({ status: 403, responseText: '<html>Cloudflare challenge</html>', responseHeaders: 'content-type: text/html' })); return { abort() {} }; },
+    beforeWrite: (key, value) => { if (key.startsWith('BBSSignHelperDashboardStatus:') && value.status === 'needs-foreground') logsAtNotification = structuredClone(blockedStorage.get('BBSSignHelperDebugLogs')); }
+});
+await blocked.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+assert.equal(blockedRequests, 1, '403验证停止重试');
+assert.equal(logsAtNotification.length, 1, '界面收到失败状态时日志已存在');
+assert.equal(logsAtNotification[0].entries[0].status, 403);
+assert.match(logsAtNotification[0].entries[0].response, /Cloudflare/);
+assert.equal(blocked.run("getRawTargetStatus('sijishe').status"), 'needs-foreground');
+
+for (const [text, code] of [['<html>Cloudflare challenge<input name="formhash" value="PAGE_SECRET"></html>', 'captcha'], ['<html>Forbidden</html>', 'permission']]) {
+    const calls = [];
+    const page = await createFixture({ fetch: async (url, options) => {
+        calls.push({ url, options });
+        const response = new Response(text, { status: 403, headers: { 'Content-Type': 'text/html', 'Set-Cookie': 'COOKIE_SECRET' } });
+        Object.defineProperty(response, 'url', { value: url + '?token=URL_SECRET' });
+        return response;
+    } });
+    Object.assign(page.context.location, { hostname: 'sjs96.com', origin: 'https://sjs96.com', href: 'https://sjs96.com/k_misign-sign.html' });
+    await page.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].options.credentials, 'include');
+    assert.equal(calls[0].options.cache, 'no-store');
+    const log = page.run("buildSignDebugExport('sijishe').logs[0]");
+    assert.equal(log.reason.reasonCode, code);
+    assert.equal(log.entries[0].type, 'pageFetch');
+    assert.equal(log.entries[0].status, 403);
+    assert.match(log.entries[0].response, /Cloudflare|Forbidden/);
+    assert.equal(log.entries[0].responseType, 'text/html');
+    assert.ok(log.entries[0].finalUrl);
+    assert.ok(!/PAGE_SECRET|COOKIE_SECRET|URL_SECRET/.test(JSON.stringify(log)));
+}
+const pageSigned = await createFixture({ fetch: async () => new Response('discuz_uid=7;<a class="btnvisted">今日已签到</a>', { headers: { 'Content-Type': 'text/html' } }) });
+Object.assign(pageSigned.context.location, { hostname: 'sjs96.com', origin: 'https://sjs96.com', href: 'https://sjs96.com/k_misign-sign.html' });
+assert.equal(await pageSigned.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))"), true);
+assert.equal(pageSigned.run("buildSignDebugExport('sijishe').logs.length"), 0);
+
 const retry = await createFixture();
 retry.run(`globalThis.calls=[];
     siteConfigs.find(s=>s.key==='fxacg').directRun=async ctx=>{ calls.push(Date.now()); if(calls.length<3)throw signRequestError('network','暂时离线'); return taskActions(ctx).completeSign('fxacg','接口明确今日完成'); };

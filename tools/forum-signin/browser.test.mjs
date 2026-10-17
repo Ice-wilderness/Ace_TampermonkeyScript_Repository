@@ -111,6 +111,7 @@ try {
     const beforeDiagnostics = await evaluate(ui, 'JSON.stringify(getStatusStore())');
     await evaluate(ui, "showTargetDiagnostics(getBuiltInTargets().find(t=>t.id==='wcccc'))");
     assert.ok((await ui.locator('dialog').textContent()).includes('没有保存失败请求日志'));
+    assert.equal(JSON.parse(await ui.locator('dialog pre').textContent()).targetStatus.status, await result(ui, 'wcccc'));
     await ui.locator('dialog').getByText('关闭', { exact: true }).click();
     assert.equal(await evaluate(ui, 'JSON.stringify(getStatusStore())'), beforeDiagnostics);
     assert.equal(await ui.evaluate(() => __requests.length), 0);
@@ -546,6 +547,17 @@ try {
         else await runSite(page, key);
         assert.equal(await result(page, key), 'success', key); verified.push(key); await page.close();
     }
+    const sijishe = await pageFor('https://sjs96.com/k_misign-sign.html');
+    await sijishe.evaluate(() => { __fetchResponses.push(
+        { text: 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao&formhash=SIGN_SECRET">签到</a>', headers: { 'Content-Type': 'text/html' } },
+        { text: '<root>签到成功</root>', headers: { 'Content-Type': 'text/xml' } },
+        { text: '<table><tr><td><a href="home.php?mod=space&uid=7">本人</a></td><td>2026-10-09</td></tr></table>', headers: { 'Content-Type': 'text/html' } }
+    ); });
+    await runSite(sijishe, 'sijishe');
+    assert.equal(await result(sijishe, 'sijishe'), 'success', '司机社页面会话提交后核对本人当日排行');
+    assert.equal(await sijishe.evaluate(() => __requests.filter(r => r.url.includes('operation=qiandao')).length), 1);
+    assert.equal(await sijishe.evaluate(() => __responses.length), 0);
+    await sijishe.close();
     const dog = await pageFor('https://www.acgndog.com/');
     await dog.evaluate(() => { __fetchResponses.push({ text: JSON.stringify({ user: { isLoggedIn: true }, _nonce: 'sample-redacted', customPointSignDaily: { signed: false } }) }, { text: JSON.stringify({ code: 0, msg: '签到成功' }) }, { text: JSON.stringify({ user: { isLoggedIn: true }, _nonce: 'sample-redacted', customPointSignDaily: { signed: true } }) }); });
     await runSite(dog, 'acgndog'); assert.equal(await result(dog, 'acgndog'), 'success');
@@ -943,7 +955,7 @@ try {
         ['sehuatang', 'https://sehuatang.org/forum.php', '<div>尚未回复</div>', null, null]
     ]) {
         const page = await pageFor(url, html);
-        await page.evaluate(({ gm, payload }) => { if (location.hostname.includes('uu-gg')) window.discuz_uid = 7; if (gm) __responses.push({ responseText: gm }); if (payload) __fetchResponses.push({ text: JSON.stringify(payload) }); if (location.hostname.includes('vikacg')) localStorage.setItem('token', 'x'.repeat(80)); }, { gm, payload });
+        await page.evaluate(({ gm, payload }) => { if (location.hostname.includes('uu-gg')) window.discuz_uid = 7; if (gm) { if (location.hostname === 'sjs96.com') __fetchResponses.push({ text: gm, headers: { 'Content-Type': 'text/html' } }); else __responses.push({ responseText: gm }); } if (payload) __fetchResponses.push({ text: JSON.stringify(payload) }); if (location.hostname.includes('vikacg')) localStorage.setItem('token', 'x'.repeat(80)); }, { gm, payload });
         const checked = await evaluate(page, `siteConfigs.find(s=>s.key===${JSON.stringify(key)}).check(startSignDebugCapture(${JSON.stringify(key)},'只读样例','check'))`);
         assert.notEqual(checked.outcome, 'success', key + '未签/无证据不能成功');
         const requests = await page.evaluate(() => __requests);
