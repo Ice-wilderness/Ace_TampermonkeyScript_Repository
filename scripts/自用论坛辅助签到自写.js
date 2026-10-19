@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.21.2
+// @version      2.21.3
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1372,7 +1372,7 @@
                 } catch (err) {
                     const code = err.reasonCode || 'adaptation';
                     if (!['network', 'timeout', 'temporary'].includes(code)) {
-                        recordTargetStatus(site.key, code === 'login' ? 'needs-login' : code === 'captcha' ? 'needs-foreground' : 'result-unknown', { context: context?.operation, reasonCode: code, stage: 'verify', message: stringifyDebugError(err) });
+                        recordTargetStatus(site.key, code === 'login' ? 'needs-login' : (code === 'captcha' || site.key === 'sijishe' && code === 'permission' && !context?.submitted) ? 'needs-foreground' : 'result-unknown', { context: context?.operation, reasonCode: code, stage: 'verify', message: stringifyDebugError(err) });
                         return false;
                     }
                     if (remote && requestChecks < 3) await delay(Math.max(requestChecks * 3000, err.retryAfterMs || 0));
@@ -1481,7 +1481,13 @@
     function classifyHttpResponse(status, text = '', headers = '', finalUrl = '') {
         if (/Just a moment|Enable JavaScript and cookies to continue/i.test(text)) return signRequestError('captcha', '站点要求前台完成人工验证');
         if (status === 401 || /\/(?:login|sign_in)(?:[/?#]|$)|[?&](?:mod=logging&action=login|action=login)(?:&|$)/i.test(finalUrl)) return signRequestError('login', '登录状态已失效，请先登录');
-        if (status === 403) return signRequestError(/cloudflare|challenge|captcha/i.test(text) ? 'captcha' : 'permission', '访问受限，请前台检查验证或权限');
+        if (status === 403) {
+            // Cloudflare统计脚本并非验证证据，只采信验证内容或明确的挑战响应头。
+            const challenge = /challenge|captcha|\bcf_chl_|\b_cf_chl_|\/cdn-cgi\/challenge-platform\//i.test(text) || /^cf-mitigated\s*:\s*challenge\s*$/im.test(headers);
+            return signRequestError(challenge ? 'captcha' : 'permission', challenge
+                ? '站点返回验证拦截（HTTP 403），请在前台完成验证'
+                : '访问被拒绝（HTTP 403），请在前台检查浏览器校验或账号权限');
+        }
         if (status === 429 || status >= 500) {
             const value = String(headers).match(/retry-after:\s*([^\r\n]+)/i)?.[1] || '';
             const seconds = /^\d+$/.test(value) ? Number(value) * 1000 : Math.max(0, new Date(value).getTime() - Date.now());
@@ -3634,7 +3640,8 @@
         const url = new URL(target.url);
         if (target.builtIn) url.searchParams.set('__bbs_task', operation.taskId);
         try {
-            const tab = openUrl(url.href, target.openMode);
+            const openMode = ['needs-login', 'needs-foreground'].includes(raw?.status) ? 'foreground' : target.openMode;
+            const tab = openUrl(url.href, openMode);
             if (tab === null || (!tab && typeof GM_openInTab !== 'function')) throw new Error('浏览器拒绝打开页面');
             trackLaunchedAutoCloseTab(target, tab, operation);
             recordTargetStatus(target.id, 'opened', { context: operation, stage: 'launch', incrementAttempt: true, url: target.url,
@@ -3659,7 +3666,7 @@
             return { isSuccess: false, debugContext, reason: { status: ['needs-login', 'needs-foreground', 'failed', 'result-unknown'].includes(status?.status) ? status.status : debugContext.submitted || checkOnly ? 'result-unknown' : 'failed', stage: status?.stage || 'verify', message: status?.status === 'running' ? '本次未获得明确成功证据，请检查结果' : status?.message || '结果未确认', reasonCode: status?.reasonCode || (debugContext.submitted || checkOnly ? 'unknown' : 'adaptation'), retryable: false } };
         } catch (error) {
             const code = error.reasonCode || (error instanceof SyntaxError ? 'adaptation' : 'network');
-            return { isSuccess: false, debugContext, reason: { status: code === 'login' ? 'needs-login' : code === 'captcha' ? 'needs-foreground' : debugContext.submitted ? 'result-unknown' : 'failed', stage: 'request', message: stringifyDebugError(error), reasonCode: code, retryable: error.retryable === true || code === 'network', retryAfterMs: error.retryAfterMs || 0 } };
+            return { isSuccess: false, debugContext, reason: { status: code === 'login' ? 'needs-login' : (code === 'captcha' || site.key === 'sijishe' && code === 'permission' && !debugContext.submitted) ? 'needs-foreground' : debugContext.submitted ? 'result-unknown' : 'failed', stage: 'request', message: stringifyDebugError(error), reasonCode: code, retryable: error.retryable === true || code === 'network', retryAfterMs: error.retryAfterMs || 0 } };
         } finally { finishSignDebugCapture(debugContext); }
     }
 
@@ -5225,7 +5232,7 @@
                 if (debugContext.submitted && !['login', 'captcha', 'cancelled'].includes(reasonCode)) {
                     try { recovered = (await site.check(debugContext)).outcome === 'success'; } catch (checkError) { /* 结果未知保留人工检查。 */ }
                 }
-                if (!recovered) recordTargetStatus(site.key, reasonCode === 'login' ? 'needs-login' : reasonCode === 'captcha' ? 'needs-foreground' : debugContext.submitted ? 'result-unknown' : 'failed', {
+                if (!recovered) recordTargetStatus(site.key, reasonCode === 'login' ? 'needs-login' : (reasonCode === 'captcha' || site.key === 'sijishe' && reasonCode === 'permission' && !debugContext.submitted) ? 'needs-foreground' : debugContext.submitted ? 'result-unknown' : 'failed', {
                     reasonCode, stage: 'error',
                     message: `执行异常：${stringifyDebugError(err) || '未知错误'}`,
                     url: location.href

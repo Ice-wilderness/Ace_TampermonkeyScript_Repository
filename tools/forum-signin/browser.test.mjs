@@ -558,6 +558,14 @@ try {
     assert.equal(await sijishe.evaluate(() => __requests.filter(r => r.url.includes('operation=qiandao')).length), 1);
     assert.equal(await sijishe.evaluate(() => __responses.length), 0);
     await sijishe.close();
+    const sijisheBlocked = await context.newPage();
+    await sijisheBlocked.goto('https://sjs96.com/k_misign-sign.html');
+    await sijisheBlocked.evaluate(() => { __fetchResponses.push({ status: 403, text: '<html><div></div></html><script>window.location.href="/k_misign-sign.html";</script><script src="https://static.cloudflareinsights.com/beacon.min.js"></script>', headers: { 'Content-Type': 'text/html' } }); });
+    await sijisheBlocked.evaluate(engine);
+    assert.equal(await sijisheBlocked.evaluate(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sijishe').status), 'needs-foreground', '本站页面403仍提示前台检查');
+    assert.equal(await sijisheBlocked.evaluate(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sijishe').reasonCode), 'permission', '统计beacon不误判为验证码');
+    assert.equal(await sijisheBlocked.evaluate(() => __requests.length), 1, '本站页面受限不提交、不重试');
+    await sijisheBlocked.close();
     const dog = await pageFor('https://www.acgndog.com/');
     await dog.evaluate(() => { __fetchResponses.push({ text: JSON.stringify({ user: { isLoggedIn: true }, _nonce: 'sample-redacted', customPointSignDaily: { signed: false } }) }, { text: JSON.stringify({ code: 0, msg: '签到成功' }) }, { text: JSON.stringify({ user: { isLoggedIn: true }, _nonce: 'sample-redacted', customPointSignDaily: { signed: true } }) }); });
     await runSite(dog, 'acgndog'); assert.equal(await result(dog, 'acgndog'), 'success');

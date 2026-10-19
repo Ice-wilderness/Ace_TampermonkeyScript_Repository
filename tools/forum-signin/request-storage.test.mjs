@@ -24,6 +24,39 @@ for (const [status, text, code] of [[401, '', 'login'], [403, 'captcha', 'captch
 assert.equal(timeout.run("classifyHttpResponse(429,'','Retry-After: 99999').retryAfterMs"), 60000);
 await assert.rejects(timeout.run("fetchBuffered(async()=>new Response('Not found',{status:404}),'https://example.test/',{})"), error => error.httpStatus === 404 && error.reasonCode === 'adaptation');
 
+// 用户403回包只有JS跳转和统计beacon，不足以证明有验证码。
+const redirectHtml = '<html><meta charset="utf-8"><title></title><div></div></html><script>window.location.href="/k_misign-sign.html";</script><script type="module" src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon=\'{"token":"BEACON_SECRET"}\'></script>';
+timeout.context.redirectHtml = redirectHtml;
+assert.equal(timeout.run("classifyHttpResponse(403,redirectHtml,'server:cloudflare').reasonCode"), 'permission');
+assert.equal(timeout.run("classifyHttpResponse(200,redirectHtml,'server:cloudflare')"), null);
+for (const marker of ['<script src="/cdn-cgi/challenge-platform/test.js"></script>', '<script>window._cf_chl_opt={};</script>']) {
+    timeout.context.challengeHtml = marker;
+    assert.equal(timeout.run("classifyHttpResponse(403,challengeHtml).reasonCode"), 'captcha');
+}
+assert.equal(timeout.run("classifyHttpResponse(403,'','server:cloudflare\\r\\ncf-mitigated: challenge\\r\\n').reasonCode"), 'captcha');
+const redirect = await createFixture({ request: details => {
+    queueMicrotask(() => details.onload({ status: 403, responseText: redirectHtml, responseHeaders: 'content-type: text/html; charset=utf8' }));
+    return { abort() {} };
+} });
+await redirect.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+assert.equal(redirect.run("getRawTargetStatus('sijishe').status"), 'needs-foreground');
+assert.equal(redirect.run("getRawTargetStatus('sijishe').reasonCode"), 'permission');
+assert.equal(redirect.run("buildSignDebugExport('sijishe').logs[0].entries.length"), 1, '仅尝试读取页面，未重试或提交签到');
+assert.equal(redirect.run("buildSignDebugExport('sijishe').logs[0].entries[0].status"), 403);
+assert.ok(!JSON.stringify(redirect.run("buildSignDebugExport('sijishe')")).includes('BEACON_SECRET'));
+redirect.run("launchTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+assert.equal(redirect.tabs[0].details.active, true, '需前台处理时实际激活标签');
+assert.equal(redirect.run("getTaskLease('sijishe').checkOnly"), false);
+assert.equal(redirect.run("getBuiltInTargets().find(t=>t.id==='sijishe').openMode"), 'background', '不改写用户原有开页设置');
+assert.equal(redirect.run("launchTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))"), false, '前台任务在途时不重复打开');
+const redirectAfterSubmit = await createFixture();
+redirectAfterSubmit.run(`globalThis.submitCount=0;
+    siteConfigs.find(s=>s.key==='sijishe').directRun=async ctx=>{submitCount++;ctx.submitted=true;throw signRequestError('permission','提交后访问被拒绝')};
+    checkSiteResult=async()=>({outcome:'unknown'});`);
+await redirectAfterSubmit.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+assert.equal(redirectAfterSubmit.run('submitCount'), 1);
+assert.equal(redirectAfterSubmit.run("getRawTargetStatus('sijishe').status"), 'result-unknown', '已提交后权限错误保留只读复查边界');
+
 // 司机社403须在状态通知前保存；本站请求使用页面会话，失败回包仍能诊断。
 const blockedStorage = new Map();
 let blockedRequests = 0, logsAtNotification;
