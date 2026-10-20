@@ -39,13 +39,15 @@ const redirect = await createFixture({ request: details => {
     return { abort() {} };
 } });
 await redirect.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
-assert.equal(redirect.run("getRawTargetStatus('sijishe').status"), 'needs-foreground');
-assert.equal(redirect.run("getRawTargetStatus('sijishe').reasonCode"), 'permission');
+assert.equal(redirect.run("getRawTargetStatus('sijishe').status"), 'opened');
+assert.equal(redirect.run("buildSignDebugExport('sijishe').logs[0].reason.reasonCode"), 'permission');
 assert.equal(redirect.run("buildSignDebugExport('sijishe').logs[0].entries.length"), 1, '仅尝试读取页面，未重试或提交签到');
 assert.equal(redirect.run("buildSignDebugExport('sijishe').logs[0].entries[0].status"), 403);
 assert.ok(!JSON.stringify(redirect.run("buildSignDebugExport('sijishe')")).includes('BEACON_SECRET'));
-redirect.run("launchTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+assert.equal(redirect.tabs.length, 1, '直签403后自动接续页面，无需第二次点击');
 assert.equal(redirect.tabs[0].details.active, true, '需前台处理时实际激活标签');
+assert.equal(redirect.run("getTaskLease('sijishe').kind"), 'page');
+assert.equal(redirect.run("hasActiveTask('sijishe')"), true, '旧直签结束未释放新页面租约');
 assert.equal(redirect.run("getTaskLease('sijishe').checkOnly"), false);
 assert.equal(redirect.run("getBuiltInTargets().find(t=>t.id==='sijishe').openMode"), 'background', '不改写用户原有开页设置');
 assert.equal(redirect.run("launchTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))"), false, '前台任务在途时不重复打开');
@@ -56,6 +58,27 @@ redirectAfterSubmit.run(`globalThis.submitCount=0;
 await redirectAfterSubmit.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
 assert.equal(redirectAfterSubmit.run('submitCount'), 1);
 assert.equal(redirectAfterSubmit.run("getRawTargetStatus('sijishe').status"), 'result-unknown', '已提交后权限错误保留只读复查边界');
+assert.equal(redirectAfterSubmit.tabs.length, 0, '已提交后不自动打开执行页面');
+
+for (const checkOnly of [false, true]) {
+    const fallback = await createFixture({ request: details => {
+        queueMicrotask(() => details.onload({ status: 403, responseText: redirectHtml, responseHeaders: 'content-type: text/html' }));
+        return { abort() {} };
+    } });
+    await fallback.run(checkOnly
+        ? "runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'),undefined,true)"
+        : "runDirectTargets([getBuiltInTargets().find(t=>t.id==='sijishe')])");
+    assert.equal(fallback.tabs.length, 1);
+    assert.equal(fallback.run("getTaskLease('sijishe').checkOnly"), checkOnly);
+    assert.equal(fallback.tabs.at(-1).details.active, true);
+    assert.equal(fallback.run("directTasks.size"), 0);
+}
+const deniedFallback = await createFixture({ openTab: () => null, request: details => {
+    queueMicrotask(() => details.onload({ status: 403, responseText: redirectHtml, responseHeaders: '' })); return { abort() {} };
+} });
+await deniedFallback.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+assert.equal(deniedFallback.run("getRawTargetStatus('sijishe').reasonCode"), 'open-failed');
+assert.equal(deniedFallback.run("hasActiveTask('sijishe')"), false, '开页失败释放租约，可手动恢复');
 
 // 司机社403须在状态通知前保存；本站请求使用页面会话，失败回包仍能诊断。
 const blockedStorage = new Map();
@@ -69,7 +92,8 @@ assert.equal(blockedRequests, 1, '403验证停止重试');
 assert.equal(logsAtNotification.length, 1, '界面收到失败状态时日志已存在');
 assert.equal(logsAtNotification[0].entries[0].status, 403);
 assert.match(logsAtNotification[0].entries[0].response, /Cloudflare/);
-assert.equal(blocked.run("getRawTargetStatus('sijishe').status"), 'needs-foreground');
+assert.equal(blocked.run("getRawTargetStatus('sijishe').status"), 'opened');
+assert.equal(blocked.tabs.length, 1, '明确验证拦截也自动打开前台接续');
 
 for (const [text, code] of [['<html>Cloudflare challenge<input name="formhash" value="PAGE_SECRET"></html>', 'captcha'], ['<html>Forbidden</html>', 'permission']]) {
     const calls = [];
@@ -131,6 +155,20 @@ assert.equal(submitted.run("getRawTargetStatus('fxacg').status"), 'result-unknow
 
 // 显式任务日志归属和旧日志再次脱敏，含数字 nonce、HTML 表单和 Cookie 头。
 const logs = await createFixture();
+const localStatus = logs.run("recordTargetStatus('sijishe','needs-foreground')");
+assert.match(localStatus.updatedAt, /[+-]\d{2}:\d{2}$/, '新状态使用带偏移的本地时间');
+assert.equal(Date.parse(localStatus.updatedAt), logs.run('Date.now()'));
+const oldTimestamp = '2026-10-20T12:20:43.014Z';
+logs.context.oldTimestamp = oldTimestamp;
+const legacyTimes = logs.run("sanitizeDebugValue({startedAt:oldTimestamp,savedAt:oldTimestamp,updatedAt:oldTimestamp,exportedAt:oldTimestamp,entries:[{time:oldTimestamp}],responseHeaders:'date: Tue, 20 Oct 2026 12:20:43 GMT'})");
+for (const value of [legacyTimes.startedAt, legacyTimes.savedAt, legacyTimes.updatedAt, legacyTimes.exportedAt, legacyTimes.entries[0].time]) {
+    assert.match(value, /[+-]\d{2}:\d{2}$/);
+    assert.equal(Date.parse(value), Date.parse(oldTimestamp), '旧UTC时间转换后仍是同一时刻');
+}
+assert.equal(legacyTimes.responseHeaders, 'date: Tue, 20 Oct 2026 12:20:43 GMT', '保留服务器原始响应头');
+assert.equal(logs.run("sanitizeDebugValue({updatedAt:'',time:'不是日期',savedAt:'2026-99-99T00:00:00Z'}).updatedAt"), '');
+assert.equal(logs.run("sanitizeDebugValue({time:'不是日期'}).time"), '不是日期');
+assert.equal(logs.run("sanitizeDebugValue({updatedAt:123}).updatedAt"), 123, '不转换内部数值时间戳');
 logs.run(`globalThis.a=startSignDebugCapture('fxacg','飞雪','direct'); globalThis.b=startSignDebugCapture('sl-asmr','ASMR','direct');
     addSignDebugEntry({type:'test',url:'https://example.test/?_nonce=URL_SECRET'},a);
     addSignDebugEntry({type:'test',requestBody:'{"nonce":1234567,"_nonce":"BODY_SECRET"}',response:'<input name="formhash" value="HTML_SECRET">'},b);

@@ -114,6 +114,12 @@ try {
     assert.equal(JSON.parse(await ui.locator('dialog pre').textContent()).targetStatus.status, await result(ui, 'wcccc'));
     await ui.locator('dialog').getByText('关闭', { exact: true }).click();
     assert.equal(await evaluate(ui, 'JSON.stringify(getStatusStore())'), beforeDiagnostics);
+    await evaluate(ui, "globalThis.timeBefore=getRawTargetStatus('wcccc'); GM_setValue(getTargetStatusStorageKey(getToday(),'wcccc'),{...timeBefore,updatedAt:'2026-10-20T12:20:43.014Z'}); showTargetDiagnostics(getBuiltInTargets().find(t=>t.id==='wcccc'))");
+    const localDiagnostic = JSON.parse(await ui.locator('dialog pre').textContent());
+    assert.equal(localDiagnostic.targetStatus.updatedAt, '2026-10-20T20:20:43.014+08:00', '旧UTC状态在诊断中显示北京时间');
+    assert.equal(await evaluate(ui, "getRawTargetStatus('wcccc').updatedAt"), '2026-10-20T12:20:43.014Z', '导出兼容旧记录且不改写状态');
+    await ui.locator('dialog').getByText('关闭', { exact: true }).click();
+    await evaluate(ui, "GM_setValue(getTargetStatusStorageKey(getToday(),'wcccc'),timeBefore)");
     assert.equal(await ui.evaluate(() => __requests.length), 0);
     await evaluate(ui, "updateDashboardPreference({autoOpenDashboardOnAttention:true}); closeDashboardOverlay(dashboardMounted.overlay); completeSign('sijishe','明确今日已签到')");
     await ui.waitForTimeout(3200);
@@ -547,6 +553,33 @@ try {
         else await runSite(page, key);
         assert.equal(await result(page, key), 'success', key); verified.push(key); await page.close();
     }
+    const sijisheFallback = await pageFor('https://www.limestart.cn/');
+    await evaluate(sijisheFallback, "for (const target of getBuiltInTargets()) updateBuiltInTargetSetting(target.id,{enabled:target.id==='sijishe'}); showDashboard()");
+    await sijisheFallback.evaluate(() => { __responses.push({ status: 403, responseText: '<html><script>window.location.href="/k_misign-sign.html";</script></html>' }); });
+    await sijisheFallback.getByRole('button', { name: '一键处理未完成', exact: true }).click();
+    await sijisheFallback.waitForFunction(() => __tabs.length === 1 && __bbs('directTasks.size') === 0);
+    const handoff = await sijisheFallback.evaluate(() => ({ url: __tabs[0].url, details: __tabs[0].details, storage: [...__storage] }));
+    assert.equal(handoff.details.active, true, '一键处理遇到403自动打开前台');
+    assert.equal(await result(sijisheFallback, 'sijishe'), 'opened');
+    assert.equal(await evaluate(sijisheFallback, "hasActiveTask('sijishe')"), true, '直签结束后页面任务仍有效');
+    await sijisheFallback.getByRole('button', { name: '一键处理未完成', exact: true }).click();
+    assert.equal(await sijisheFallback.evaluate(() => __tabs.length), 1, '页面接续中再次一键不重复开页');
+    const sijisheHandoff = await context.newPage();
+    await sijisheHandoff.goto(handoff.url);
+    await sijisheHandoff.evaluate(entries => { for (const [key, value] of entries) __storage.set(key, value); __fetchResponses.push(
+        { text: 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao&formhash=SIGN_SECRET">签到</a>', headers: { 'Content-Type': 'text/html' } },
+        { text: '<root>签到成功</root>', headers: { 'Content-Type': 'text/xml' } },
+        { text: '<table><tr><td><a href="home.php?mod=space&uid=7">本人</a></td><td>2026-10-09</td></tr></table>', headers: { 'Content-Type': 'text/html' } }
+    ); }, handoff.storage);
+    await sijisheHandoff.evaluate(engine);
+    const handoffResult = await sijisheHandoff.evaluate(() => ({ storage: [...__storage], status: GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sijishe'), submissions: __requests.filter(r => r.url.includes('operation=qiandao')).length }));
+    assert.equal(handoffResult.status.status, 'success', '自动接续页面完成实际站内流程');
+    assert.equal(handoffResult.submissions, 1);
+    assert.equal(handoffResult.status.taskId, new URL(handoff.url).searchParams.get('__bbs_task'), '页面成功归属接续任务');
+    await sijisheFallback.evaluate(entries => { for (const [key, value] of entries) GM_setValue(key, value); }, handoffResult.storage);
+    assert.equal(await result(sijisheFallback, 'sijishe'), 'success', '控制台同步接续任务成功');
+    await sijisheHandoff.close();
+    await sijisheFallback.close();
     const sijishe = await pageFor('https://sjs96.com/k_misign-sign.html');
     await sijishe.evaluate(() => { __fetchResponses.push(
         { text: 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao&formhash=SIGN_SECRET">签到</a>', headers: { 'Content-Type': 'text/html' } },

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.21.3
+// @version      2.21.4
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -656,7 +656,7 @@
             status,
             stage: options.stage || previous.stage || '',
             message: truncateDebugText(redactDebugText(options.message || STATUS_META[status]?.message || previous.message || ''), 1000),
-            updatedAt: new Date().toISOString(),
+            updatedAt: getLocalDateTimeWithOffset(),
             url: sanitizeDebugUrl(options.url || previous.url || location.href),
             attemptCount: options.incrementAttempt ? (previous.attemptCount || 0) + 1 : (previous.attemptCount || 0)
         };
@@ -1054,7 +1054,13 @@
         if (DEBUG_SENSITIVE_KEY_RE.test(key)) return '[REDACTED]';
         if (Array.isArray(value)) return value.slice(0, key === 'entries' ? DEBUG_LOG_MAX_ENTRIES_PER_SESSION : DEBUG_LOG_MAX_SESSIONS).map(item => sanitizeDebugValue(item));
         if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([name, item]) => [name, sanitizeDebugValue(item, name)]));
-        if (typeof value === 'string') return truncateDebugText(/url$/i.test(key) ? sanitizeDebugUrl(value) : redactDebugText(value));
+        if (typeof value === 'string') {
+            if (['startedAt', 'savedAt', 'updatedAt', 'exportedAt', 'time'].includes(key) && /^\d{4}-\d{2}-\d{2}T/.test(value)) {
+                const date = new Date(value);
+                if (Number.isFinite(date.getTime())) return getLocalDateTimeWithOffset(date);
+            }
+            return truncateDebugText(/url$/i.test(key) ? sanitizeDebugUrl(value) : redactDebugText(value));
+        }
         return value;
     }
 
@@ -3697,6 +3703,11 @@
         if (result?.reason && isOperationCurrent(operation)) {
             persistSignDebugFailure(result.debugContext, result.reason);
             recordTargetStatus(target.id, result.reason.status, { ...result.reason, context: operation, url: target.url });
+            if (site.key === 'sijishe' && !result.debugContext.submitted && result.reason.status === 'needs-foreground' && ['captcha', 'permission'].includes(result.reason.reasonCode) && isOperationCurrent(operation)) {
+                // 直签受限时交给站内页面接续；旧直签结束时不能释放新页面的租约。
+                finishTaskLease(operation);
+                launchTarget(target, checkOnly);
+            }
         }
         return false;
     }
