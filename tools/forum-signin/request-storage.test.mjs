@@ -103,7 +103,7 @@ for (const [text, code] of [['<html>Cloudflare challenge<input name="formhash" v
         Object.defineProperty(response, 'url', { value: url + '?token=URL_SECRET' });
         return response;
     } });
-    Object.assign(page.context.location, { hostname: 'sjs96.com', origin: 'https://sjs96.com', href: 'https://sjs96.com/k_misign-sign.html' });
+    Object.assign(page.context.location, { hostname: 'dlsjs.com', origin: 'https://dlsjs.com', href: 'https://dlsjs.com/k_misign-sign.html' });
     await page.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.credentials, 'include');
@@ -118,7 +118,7 @@ for (const [text, code] of [['<html>Cloudflare challenge<input name="formhash" v
     assert.ok(!/PAGE_SECRET|COOKIE_SECRET|URL_SECRET/.test(JSON.stringify(log)));
 }
 const pageSigned = await createFixture({ fetch: async () => new Response('discuz_uid=7;<a class="btnvisted">今日已签到</a>', { headers: { 'Content-Type': 'text/html' } }) });
-Object.assign(pageSigned.context.location, { hostname: 'sjs96.com', origin: 'https://sjs96.com', href: 'https://sjs96.com/k_misign-sign.html' });
+Object.assign(pageSigned.context.location, { hostname: 'dlsjs.com', origin: 'https://dlsjs.com', href: 'https://dlsjs.com/k_misign-sign.html' });
 assert.equal(await pageSigned.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))"), true);
 assert.equal(pageSigned.run("buildSignDebugExport('sijishe').logs.length"), 0);
 

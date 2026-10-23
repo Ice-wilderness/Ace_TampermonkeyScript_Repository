@@ -580,7 +580,7 @@ try {
     assert.equal(await result(sijisheFallback, 'sijishe'), 'success', '控制台同步接续任务成功');
     await sijisheHandoff.close();
     await sijisheFallback.close();
-    const sijishe = await pageFor('https://sjs96.com/k_misign-sign.html');
+    const sijishe = await pageFor('https://dlsjs.com/k_misign-sign.html');
     await sijishe.evaluate(() => { __fetchResponses.push(
         { text: 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao&formhash=SIGN_SECRET">签到</a>', headers: { 'Content-Type': 'text/html' } },
         { text: '<root>签到成功</root>', headers: { 'Content-Type': 'text/xml' } },
@@ -592,7 +592,7 @@ try {
     assert.equal(await sijishe.evaluate(() => __responses.length), 0);
     await sijishe.close();
     const sijisheBlocked = await context.newPage();
-    await sijisheBlocked.goto('https://sjs96.com/k_misign-sign.html');
+    await sijisheBlocked.goto('https://dlsjs.com/k_misign-sign.html');
     await sijisheBlocked.evaluate(() => { __fetchResponses.push({ status: 403, text: '<html><div></div></html><script>window.location.href="/k_misign-sign.html";</script><script src="https://static.cloudflareinsights.com/beacon.min.js"></script>', headers: { 'Content-Type': 'text/html' } }); });
     await sijisheBlocked.evaluate(engine);
     assert.equal(await sijisheBlocked.evaluate(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sijishe').status), 'needs-foreground', '本站页面403仍提示前台检查');
@@ -984,7 +984,7 @@ try {
     for (const [key, url, html, gm, payload] of [
         ['fxacg', 'https://feixueacg.org/', '', '<form id="signform">签到说明</form>', null],
         ['kfpromax', 'https://www.limestart.cn/', '', '<div id="kf_topuser">本人</div><a href="kf_growup.php?ok=3&safeid=sample">领取</a>', null],
-        ['sijishe', 'https://sjs96.com/', '', 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao">签到</a>', null],
+        ['sijishe', 'https://dlsjs.com/', '', 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao">签到</a>', null],
         ['uugg', 'https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign', '<div>签到服务台 今天未签到</div><form id="qiandao"></form>', null, null],
         ['acgndog', 'https://www.acgndog.com/', '', null, { user: { isLoggedIn: true }, _nonce: 'sample', customPointSignDaily: { signed: false } }],
         ['vik', 'https://www.vikacg.com/wallet/mission', '', null, { status: 'success', data: { basic: { id: 7 }, credit: { sign_time: 0 } } }],
@@ -996,7 +996,7 @@ try {
         ['sehuatang', 'https://sehuatang.org/forum.php', '<div>尚未回复</div>', null, null]
     ]) {
         const page = await pageFor(url, html);
-        await page.evaluate(({ gm, payload }) => { if (location.hostname.includes('uu-gg')) window.discuz_uid = 7; if (gm) { if (location.hostname === 'sjs96.com') __fetchResponses.push({ text: gm, headers: { 'Content-Type': 'text/html' } }); else __responses.push({ responseText: gm }); } if (payload) __fetchResponses.push({ text: JSON.stringify(payload) }); if (location.hostname.includes('vikacg')) localStorage.setItem('token', 'x'.repeat(80)); }, { gm, payload });
+        await page.evaluate(({ gm, payload }) => { if (location.hostname.includes('uu-gg')) window.discuz_uid = 7; if (gm) { if (location.hostname === 'dlsjs.com') __fetchResponses.push({ text: gm, headers: { 'Content-Type': 'text/html' } }); else __responses.push({ responseText: gm }); } if (payload) __fetchResponses.push({ text: JSON.stringify(payload) }); if (location.hostname.includes('vikacg')) localStorage.setItem('token', 'x'.repeat(80)); }, { gm, payload });
         const checked = await evaluate(page, `siteConfigs.find(s=>s.key===${JSON.stringify(key)}).check(startSignDebugCapture(${JSON.stringify(key)},'只读样例','check'))`);
         assert.notEqual(checked.outcome, 'success', key + '未签/无证据不能成功');
         const requests = await page.evaluate(() => __requests);

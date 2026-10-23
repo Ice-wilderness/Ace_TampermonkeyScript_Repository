@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.21.4
+// @version      2.22.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -13,7 +13,7 @@
 // @match        http*://2dfan.org/*
 // @match        http*://www.sl-asmr.com/*
 // @match        http*://bbs.kfpromax.com/*
-// @match        http*://sjs96.com/*
+// @match        http*://dlsjs.com/*
 // @match        http*://laowang.vip/*
 // @match        *://sp6m.fwsefwef66s.com/*
 // @match        http*://www.vikacg.com/*
@@ -29,7 +29,7 @@
 // @connect      www.south-plus.net
 // @connect      www.sl-asmr.com
 // @connect      bbs.kfpromax.com
-// @connect      sjs96.com
+// @connect      dlsjs.com
 // @connect      www.galgamex.net
 // @grant        unsafeWindow
 // @grant        GM_getValue
@@ -1913,9 +1913,9 @@
     async function runSijisheApiSign(debugContext, checkOnly = false) {
         const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const requestText = async (url) => {
-            const targetUrl = new URL(url, 'https://sjs96.com/').href;
+            const targetUrl = new URL(url, 'https://dlsjs.com/').href;
             const headers = { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' };
-            if (location.hostname === 'sjs96.com' && new URL(targetUrl).origin === location.origin) {
+            if (location.hostname === 'dlsjs.com' && new URL(targetUrl).origin === location.origin) {
                 const pageFetch = typeof unsafeWindow !== 'undefined' && typeof unsafeWindow.fetch === 'function'
                     ? unsafeWindow.fetch.bind(unsafeWindow)
                     : window.fetch.bind(window);
@@ -1932,14 +1932,14 @@
             return response.responseText || '';
         };
 
-        const pageText = await requestText('https://sjs96.com/k_misign-sign.html');
+        const pageText = await requestText('https://dlsjs.com/k_misign-sign.html');
         const uid = pageText.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '';
         const hasLogoutLink = /member\.php\?mod=logging(?:&amp;|&)action=logout/i.test(pageText);
         if ((!uid || uid === '0') && !hasLogoutLink) {
             recordTargetStatus('sijishe', 'needs-login', {
                 stage: 'login',
                 message: '司机社需要先登录账号',
-                url: 'https://sjs96.com/k_misign-sign.html'
+                url: 'https://dlsjs.com/k_misign-sign.html'
             });
             return false;
         }
@@ -1958,17 +1958,17 @@
             return false;
         }
 
-        const signUrl = new URL(signPath, 'https://sjs96.com/');
+        const signUrl = new URL(signPath, 'https://dlsjs.com/');
         signUrl.searchParams.set('inajax', '1');
         signUrl.searchParams.set('ajaxtarget', 'JD_sign');
         await requestText(signUrl.href);
 
-        const rankText = await requestText('https://sjs96.com/plugin.php?id=k_misign:sign&operation=list&inajax=1&ajaxtarget=ranklist');
+        const rankText = await requestText('https://dlsjs.com/plugin.php?id=k_misign:sign&operation=list&inajax=1&ajaxtarget=ranklist');
         if (hasUserDailyRecord(rankText, uid, new RegExp(getToday()))) {
             return completeSign('sijishe', '今日排行已确认签到记录', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
-        const verifyText = await requestText('https://sjs96.com/k_misign-sign.html');
+        const verifyText = await requestText('https://dlsjs.com/k_misign-sign.html');
         if (/<[^>]+class=["'][^"']*btnvisted/i.test(verifyText)) {
             return completeSign('sijishe', '页面复查确认今日已签到', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
@@ -3212,10 +3212,10 @@
         },
         {
             name: "司机社",
-            matches: ["sjs96.com"],
+            matches: ["dlsjs.com"],
             key: "sijishe",
             dashboard: {
-                url: "https://sjs96.com/k_misign-sign.html",
+                url: "https://dlsjs.com/k_misign-sign.html",
                 openMode: "background",
                 resultMode: "script",
                 note: "支持控制台 API 直签"
