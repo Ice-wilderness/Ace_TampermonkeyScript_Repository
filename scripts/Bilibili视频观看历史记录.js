@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.4.0
+// @version      4.5.0
 // @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -142,7 +142,9 @@
     const MIN_RESUME_SECONDS = 5;
     const ACTION_LIST_ITEM_SELECTOR = '.action-list-item-wrap[data-key]';
     const PLAYLIST_ITEM_SELECTOR = `${ACTION_LIST_ITEM_SELECTOR}, .video-pod__item[data-key], .bpx-player-ctrl-eplist-multi-menu-item[data-cid], .video-pod__list.section .simple-base-item.page-item`;
-    const VIDEO_LINK_SELECTOR = 'a[href*="/video/"], a[href*="/v/"], a[href*="bvid="]';
+    const ENDING_RECOMMEND_ROOT_SELECTOR = '.bpx-player-ending-related';
+    const ENDING_RECOMMEND_ITEM_SELECTOR = 'a.bpx-player-ending-related-item';
+    const VIDEO_LINK_SELECTOR = `a[href*="/video/"], a[href*="/v/"], a[href*="bvid="], ${ENDING_RECOMMEND_ITEM_SELECTOR}`;
     const HEADER_POPOVER_SELECTOR = '.dynamic-panel-popover, .history-panel-popover, .favorite-panel-popover, #biliHeaderDynScrollCon, #favorite-content-scroll, .header-favorite-popover';
     const HEADER_POPOVER_VIDEO_LINK_SELECTOR = [
         '.dynamic-panel-popover .header-dynamic__box--right[href*="/video/"]',
@@ -155,6 +157,7 @@
     const HEADER_POPOVER_COVER_SELECTOR = '.header-dynamic__box--right .cover, .header-history-video__image, .header-fav-card__image';
     const MUTATION_RELEVANT_SELECTOR = `${VIDEO_LINK_SELECTOR}, ${PLAYLIST_ITEM_SELECTOR}, ${HEADER_POPOVER_SELECTOR}, ${HEADER_POPOVER_VIDEO_LINK_SELECTOR}`;
     const VIDEO_OBSERVER_ROOT_SELECTOR = [
+        ENDING_RECOMMEND_ROOT_SELECTOR,
         '#reco_list',
         '.right-container',
         '.right-container-inner',
@@ -351,6 +354,7 @@
         .bvh-episode-tag { display: inline-block; margin-left: 6px; padding: 0 4px; height: 16px; line-height: 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 600; vertical-align: middle; white-space: nowrap; pointer-events: none; }
         .action-list-item-wrap .cover, .action-list-item-wrap .cover-img { position: relative; }
         ${HEADER_POPOVER_COVER_SELECTOR} { position: relative; }
+        ${ENDING_RECOMMEND_ITEM_SELECTOR} { position: relative; }
         .bvh-action-list-cover-tag { z-index: 109 !important; }
         .video-pod__list.grid .video-pod__item.page { position: relative; }
         .bvh-episode-tag-grid { position: absolute; top: 2px; right: 2px; margin: 0; padding: 0 3px; min-width: 14px; max-width: 30px; height: 14px; line-height: 14px; font-size: 9px; text-align: center; overflow: hidden; text-overflow: ellipsis; }
@@ -4707,6 +4711,7 @@
             this.pageMode = this.getPageMode();
             this.scheduleHeaderPopoverRefresh = Utils.debounce(() => this.refreshHeaderPopoverCards(), 120);
             this.schedulePlaylistRefresh = Utils.debounce(() => this.refreshPlaylistItems(), 120);
+            this.scheduleEndingRecommendRefresh = Utils.debounce(() => this.enqueueLinks(document.querySelectorAll(ENDING_RECOMMEND_ITEM_SELECTOR)), 120);
             this.scheduleObserverRootRefresh = Utils.debounce(() => this.refreshObserverRoots(), 180);
             this.scheduleFullRescan = Utils.debounce(() => this.flushRescanRoots(), DOM_RESCAN_DELAY);
             this.initIntersectionObserver();
@@ -4900,7 +4905,10 @@
             }
 
             const observer = new MutationObserver(mutations => this.handleContentMutations(mutations, root));
-            observer.observe(root, { childList: true, subtree: true });
+            const endingRoot = root.matches(ENDING_RECOMMEND_ROOT_SELECTOR);
+            observer.observe(root, { childList: true, subtree: true, ...(endingRoot
+                ? { attributes: true, attributeFilter: ['href', 'data-bvid', 'data-aid', 'style'], characterData: true }
+                : {}) });
             this.contentObservers.set(root, observer);
             if (!this._initialScanInProgress) {
                 this.rescanContentRoot(root, 'observe root');
@@ -4918,7 +4926,14 @@
             let limited = false;
 
             mutations.forEach(m => {
-                if (limited || m.type !== 'childList') return;
+                if (limited) return;
+                const target = m.target.nodeType === Node.ELEMENT_NODE ? m.target : m.target.parentElement;
+                if (target?.closest?.('[class*="bvh-"]')) return;
+                if (m.type === 'attributes' && m.attributeName === 'style'
+                    && !target?.matches?.(`${ENDING_RECOMMEND_ITEM_SELECTOR}, .bpx-player-ending-related-item-img`)) return;
+                const endingItem = target?.closest?.(ENDING_RECOMMEND_ITEM_SELECTOR);
+                if (endingItem) links.add(endingItem);
+                if (m.type !== 'childList') return;
                 childListCount++;
                 m.addedNodes.forEach(node => {
                     if (limited) return;
@@ -4940,6 +4955,8 @@
                 this.enqueuePlaylistItems(playlistItems);
             }
             if (playlistItems.size > 0) this.schedulePlaylistRefresh();
+            // 右侧推荐晚于结束卡片加载时，补齐无 href 卡片的身份与标签。
+            if (links.size > 0 && !root.matches(ENDING_RECOMMEND_ROOT_SELECTOR)) this.scheduleEndingRecommendRefresh();
             if (shouldRefreshHeaderPopoverCards) this.scheduleHeaderPopoverRefresh();
 
             const cost = performance.now() - start;
@@ -4967,7 +4984,7 @@
                 return { headerPopover: false };
             }
 
-            if (selfIsRelevantLink && node.href) {
+            if (selfIsRelevantLink) {
                 links.add(node);
             }
             if (node.querySelectorAll) {
@@ -4991,6 +5008,7 @@
             this.collectExistingFromRoot(root, links, playlistItems);
             this.enqueueLinks(links);
             this.enqueuePlaylistItems(playlistItems);
+            if (links.size > 0 && !root.matches(ENDING_RECOMMEND_ROOT_SELECTOR)) this.scheduleEndingRecommendRefresh();
             Utils.log('DOMWatcher.rescanContentRoot', `mode=${this.pageMode}`, `reason=${reason}`, `root=${Utils.describeElement(root)}`, `links=${links.size}`, `playlist=${playlistItems.size}`, `cost=${(performance.now() - start).toFixed(1)}ms`);
             Utils.logSlow('DOMWatcher.rescanContentRoot', start, `mode=${this.pageMode} root=${Utils.describeElement(root)} links=${links.size} playlist=${playlistItems.size}`, 50);
         }
@@ -5012,7 +5030,7 @@
 
         collectExistingFromRoot(root, links, playlistItems) {
             if (!root || this.isSkippedHeaderNode(root)) return;
-            if (root.matches?.(VIDEO_LINK_SELECTOR) && root.href) links.add(root);
+            if (root.matches?.(VIDEO_LINK_SELECTOR)) links.add(root);
             if (root.querySelectorAll) root.querySelectorAll(VIDEO_LINK_SELECTOR).forEach(link => links.add(link));
             if (root.matches?.(PLAYLIST_ITEM_SELECTOR)) playlistItems.add(root);
             if (root.querySelectorAll) root.querySelectorAll(PLAYLIST_ITEM_SELECTOR).forEach(item => playlistItems.add(item));
@@ -5155,8 +5173,36 @@
         }
 
         getVideoKeyFromLink(el) {
-            if (!el || !el.href) return '';
-            return VideoKey.fromUrl(el.href);
+            if (!el) return '';
+            const directKey = VideoKey.fromUrl(el.href);
+            if (directKey || !el.matches?.(ENDING_RECOMMEND_ITEM_SELECTOR)) return directKey;
+            const dataKey = VideoKey.fromText(el.getAttribute('data-bvid'))
+                || VideoKey.fromText(el.getAttribute('data-aid') ? `av${el.getAttribute('data-aid')}` : '');
+            if (dataKey) return dataKey;
+
+            // 结束推荐只有背景封面和标题，通过右侧推荐的真实链接解析身份，不按排列顺序猜测。
+            const cover = this.getEndingRecommendCoverPath(el.querySelector('.bpx-player-ending-related-item-img')?.style.backgroundImage);
+            const title = el.querySelector('.bpx-player-ending-related-item-title')?.textContent.trim();
+            if (!cover || !title) return '';
+            const keys = new Set();
+            document.querySelectorAll('.video-page-card-small, .video-page-card').forEach(card => {
+                const img = card.querySelector('img');
+                const cardCover = this.getEndingRecommendCoverPath(img?.getAttribute('src') || img?.getAttribute('data-src'));
+                const titleNode = card.querySelector('.title');
+                const cardTitle = (titleNode?.getAttribute('title') || titleNode?.textContent || '').trim();
+                if (cover !== cardCover || title !== cardTitle) return;
+                const link = card.querySelector('a[href*="/video/"], a[href*="/v/"], a[href*="bvid="]');
+                const key = VideoKey.fromUrl(link?.href);
+                if (key) keys.add(key);
+            });
+            return keys.size === 1 ? keys.values().next().value : '';
+        }
+
+        getEndingRecommendCoverPath(value) {
+            if (!value) return '';
+            const url = String(value).replace(/^url\(["']?/, '').replace(/["']?\)$/, '');
+            try { return new URL(url, location.href).pathname.split('@')[0]; }
+            catch (e) { return ''; }
         }
 
         removeExistingMark(el) {
@@ -5181,6 +5227,7 @@
 
         isValidLink(el) {
             const href = el.href;
+            if (el.matches?.(ENDING_RECOMMEND_ITEM_SELECTOR)) return true;
             if (!href || !this.getVideoKeyFromLink(el)) return false;
             const isHeaderPopoverLink = this.isHeaderPopoverVideoLink(el);
 
@@ -5407,7 +5454,11 @@
             }
 
             let bv = this.getVideoKeyFromLink(el);
-            if (!bv) return;
+            const isEndingRecommend = el.matches(ENDING_RECOMMEND_ITEM_SELECTOR);
+            if (!bv) {
+                if (isEndingRecommend) { this.removeExistingMark(el); el._bvhLastVideoKey = ''; }
+                return;
+            }
             let bvBase = VideoKey.base(bv);
             const isHeaderPopoverLink = this.isHeaderPopoverVideoLink(el);
             const headerPopoverCover = this.getHeaderPopoverCover(el);
@@ -5469,9 +5520,10 @@
                 if (!existingBars[0].remove) this.removeExistingMark(el);
             }
 
-            let img = headerPopoverCover
+            const endingCover = isEndingRecommend ? el.querySelector('.bpx-player-ending-related-item-img') : null;
+            let img = endingCover || (headerPopoverCover
                 ? (headerPopoverCover.querySelector('img') || headerPopoverCover.querySelector('picture'))
-                : (el.querySelector('img') || el.querySelector('picture'));
+                : (el.querySelector('img') || el.querySelector('picture')));
             let isSmall = false;
 
             if (!img) {
