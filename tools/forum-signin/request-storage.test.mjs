@@ -168,6 +168,74 @@ Object.assign(pageSigned.context.location, { hostname: 'dlsjs.com', origin: 'htt
 assert.equal(await pageSigned.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))"), true);
 assert.equal(pageSigned.run("buildSignDebugExport('sijishe').logs.length"), 0);
 
+// 实站只读取页可返回403、下发访问Cookie并要求重读原页；不得执行回包脚本或重新提交签到。
+const sessionReloadHtml = '<html><meta charset="utf-8"><title></title><div></div></html><script> window.location.href ="/k_misign-sign.html"; </script><script src="https://static.cloudflareinsights.com/beacon.min.js"></script>';
+const sessionReloadHeaders = 'content-type: text/html; charset=utf8\r\nset-cookie: ffeec2b181d51c9a31c663da350e3aad=ACCESS_SECRET; path=/\r\nset-cookie: server_session_5db84476=SESSION_SECRET; HttpOnly; path=/';
+for (const [failures, nextStatus, checkOnly] of [[1, 200, false], [2, 200, false], [3, 403, false], [1, 200, true], [2, 200, true], [3, 403, true], [1, 'unsigned', true]]) {
+    const urls = [];
+    const times = [];
+    const session = await createFixture({ request: details => {
+        urls.push(details.url);
+        times.push(session.run('Date.now()'));
+        queueMicrotask(() => details.onload({ status: urls.length <= failures ? 403 : 200, finalUrl: details.url,
+            responseText: urls.length <= failures ? sessionReloadHtml : nextStatus === 'unsigned'
+                ? 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao">签到</a>'
+                : 'discuz_uid=7;<a class="btnvisted">今日已签到</a>',
+            responseHeaders: sessionReloadHeaders }));
+        return { abort() {} };
+    } });
+    const job = session.run(`runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'),undefined,${checkOnly})`);
+    await session.tick(9000);
+    const success = await job;
+    assert.equal(urls.length, Math.min(failures + 1, 3), '沿用最多三次尝试，恢复后立即停止');
+    assert.equal(times[1] - times[0], 3000, '首次失败等待3秒再读');
+    if (times.length === 3) assert.equal(times[2] - times[1], 6000, '第二次失败等待6秒再读');
+    assert.ok(urls.every(url => url === 'https://dlsjs.com/k_misign-sign.html'), '只读取原签到页，不领取');
+    assert.equal(success, nextStatus === 200);
+    assert.equal(session.tabs.length, nextStatus === 403 ? 1 : 0, '原页重读恢复后无需前台接续');
+    if (nextStatus === 'unsigned') assert.equal(session.run("getRawTargetStatus('sijishe').reasonCode"), 'confirmed-unsigned', '只读复查恢复后仍不能提交签到或误报成功');
+    if (nextStatus === 403) {
+        assert.equal(session.run("getTaskLease('sijishe').checkOnly"), checkOnly);
+        const logs = session.run("buildSignDebugExport('sijishe').logs");
+        assert.equal(logs.length, 3, '失败诊断保留三次尝试');
+        assert.equal(logs.reduce((sum, log) => sum + log.entries.length, 0), 3, '每次取页回包均保留');
+        assert.ok(!/ACCESS_SECRET|SESSION_SECRET/.test(JSON.stringify(logs)));
+    }
+}
+
+for (const [html, headers, finalUrl] of [
+    [sessionReloadHtml, '', ''],
+    [sessionReloadHtml.replace('/k_misign-sign.html', 'https://elsewhere.test/'), sessionReloadHeaders, ''],
+    [sessionReloadHtml.replace('/k_misign-sign.html', '/plugin.php?id=k_misign:sign&operation=qiandao'), sessionReloadHeaders, ''],
+    [sessionReloadHtml + '<p>Permission denied</p>', sessionReloadHeaders, ''],
+    [sessionReloadHtml + '<script>window._cf_chl_opt={};</script>', sessionReloadHeaders, ''],
+    [sessionReloadHtml, sessionReloadHeaders, 'https://dlsjs.com/other.html']
+]) {
+    let reads = 0;
+    const restricted = await createFixture({ request: details => {
+        reads++;
+        queueMicrotask(() => details.onload({ status: 403, finalUrl: finalUrl || details.url, responseText: html, responseHeaders: headers }));
+        return { abort() {} };
+    } });
+    await restricted.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'),undefined,true)");
+    assert.equal(reads, 1, '不把其他403、挑战或非原页跳转当作可重读回包');
+}
+
+const submittedUrls = [];
+const sessionAfterSubmit = await createFixture({ request: details => {
+    submittedUrls.push(details.url);
+    const action = details.url.includes('operation=qiandao');
+    queueMicrotask(() => details.onload({ status: action ? 403 : 200, finalUrl: details.url,
+        responseText: action ? sessionReloadHtml : submittedUrls.length === 1
+            ? 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao">签到</a>'
+            : 'discuz_uid=7;<a class="btnvisted">今日已签到</a>', responseHeaders: sessionReloadHeaders }));
+    return { abort() {} };
+} });
+await sessionAfterSubmit.run("runDirectTarget(getBuiltInTargets().find(t=>t.id==='sijishe'))");
+assert.equal(submittedUrls.filter(url => url.includes('operation=qiandao')).length, 1, '提交回包403也不能重复签到');
+assert.equal(submittedUrls.length, 3, '提交受限后仅做一次原有只读复查');
+assert.equal(sessionAfterSubmit.run("getRawTargetStatus('sijishe').status"), 'success');
+
 const retry = await createFixture();
 retry.run(`globalThis.calls=[];
     siteConfigs.find(s=>s.key==='fxacg').directRun=async ctx=>{ calls.push(Date.now()); if(calls.length<3)throw signRequestError('network','暂时离线'); return taskActions(ctx).completeSign('fxacg','接口明确今日完成'); };

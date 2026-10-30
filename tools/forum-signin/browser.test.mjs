@@ -553,6 +553,23 @@ try {
         else await runSite(page, key);
         assert.equal(await result(page, key), 'success', key); verified.push(key); await page.close();
     }
+    const sijisheReload = await pageFor('https://www.limestart.cn/');
+    await evaluate(sijisheReload, "for (const target of getBuiltInTargets()) updateBuiltInTargetSetting(target.id,{enabled:target.id==='sijishe'}); showDashboard()");
+    await sijisheReload.evaluate(() => { __responses.push(
+        { status: 403, responseText: '<html><div></div></html><script>window.location.href="/k_misign-sign.html";</script>', responseHeaders: 'set-cookie: ffeec2b181d51c9a31c663da350e3aad=ACCESS_SECRET; path=/' },
+        { responseText: 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao&formhash=SIGN_SECRET">签到</a>' },
+        { responseText: '<root>签到成功</root>' },
+        { responseText: '<table><tr><td><a href="home.php?mod=space&uid=7">本人</a></td><td>2026-10-09</td></tr></table>' }
+    ); });
+    await sijisheReload.getByRole('button', { name: '一键处理未完成', exact: true }).click();
+    await sijisheReload.waitForFunction(() => __bbs("getRawTargetStatus('sijishe')?.status") === 'success');
+    const reloadResult = await sijisheReload.evaluate(() => ({ requests: __requests, tabs: __tabs.length }));
+    assert.equal(reloadResult.requests.length, 4);
+    assert.equal(reloadResult.requests.filter(r => r.url === 'https://dlsjs.com/k_misign-sign.html').length, 2, '取页403后重读一次');
+    assert.equal(reloadResult.requests.filter(r => r.url.includes('operation=qiandao')).length, 1, '恢复直签后只提交一次');
+    assert.equal(reloadResult.tabs, 0, '取页恢复后控制台直接完成，无需开页');
+    await sijisheReload.close();
+
     const sijisheFallback = await pageFor('https://www.limestart.cn/');
     await evaluate(sijisheFallback, "for (const target of getBuiltInTargets()) updateBuiltInTargetSetting(target.id,{enabled:target.id==='sijishe'}); showDashboard()");
     await sijisheFallback.evaluate(() => { __responses.push({ status: 403, responseText: '<html><script>window.location.href="/k_misign-sign.html";</script></html>' }); });

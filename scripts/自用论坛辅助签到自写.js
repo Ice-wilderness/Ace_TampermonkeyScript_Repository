@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.22.1
+// @version      2.22.2
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1457,7 +1457,7 @@
                         debugEntry.durationMs = Date.now() - startedAt;
                     }
                     const error = classifyHttpResponse(response.status, getDebugGmResponseText(response), response.responseHeaders, response.finalUrl || details.url);
-                    finish(error, response);
+                    finish(error && Object.assign(error, { httpStatus: response.status, response }), response);
                 },
                 onerror: (err) => {
                     if (debugEntry) {
@@ -1917,9 +1917,23 @@
         return false;
     }
 
+    function isSijishePageReloadResponse(response, targetUrl) {
+        if (response?.status !== 403 || targetUrl !== 'https://dlsjs.com/k_misign-sign.html') return false;
+        if (response.finalUrl && response.finalUrl !== targetUrl) return false;
+        if (!/^set-cookie:\s*[a-f0-9]{32}=/im.test(response.responseHeaders || '')) return false;
+        const html = response.responseText || '';
+        if (html.length > 2000) return false;
+        const reload = html.match(/<script\b[^>]*>\s*window\.location\.href\s*=\s*(["'])([^"']+)\1\s*;?\s*<\/script>/i);
+        if (!reload) return false;
+        try {
+            if (new URL(reload[2], targetUrl).href !== targetUrl) return false;
+        } catch (err) { return false; }
+        return !html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '').replace(/<[^>]*>/g, '').trim();
+    }
+
     async function runSijisheApiSign(debugContext, checkOnly = false) {
         const { completeSign, recordTargetStatus } = taskActions(debugContext);
-        const requestText = async (url) => {
+        const requestText = async (url, allowPageReload = false) => {
             const targetUrl = new URL(url, 'https://dlsjs.com/').href;
             const headers = { Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' };
             if (location.hostname === 'dlsjs.com' && new URL(targetUrl).origin === location.origin) {
@@ -1931,15 +1945,23 @@
                 }, debugContext);
                 return response.text();
             }
-            const response = await gmRequest({
-                url: targetUrl,
-                headers,
-                debugContext
-            });
-            return response.responseText || '';
+            try {
+                const response = await gmRequest({
+                    url: targetUrl,
+                    headers,
+                    debugContext
+                });
+                return response.responseText || '';
+            } catch (err) {
+                // 实站首次取页会下发访问Cookie并要求JS重载；交给控制台统一的三次尝试处理。
+                if (allowPageReload && !debugContext?.submitted && err.reasonCode === 'permission' && isSijishePageReloadResponse(err.response, targetUrl)) {
+                    err.retryable = true;
+                }
+                throw err;
+            }
         };
 
-        const pageText = await requestText('https://dlsjs.com/k_misign-sign.html');
+        const pageText = await requestText('https://dlsjs.com/k_misign-sign.html', true);
         const uid = pageText.match(/discuz_uid\s*=\s*['"]?(\d+)['"]?/i)?.[1] || '';
         const hasLogoutLink = /member\.php\?mod=logging(?:&amp;|&)action=logout/i.test(pageText);
         if ((!uid || uid === '0') && !hasLogoutLink) {
@@ -3700,7 +3722,8 @@
             if (!isOperationCurrent(operation)) return false;
             result = await runDirectTargetOnce(target, site, operation, checkOnly);
             if (result.isSuccess) return true;
-            if (['needs-login', 'needs-foreground'].includes(result.reason.status)) break;
+            const retryPageReload = site.key === 'sijishe' && result.reason.reasonCode === 'permission' && result.reason.retryable && !result.debugContext.submitted;
+            if (['needs-login', 'needs-foreground'].includes(result.reason.status) && !retryPageReload) break;
             if (result.debugContext.submitted) {
                 // 回包丢失也可能已经执行，只检查，不重新提交。
                 const checked = await runDirectTargetOnce(target, site, operation, true);
@@ -3709,7 +3732,7 @@
                 if (!['needs-login', 'needs-foreground'].includes(result.reason.status)) result.reason.status = 'result-unknown';
                 break;
             }
-            if (!result.reason.retryable || checkOnly || attempt === DIRECT_SIGN_RETRY_ATTEMPTS) break;
+            if (!result.reason.retryable || checkOnly && !retryPageReload || attempt === DIRECT_SIGN_RETRY_ATTEMPTS) break;
             persistSignDebugFailure(result.debugContext, { ...result.reason, attempt });
             const wait = Math.max(DIRECT_SIGN_RETRY_DELAY_MS * attempt, result.reason.retryAfterMs || 0);
             recordTargetStatus(target.id, 'running', { stage: 'retry', context: operation, message: `第 ${attempt} 次暂时失败，${Math.ceil(wait / 1000)} 秒后重试（${attempt + 1}/3）` });
