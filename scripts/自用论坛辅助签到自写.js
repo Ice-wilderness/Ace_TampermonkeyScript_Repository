@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.22.0
+// @version      2.22.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -1814,6 +1814,16 @@
         return false;
     }
 
+    function isKfpromaxLoggedInPage(text) {
+        // 顶栏容器在游客页也存在，只使用退出链接或账号资料链接确认登录。
+        return /login\.php\?action=quit|profile\.php\?action=show(?:&amp;|&)uid=/i.test(text);
+    }
+
+    function isKfpromaxLoginPage(text, url = '') {
+        return /\/login\.php(?:[?#]|$)/i.test(url) || (!isKfpromaxLoggedInPage(text) &&
+            /<form[^>]+action=["'][^"']*login\.php|name=["']?pwpwd|您还没有登录|请先登录/i.test(text));
+    }
+
     async function runKfpromaxApiSign(debugContext, checkOnly = false) {
         const { completeSign, recordTargetStatus } = taskActions(debugContext);
         const isKfpromaxPage = location.hostname === 'bbs.kfpromax.com';
@@ -1863,15 +1873,11 @@
             }
             return { status: response.status, url: response.finalUrl || targetUrl, text };
         };
-        const isLoggedInPage = (text) => /login\.php\?action=quit|id=["']kf_topuser|id=["']kf_information|profile\.php\?action=show(?:&amp;|&)uid=/i.test(text);
-        const isLoginPage = (text) => !isLoggedInPage(text) && (
-            /<form[^>]+action=["'][^"']*login\.php|name=["']?pwpwd|您还没有登录|请先登录/.test(text)
-        );
-
         const growthPage = await requestPage('https://bbs.kfpromax.com/kf_growup.php');
-        if (isLoginPage(growthPage.text)) {
+        if (isKfpromaxLoginPage(growthPage.text, growthPage.url)) {
             recordTargetStatus('kfpromax', 'needs-login', {
                 stage: 'login',
+                reasonCode: 'login',
                 message: '绯月需要先登录账号',
                 url: growthPage.url
             });
@@ -1881,7 +1887,7 @@
             return completeSign('kfpromax', '页面显示成长奖励已领取');
         }
 
-        if (checkOnly) { debugContext.unsignedConfirmed = isLoggedInPage(growthPage.text) && /kf_growup\.php\?ok=3(?:&amp;|&)safeid=/i.test(growthPage.text); return false; }
+        if (checkOnly) { debugContext.unsignedConfirmed = isKfpromaxLoggedInPage(growthPage.text) && /kf_growup\.php\?ok=3(?:&amp;|&)safeid=/i.test(growthPage.text); return false; }
 
         const hrefMatch = growthPage.text.match(/href=["']([^"']*kf_growup\.php\?ok=3(?:&amp;|&)safeid=[^"']+)["']/i);
         const safeidMatch = growthPage.text.match(/kf_growup\.php\?ok=3(?:&amp;|&)safeid=([a-z0-9]+)/i);
@@ -1894,16 +1900,17 @@
         }
 
         const signPage = await requestPage(signPath);
-        if (/领取成功|请明天继续|已经领过了|已领过/.test(signPage.text)) {
-            return completeSign('kfpromax', '成长奖励接口返回领取成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
-        }
-        if (isLoginPage(signPage.text)) {
+        if (isKfpromaxLoginPage(signPage.text, signPage.url)) {
             recordTargetStatus('kfpromax', 'needs-login', {
                 stage: 'login',
+                reasonCode: 'login',
                 message: '绯月登录状态失效，需要重新登录',
                 url: signPage.url
             });
             return false;
+        }
+        if (/领取成功|请明天继续|已经领过了|已领过/.test(signPage.text)) {
+            return completeSign('kfpromax', '成长奖励接口返回领取成功', CLOSE_PAGE_AFTER_SIGN_ACTION);
         }
 
         console.log('[绯月] 成长奖励接口未返回成功标记', signPage.text);
@@ -3175,6 +3182,15 @@
             directRun: runKfpromaxApiSign,
             async run(debugContext) {
                 const { completeSign, recordTargetStatus } = taskActions(debugContext);
+                if (isKfpromaxLoginPage(document.documentElement?.innerHTML || '', location.href)) {
+                    recordTargetStatus('kfpromax', 'needs-login', {
+                        stage: 'login',
+                        reasonCode: 'login',
+                        message: '绯月需要先登录账号',
+                        url: location.href
+                    });
+                    return false;
+                }
                 if (!location.href.includes('kf_growup.php')) {
                     window.location.href = 'kf_growup.php';
                     return false;

@@ -1,6 +1,52 @@
 import assert from 'node:assert/strict';
 import { createFixture } from './fixture.mjs';
 
+// 绯月游客页也包含顶栏容器；回包跳转、原地址登录表单和前台登录页均应停在需登录。
+const kfLoginHtml = '<div id="kf_topuser"><a href="login.php">登录 | 注册</a></div><div id="kf_information">会员登录</div><form action="login.php?" name="login"><input name="pwuser"><input type="password" name="pwpwd"></form>';
+const kfGrowthHtml = '<a href="login.php?action=quit">退出</a><a href="kf_growup.php?ok=3&safeid=sample">领取</a>';
+for (const checkOnly of [false, true]) {
+    for (const [html, finalUrl] of [[kfLoginHtml, 'https://bbs.kfpromax.com/login.php'], [kfLoginHtml, 'https://bbs.kfpromax.com/kf_growup.php'], ['', 'https://bbs.kfpromax.com/login.php?forward=growup']]) {
+        let requests = 0;
+        const kf = await createFixture({ request: details => {
+            requests++;
+            queueMicrotask(() => details.onload({ status: 200, finalUrl, response: new TextEncoder().encode(html).buffer, responseHeaders: 'content-type: text/html; charset=utf-8' }));
+            return { abort() {} };
+        } });
+        await kf.run(`runDirectTarget(getBuiltInTargets().find(t=>t.id==='kfpromax'),undefined,${checkOnly})`);
+        assert.equal(kf.run("getRawTargetStatus('kfpromax').status"), 'needs-login');
+        assert.equal(kf.run("getRawTargetStatus('kfpromax').reasonCode"), 'login');
+        assert.equal(requests, 1, '游客只请求一次，不重试或领取奖励');
+        assert.notEqual(kf.run("getData('kfpromax')"), kf.run('getToday()'));
+    }
+}
+const kfPage = await createFixture();
+kfPage.context.location = { hostname: 'bbs.kfpromax.com', href: 'https://bbs.kfpromax.com/login.php', pathname: '/login.php', search: '' };
+kfPage.context.document.documentElement.innerHTML = kfLoginHtml;
+await kfPage.run("siteConfigs.find(s=>s.key==='kfpromax').run(startSignDebugCapture('kfpromax','绯月','page'))");
+assert.equal(kfPage.run("getRawTargetStatus('kfpromax').status"), 'needs-login');
+assert.equal(kfPage.context.location.href, 'https://bbs.kfpromax.com/login.php', '登录页不再跳回成长奖励页');
+
+for (const expired of [false, true]) {
+    let requests = 0;
+    const kf = await createFixture({ fetch: async url => {
+        requests++;
+        const response = new Response(expired && requests === 2 ? kfLoginHtml : requests === 1 ? kfGrowthHtml : '领取成功');
+        Object.defineProperty(response, 'url', { value: expired && requests === 2 ? 'https://bbs.kfpromax.com/login.php' : url });
+        return response;
+    } });
+    kf.context.location.hostname = 'bbs.kfpromax.com';
+    await kf.run("runKfpromaxApiSign(startSignDebugCapture('kfpromax','绯月','page-api'))");
+    assert.equal(kf.run("getRawTargetStatus('kfpromax').status"), expired ? 'needs-login' : 'success');
+    assert.equal(requests, 2, '登录有效正常领取，提交时失效则报告需登录');
+}
+const kfCheck = await createFixture({ request: details => {
+    queueMicrotask(() => details.onload({ status: 200, response: new TextEncoder().encode(kfGrowthHtml).buffer, responseHeaders: '' }));
+    return { abort() {} };
+} });
+kfCheck.run("globalThis.kfContext=startSignDebugCapture('kfpromax','绯月','check')");
+await kfCheck.run('runKfpromaxApiSign(kfContext,true)');
+assert.equal(kfCheck.run('kfContext.unsignedConfirmed'), true, '退出链接与奖励链接仍能确认已登录且未领取');
+
 let late, aborted = 0;
 const timeout = await createFixture({ request: details => { late = details; return { abort() { aborted++; } }; } });
 const request = timeout.run("gmRequest({url:'https://feixueacg.org/check'})");

@@ -983,7 +983,7 @@ try {
     await refresh.close();
     for (const [key, url, html, gm, payload] of [
         ['fxacg', 'https://feixueacg.org/', '', '<form id="signform">签到说明</form>', null],
-        ['kfpromax', 'https://www.limestart.cn/', '', '<div id="kf_topuser">本人</div><a href="kf_growup.php?ok=3&safeid=sample">领取</a>', null],
+        ['kfpromax', 'https://www.limestart.cn/', '', '<div id="kf_topuser"><a href="login.php?action=quit">退出</a></div><a href="kf_growup.php?ok=3&safeid=sample">领取</a>', null],
         ['sijishe', 'https://dlsjs.com/', '', 'discuz_uid=7;<a id="JD_sign" href="plugin.php?id=k_misign:sign&operation=qiandao">签到</a>', null],
         ['uugg', 'https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign', '<div>签到服务台 今天未签到</div><form id="qiandao"></form>', null, null],
         ['acgndog', 'https://www.acgndog.com/', '', null, { user: { isLoggedIn: true }, _nonce: 'sample', customPointSignDaily: { signed: false } }],
