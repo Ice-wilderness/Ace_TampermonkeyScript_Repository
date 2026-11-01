@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.22.2
+// @version      2.23.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -15,7 +15,7 @@
 // @match        http*://bbs.kfpromax.com/*
 // @match        http*://dlsjs.com/*
 // @match        http*://laowang.vip/*
-// @match        *://sp6m.fwsefwef66s.com/*
+// @match        *://1y0c.brpbkw3n.com/*
 // @match        http*://www.vikacg.com/*
 // @match        http*://feixueacg.org/*
 // @match        http*://www.acgndog.com/*
@@ -3287,10 +3287,10 @@
         },
         {
             name: "搜书吧",
-            matches: ["sp6m.fwsefwef66s.com"],
+            matches: ["1y0c.brpbkw3n.com"],
             key: "soushuba",
             dashboard: {
-                url: "https://sp6m.fwsefwef66s.com/",
+                url: "https://1y0c.brpbkw3n.com/",
                 openMode: "background",
                 resultMode: "script",
                 note: "登录访问即自动获得 2 银币"

@@ -651,7 +651,7 @@ try {
     const uugg = await pageFor('https://www.uu-gg.one/plugin.php?id=dsu_paulsign:sign', '<div>签到服务台 今日已签到</div>');
     await runSite(uugg, 'uugg'); assert.equal(await result(uugg, 'uugg'), 'success');
     assert.equal(await uugg.evaluate(() => __requests.length), 0); verified.push('uugg'); await uugg.close();
-    const book = await pageFor('https://sp6m.fwsefwef66s.com/', '<a href="member.php?mod=logging&action=logout">退出</a>');
+    const book = await pageFor('https://1y0c.brpbkw3n.com/', '<a href="member.php?mod=logging&action=logout">退出</a>');
     await runSite(book, 'soushuba'); assert.equal(await result(book, 'soushuba'), 'success'); verified.push('soushuba'); await book.close();
     const fan = await pageFor('https://2dfan.com/checkin', '<div class="checkin-action"><button>今日已签到</button></div>');
     await runSite(fan, '2dfan'); assert.equal(await result(fan, '2dfan'), 'success'); verified.push('2dfan'); await fan.close();
@@ -1009,7 +1009,7 @@ try {
         ['2dfan', 'https://2dfan.com/checkin', '<div class="checkin-info"><span class="pull-right">已连续签到12天</span></div>', null, null],
         ['laowang', 'https://laowang.vip/', '<div>其他用户已签到</div>', null, null],
         ['galGameXNew', 'https://www.galgamex.net/', '<button>今日已完成</button><div>签到成功指南</div>', null, null],
-        ['soushuba', 'https://sp6m.fwsefwef66s.com/', '<form id="lsform">登录</form>', null, null],
+        ['soushuba', 'https://1y0c.brpbkw3n.com/', '<form id="lsform">登录</form>', null, null],
         ['sehuatang', 'https://sehuatang.org/forum.php', '<div>尚未回复</div>', null, null]
     ]) {
         const page = await pageFor(url, html);
