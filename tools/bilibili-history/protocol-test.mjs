@@ -26,6 +26,55 @@ test('每个数据块和清单写入失败均不可见，同事务重试幂等',
         assert.equal([...shared.data.keys()].filter(k => k.startsWith('bvh_commit_')).length, 1);
     }
 });
+const reorder = value => Array.isArray(value) ? value.map(reorder) : value && typeof value === 'object'
+    ? Object.fromEntries(Object.keys(value).sort().map(key => [key, reorder(value[key])])) : value;
+
+test('对象字段重排不影响校验，数组顺序和字段内容仍参与校验', () => {
+    const { HistoryCommitStore: Store } = instance();
+    const value = { z: [{ title: '中文标题', progress: 50 }, { second: true }], a: null };
+    assert.equal(Store.checksum(value), Store.checksum(reorder(value)));
+    assert.notEqual(Store.checksum(value), Store.checksum({ ...value, z: [...value.z].reverse() }));
+    assert.notEqual(Store.checksum(value), Store.checksum({ ...value, a: 0 }));
+});
+
+test('存储回读重排嵌套字段时 JSON/CSV 均可导入，重启、重试和快照正常', async () => {
+    for (const modern of [true, false]) {
+        const shared = sharedStorage(), w = instance(shared);
+        const get = w.context.GM_getValue;
+        w.context.GM_getValue = (key, fallback) => reorder(get(key, fallback));
+        if (modern) w.context.GM.getValue = async (key, fallback) => w.context.GM_getValue(key, fallback);
+        else w.context.GM = undefined;
+        assert.equal((await w.StorageManager.importFile(JSON.stringify({ [key(1)]: record(50) }), '历史.json')).count, 1);
+        const csv = `标题,视频链接,观看时间,观看进度,完成度\n测试,https://www.bilibili.com/video/${key(2)},2026-09-06 08:00:00,5分钟0秒,50%`;
+        assert.equal((await w.StorageManager.importFile(csv, '历史.csv')).count, 1);
+        const tx = await w.StorageManager._store.prepare([entry(w, 3)]);
+        await w.StorageManager._store.publish(tx);
+        await w.StorageManager._store.publish(tx);
+        const c = await fresh(shared);
+        assert.equal(c.StorageManager.getAllKeys().length, 3);
+        assert.equal(await w.StorageManager.createLegacySnapshot({ writersStopped: true }), 3);
+        const ref = tx.manifest.blocks[0], stored = shared.data.get(ref.key);
+        stored.entries[0].record.p = 99;
+        assert.equal(await c.StorageManager._store.readCommit(tx.key), null, '内容损坏仍须拒绝');
+    }
+});
+
+test('旧版未标记校验和的提交仍可读取，损坏块仍拒绝', async () => {
+    const w = await fresh(), store = w.StorageManager._store;
+    const tx = await store.prepare([entry(w, 1)]);
+    for (const ref of tx.manifest.blocks) {
+        const value = tx.blocks.find(block => block.key === ref.key).value;
+        const text = JSON.stringify(value);
+        let hash = 2166136261;
+        for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+        ref.checksum = `${text.length}:${hash >>> 0}`;
+    }
+    await store.publish(tx);
+    assert.equal((await fresh(w.shared)).StorageManager.getRecord(key(1)).percent, '50%');
+    w.shared.data.get(tx.blocks[0].key).entries[0].record.p = 99;
+    assert.equal(await store.readCommit(tx.key), null);
+});
+
 test('缺失 API 报错及同步兼容适配', async () => {
     const w = instance(); w.context.GM = undefined; w.context.GM_setValue = undefined;
     await assert.rejects(w.HistoryStoreIO.set('test', 1), /缺少存储能力/);

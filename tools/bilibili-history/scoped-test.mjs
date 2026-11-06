@@ -77,3 +77,28 @@ const touched = shared.calls.filter(call => call.type === 'get' && call.key?.sta
 const totalBlocks = [...shared.data.keys()].filter(key => key.startsWith('bvh_checkpoint_')).length;
 assert(touched < totalBlocks / 2, '整理后定向读取退化为全量检查点读取');
 console.log(`通过：分组整理后仅读取 ${touched}/${totalBlocks} 个检查点块，删除标记仍保留`);
+
+// 无关事务可跳过，全局回滚/回收批次必须读取；旧路由没有此标记时走清单降级。
+for (const kind of ['epoch', 'prune']) {
+    const state = sharedStorage(), seed = instance(state, 'seed'), store = seed.StorageManager._store;
+    await seed.StorageManager.saveRecord(key(1), record(50));
+    const epochId = kind === 'epoch' ? '123e4567-e89b-42d3-a456-426614174000' : 'initial';
+    const cutoff = performance.timeOrigin + performance.now() + 1000;
+    const control = await store.prepare([], kind, undefined, Date.now(), epochId, cutoff, cutoff);
+    if (kind === 'prune') control.manifest.checkpoints = [];
+    await store.publish(control);
+    await seed.StorageManager.initialize();
+    const index = state.data.get(seed.StorageManager._BASE_INDEX_KEY);
+    assert.equal(index.routeVersion, 2);
+    assert.equal(index.routes[control.key], null);
+    for (const old of [false, true]) {
+        if (old) { delete index.routeVersion; index.routes[control.key] = []; }
+        const page = instance(state, 'reader');
+        await page.StorageManager.initializeForKeys([key(99)]);
+        assert.equal(page.StorageManager._store.epoch, epochId);
+        assert.equal(page.StorageManager._store.pruneKey, kind === 'prune' ? control.key : null);
+        assert.equal(page.StorageManager.getRecord(key(1)), null);
+        assert(page.StorageManager._store.commits.has(control.key), '全局批次被无关视频路由错误跳过');
+    }
+}
+console.log('通过：新旧路由下全局回滚和回收批次均不可被局部读取跳过');

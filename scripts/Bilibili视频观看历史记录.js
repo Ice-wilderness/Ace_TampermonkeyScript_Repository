@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.5.0
-// @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出、官方历史页同步及可选 WebDAV 云同步与日期备份。
+// @version      4.6.0
+// @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出与失败诊断、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -856,7 +856,7 @@
             const body = [item.message, item.stack].filter(Boolean).join('\n');
             return `${header}${body ? `\n${body}` : ''}`;
         },
-        clearDebugLogs: () => {
+        clearDebugLogs: async () => {
             Utils._debugLogs = [];
             Utils._debugCounters = {};
             Utils._issuePending.clear();
@@ -866,14 +866,17 @@
             }
             Utils._issuePersistedSnapshot = [];
             try { GM_deleteValue(Utils._issueLogKey); } catch (e) { }
+            await ImportDiagnostics.clear();
         },
-        downloadDebugLog: () => {
+        downloadDebugLog: async () => {
             const historicalIssues = Utils._getHistoricalIssueLogs();
+            const importDiagnostics = await ImportDiagnostics.collect();
             const version = typeof GM_info !== 'undefined' ? (GM_info.script?.version || 'unknown') : 'unknown';
             const lines = [
                 '# Bilibili视频观看历史记录 调试日志',
                 `导出时间: ${Utils.formatTime()}`,
                 `脚本版本: ${version}`,
+                `脚本管理器: ${importDiagnostics.environment.manager} ${importDiagnostics.environment.managerVersion}`,
                 `日志会话: ${Utils._debugSessionId}`,
                 `页面地址: ${location.href}`,
                 `UserAgent: ${navigator.userAgent}`,
@@ -899,6 +902,9 @@
                         allKeysCacheSize: StorageManager._allKeysCache?.length || 0
                     }, null, 2),
                 '',
+                '# 导入失败诊断（无需开启调试，最多保留 20 条）',
+                JSON.stringify(importDiagnostics, null, 2),
+                '',
                 '# 当前页面日志',
                 ...Utils._debugLogs,
                 '',
@@ -911,7 +917,7 @@
             a.href = url;
             a.download = `bvh-debug-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`;
             a.click();
-            URL.revokeObjectURL(url);
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
             Utils.log('Debug log downloaded', `current=${Utils._debugLogs.length}`, `issues=${historicalIssues.length}`);
         },
         describeElement: (el) => {
@@ -1215,6 +1221,149 @@
         delete(key) { return this.call('deleteValue', key); }
     };
 
+    // 导入失败独立留存，不依赖调试开关；不保存文件正文或视频标题。
+    const ImportDiagnostics = {
+        prefix: 'bvh_import_diagnostic_v1_', limit: 20, memory: new Map(), errors: new WeakMap(), queue: Promise.resolve(), sequence: 0,
+        environment() {
+            const info = typeof GM_info === 'undefined' ? {} : GM_info;
+            return { scriptVersion: info.script?.version || 'unknown', manager: info.scriptHandler || 'unknown',
+                managerVersion: info.version || 'unknown', userAgent: typeof navigator === 'undefined' ? 'unknown' : navigator.userAgent };
+        },
+        begin(filename = '', size = null) {
+            return { id: `${String(Date.now()).padStart(16, '0')}_${String(++this.sequence).padStart(12, '0')}_${crypto.randomUUID()}`, at: new Date().toISOString(),
+                environment: this.environment(), file: { format: /\.csv$/i.test(filename) ? 'csv' : 'json',
+                    size: Number.isFinite(size) ? size : null }, stage: '读取文件' };
+        },
+        sample(value, includeValue = true) {
+            const type = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+            const result = { type };
+            if (typeof value === 'string' || Array.isArray(value)) result.length = value.length;
+            if (includeValue && ['string', 'number', 'boolean'].includes(type)) result.value = Utils._truncate(value, 120);
+            return result;
+        },
+        invalid(context, message, details) {
+            if (context) context.validation = details;
+            return new Error(message);
+        },
+        failureMessage(error) {
+            const record = error && typeof error === 'object' ? this.errors.get(error) : null;
+            return '导入失败：' + (error?.message || String(error))
+                + (record?.persistence === 'memory' ? '。诊断仅保留在当前页面，请先下载再刷新。' : '');
+        },
+        errorInfo(error, parsing = false) {
+            const info = Utils._errorInfo(error);
+            // JSON.parse 的原生错误可能夹带文件正文，只保留通用提示和调用栈位置。
+            if (parsing) {
+                const position = info.message.match(/(?:position \d+|line \d+ column \d+)/g);
+                info.message = 'JSON 格式无效，文件可能损坏或不完整' + (position ? `（${position.join('；')}）` : '');
+                info.stack = info.stack.split('\n').filter(line => /^\s+at\s/.test(line) || /^[^@\n]*@(?:[a-z][\w+.-]*:|\/)/i.test(line)).join('\n');
+            }
+            return info;
+        },
+        async bounded(operation) {
+            let timer;
+            try {
+                return await Promise.race([Promise.resolve().then(operation), new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(new Error('诊断存储响应超时')), 1500);
+                })]);
+            } finally { clearTimeout(timer); }
+        },
+        async capture(context, error) {
+            if (context.reported) return;
+            context.reported = true;
+            const record = { id: context.id, at: context.at, environment: context.environment, file: context.file,
+                stage: context.stage, recordCount: context.recordCount ?? null,
+                validation: context.validation || null, storage: context.storage || null,
+                error: this.errorInfo(error, context.stage === '解析 JSON'), persistence: 'GM' };
+            this.memory.set(record.id, record);
+            if (error && typeof error === 'object') this.errors.set(error, record);
+            while (this.memory.size > this.limit) this.memory.delete(this.memory.keys().next().value);
+            const save = async () => {
+                const key = this.prefix + record.id;
+                let saved = false;
+                try {
+                    await this.bounded(async () => {
+                        await HistoryStoreIO.set(key, record);
+                        if ((await HistoryStoreIO.get(key))?.id !== record.id) throw new Error('诊断写入未确认');
+                    });
+                    saved = true;
+                } catch (failure) {
+                    record.persistence = 'localStorage'; record.persistenceError = this.errorInfo(failure);
+                    try { localStorage.setItem(key, JSON.stringify(record)); }
+                    catch (fallbackError) { record.persistence = 'memory'; record.fallbackError = this.errorInfo(fallbackError); }
+                }
+                // 每条故障使用独立 key，避免多个页面互相覆盖；清理只影响诊断记录。
+                if (saved) try {
+                    await this.bounded(async () => {
+                        const keys = (await HistoryStoreIO.list()).filter(key => key.startsWith(this.prefix)).sort().reverse();
+                        for (const old of keys.slice(this.limit)) await HistoryStoreIO.delete(old);
+                    });
+                } catch (e) { }
+                try {
+                    const keys = this.localKeys().sort().reverse();
+                    for (const old of keys.slice(this.limit)) localStorage.removeItem(old);
+                } catch (e) { }
+            };
+            const pending = this.queue.then(save); this.queue = pending.catch(() => {});
+            // 诊断自身失败不能替换原始导入错误，内存副本仍可直接下载。
+            await pending.catch(() => {});
+        },
+        localKeys() {
+            const keys = [];
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key?.startsWith(this.prefix)) keys.push(key);
+            }
+            return keys;
+        },
+        validRecord(record) {
+            try {
+                return typeof record?.id === 'string' && /^\d{16}_\d{12}_[0-9a-f-]{36}$/.test(record.id)
+                    && typeof record.stage === 'string' && record.error && typeof record.error.message === 'string'
+                    && JSON.stringify(record).length <= 32768;
+            } catch (e) { return false; }
+        },
+        async collect() {
+            await this.queue;
+            const records = new Map(), unavailable = [];
+            try {
+                const results = await this.bounded(async () => {
+                    const keys = (await HistoryStoreIO.list()).filter(key => key.startsWith(this.prefix)).sort().reverse().slice(0, this.limit);
+                    return Promise.allSettled(keys.map(key => HistoryStoreIO.get(key)));
+                });
+                for (const result of results) {
+                    if (result.status === 'fulfilled' && this.validRecord(result.value)) records.set(result.value.id, result.value);
+                    else unavailable.push('部分持久诊断读取失败或格式无效');
+                }
+            } catch (e) { unavailable.push('GM 诊断存储不可读'); }
+            try {
+                for (const key of this.localKeys().sort().reverse().slice(0, this.limit)) {
+                    try { const record = JSON.parse(localStorage.getItem(key)); if (this.validRecord(record)) records.set(record.id, record);
+                        else unavailable.push('部分本地诊断格式无效'); }
+                    catch (e) { unavailable.push('部分本地诊断读取失败'); }
+                }
+            } catch (e) { unavailable.push('本地诊断存储不可读'); }
+            for (const [id, record] of this.memory) records.set(id, record);
+            return { format: 'bvh-import-diagnostics', version: 1, environment: this.environment(),
+                unavailable: [...new Set(unavailable)], records: [...records.values()].sort((a, b) => b.id.localeCompare(a.id)).slice(0, this.limit) };
+        },
+        async download() {
+            const report = await this.collect();
+            const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: 'application/json;charset=utf-8' }));
+            const a = document.createElement('a'); a.href = url; a.download = `bvh-import-diagnostics-${new Date().toISOString().slice(0, 10)}.json`;
+            a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+        },
+        async clear() {
+            await this.queue; this.memory.clear(); this.errors = new WeakMap();
+            const failures = [];
+            try { await this.bounded(async () => { for (const key of (await HistoryStoreIO.list()).filter(key => key.startsWith(this.prefix))) await HistoryStoreIO.delete(key); }); }
+            catch (e) { failures.push('GM'); }
+            try { for (const key of this.localKeys()) localStorage.removeItem(key); }
+            catch (e) { failures.push('本地'); }
+            if (failures.length) throw new Error(`${failures.join('、')}诊断记录未能清除，请稍后重试`);
+        }
+    };
+
     // 只读请求有限并发；所有写入仍沿用原事务顺序。
     async function readHistoryBatch(items, read) {
         const results = [];
@@ -1250,35 +1399,46 @@
         static compare(a, b) {
             return a[0] - b[0] || (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0) || a[2] - b[2];
         }
-        static checksum(value) {
-            const text = JSON.stringify(value);
+        static checksum(value, canonical = true) {
+            // GM 存储回读可能重排对象字段；只固定对象键顺序，数组顺序仍参与校验。
+            const text = JSON.stringify(value, canonical ? (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+                ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item : undefined);
             let hash = 2166136261;
             for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
-            return `${text.length}:${hash >>> 0}`;
+            return `${canonical ? 'sorted:' : ''}${text.length}:${hash >>> 0}`;
         }
-        async readCommit(key, knownManifest) {
+        static verifyChecksum(value, checksum) {
+            // 无前缀的旧提交继续按原序列化方式校验，不改写已有数据。
+            return typeof checksum === 'string' && HistoryCommitStore.checksum(value, checksum.startsWith('sorted:')) === checksum;
+        }
+        async readCommit(key, knownManifest, diagnostic) {
+            const reject = reason => { if (diagnostic) diagnostic.storage = { ...diagnostic.storage, confirmationError: reason }; return null; };
             const manifest = knownManifest || await this.io.get(key);
             if (!manifest || manifest.protocol !== 1 || !Array.isArray(manifest.blocks)
-                || (!manifest.blocks.length && !(['epoch', 'prune'].includes(manifest.kind) && manifest.count === 0))) return null;
+                || (!manifest.blocks.length && !(['epoch', 'prune'].includes(manifest.kind) && manifest.count === 0))) return reject('提交清单缺失或格式无效');
             const entries = [];
             const blocks = await readHistoryBatch(manifest.blocks, ref => this.io.get(ref.key));
             for (let index = 0; index < manifest.blocks.length; index++) {
                 const ref = manifest.blocks[index];
-                if (typeof ref.key !== 'string' || !ref.key.startsWith(manifest.kind === 'checkpoint' ? 'bvh_checkpoint_' : 'bvh_tx_')) return null;
+                if (typeof ref.key !== 'string' || !ref.key.startsWith(manifest.kind === 'checkpoint' ? 'bvh_checkpoint_' : 'bvh_tx_')) return reject('数据块引用无效');
                 const block = blocks[index];
                 const segmentStart = performance.now();
+                if (diagnostic) diagnostic.storage = { ...diagnostic.storage, block: ref.key,
+                    expectedChecksum: ref.checksum, actualChecksum: block ? HistoryCommitStore.checksum(block, typeof ref.checksum === 'string' && ref.checksum.startsWith('sorted:')) : null,
+                    expectedCount: ref.count, actualCount: Array.isArray(block?.entries) ? block.entries.length : null };
                 if (!block || block.id !== manifest.id || !Array.isArray(block.entries)
-                    || block.entries.length !== ref.count || HistoryCommitStore.checksum(block) !== ref.checksum) return null;
+                    || block.entries.length !== ref.count || !HistoryCommitStore.verifyChecksum(block, ref.checksum)) return reject('数据块缺失、身份、条数或校验和不匹配');
                 for (const entry of block.entries) {
                     if (!entry || !VideoKey.isValid(entry.key) || !Array.isArray(entry.version)
                         || !Number.isFinite(entry.version[0]) || typeof entry.version[1] !== 'string'
-                        || !Number.isFinite(entry.version[2]) || (!entry.deleted && !entry.record)) return null;
+                        || !Number.isFinite(entry.version[2]) || (!entry.deleted && !entry.record)) return reject('数据块中的记录或版本无效');
                     entries.push(entry);
                 }
                 HistoryQueries.recordSegment(performance.now() - segmentStart);
                 await new Promise(resolve => setTimeout(resolve, 0));
             }
-            return entries.length === manifest.count ? { manifest, entries } : null;
+            if (diagnostic) Object.assign(diagnostic.storage, { manifestCount: manifest.count, actualEntryCount: entries.length });
+            return entries.length === manifest.count ? { manifest, entries } : reject('提交清单总条数不匹配');
         }
         async sync() {
             if (this.syncing) return this.syncing;
@@ -1329,6 +1489,9 @@
             const loadedCommits = await readHistoryBatch(commitKeys, async key => {
                 if (this.commits.has(key)) return this.commits.get(key);
                 if (!this.scope) { const commit = await this.readCommit(key); if (!commit) this._incomplete = true; return commit; }
+                const route = covered.has(key) && index.routes?.[key];
+                // v2 路由用 null 标记全局批次；普通无关事务可在读取清单前排除。
+                if (index?.routeVersion === 2 && Array.isArray(route) && !route.some(base => this.scope.has(base))) return null;
                 const header = this.headers.get(key) || await this.io.get(key);
                 if (!header) { this._incomplete = true; return null; }
                 this.headers.set(key, header);
@@ -1338,7 +1501,6 @@
                     return commit;
                 }
                 if (!this.scope.size) return null;
-                const route = covered.has(key) && index.routes?.[key];
                 if (Array.isArray(route) && !route.some(base => this.scope.has(base))) return null;
                 if (Array.isArray(header.bases)) {
                     if (!header.bases.some(base => this.scope.has(base))) return null;
@@ -1448,26 +1610,48 @@
             if (kind === 'prune') manifest.cutoverAt = cutoverAt;
             return { key: `bvh_commit_${id}`, blocks, manifest };
         }
-        async publish(transaction, guard, deferSync = false) {
+        async publish(transaction, guard, deferSync = false, diagnostic) {
             if (!transaction.blocks.length && !['epoch', 'prune'].includes(transaction.manifest.kind)) return new Set();
             // 重试前检查并补齐块，沿用原事务身份。
             for (const block of transaction.blocks) {
+                const expectedChecksum = HistoryCommitStore.checksum(block.value);
+                if (diagnostic) {
+                    diagnostic.stage = '读取待写数据块'; diagnostic.storage = { transaction: transaction.key, block: block.key,
+                        blockCount: transaction.blocks.length, expectedCount: block.value.entries.length,
+                        expectedChecksum };
+                }
                 const current = await this.io.get(block.key);
-                if (!current) await this.io.set(block.key, block.value);
-                else if (HistoryCommitStore.checksum(current) !== HistoryCommitStore.checksum(block.value)) throw new Error('提交身份冲突，已保留原数据');
+                if (!current) {
+                    if (diagnostic) diagnostic.stage = '写入数据块';
+                    await this.io.set(block.key, block.value);
+                } else {
+                    if (diagnostic) { diagnostic.stage = '检查提交身份'; diagnostic.storage.actualChecksum = HistoryCommitStore.checksum(current); }
+                    if (HistoryCommitStore.checksum(current) !== expectedChecksum) throw new Error('提交身份冲突，已保留原数据');
+                }
+                if (diagnostic) diagnostic.stage = '回读数据块';
                 const confirmed = await this.io.get(block.key);
                 const segmentStart = performance.now();
-                if (HistoryCommitStore.checksum(confirmed) !== HistoryCommitStore.checksum(block.value)) throw new Error('历史数据块写入未确认，请重试');
+                const actualChecksum = confirmed ? HistoryCommitStore.checksum(confirmed) : null;
+                if (diagnostic) { diagnostic.stage = '校验数据块'; diagnostic.storage.actualChecksum = actualChecksum;
+                    diagnostic.storage.actualCount = Array.isArray(confirmed?.entries) ? confirmed.entries.length : null; }
+                if (actualChecksum !== expectedChecksum) throw new Error('历史数据块写入未确认，请重试');
                 HistoryQueries.recordSegment(performance.now() - segmentStart);
                 await new Promise(resolve => setTimeout(resolve, 0));
             }
+            if (diagnostic) diagnostic.stage = '检查并发变更';
             if (guard && !await guard()) { const error = new Error('准备期间记录发生变化，重新评估'); error.code = 'BVH_RETRY'; throw error; }
+            if (diagnostic) { diagnostic.stage = '读取提交清单'; diagnostic.storage = { transaction: transaction.key, blockCount: transaction.blocks.length }; }
             const prior = await this.io.get(transaction.key);
             const comparable = prior && !prior.bases ? { ...transaction.manifest, bases: undefined } : transaction.manifest;
+            if (diagnostic) Object.assign(diagnostic.storage, { expectedChecksum: HistoryCommitStore.checksum(comparable),
+                actualChecksum: prior ? HistoryCommitStore.checksum(prior) : null });
             if (prior && HistoryCommitStore.checksum(prior) !== HistoryCommitStore.checksum(comparable)) throw new Error('提交清单身份冲突');
+            if (diagnostic) diagnostic.stage = '写入提交清单';
             if (!prior) await this.io.set(transaction.key, transaction.manifest);
-            if (!await this.readCommit(transaction.key)) throw new Error('历史提交未确认，请保留备份并重试');
+            if (diagnostic) diagnostic.stage = '确认提交';
+            if (!await this.readCommit(transaction.key, undefined, diagnostic)) throw new Error('历史提交未确认，请保留备份并重试');
             if (deferSync) return new Set();
+            if (diagnostic) diagnostic.stage = '同步已提交历史';
             const changed = await this.sync();
             // 提示失败不把已经完整发布的事务伪报为失败；枚举会补齐丢失信号。
             try { await this.io.set('bvh_change_signal', { id: transaction.manifest.id, keys: [...changed] }); }
@@ -1619,20 +1803,28 @@
             if (!value) return null;
             if (value === '-1秒') return -1;
             const match = value.match(/^(?:(\d+)小时)?(?:(\d+)分钟)?(?:(\d+)秒)?$/);
-            if (!match || !match.slice(1).some(v => v !== undefined)) fail('时长');
+            if (!match || !match.slice(1).some(v => v !== undefined)) fail('时长', value);
             const seconds = Number(match[1] || 0) * 3600 + Number(match[2] || 0) * 60 + Number(match[3] || 0);
-            if (!Number.isSafeInteger(seconds)) fail('时长');
+            if (!Number.isSafeInteger(seconds)) fail('时长', value);
             return seconds;
         },
-        validate(text) {
+        validate(text, diagnostic) {
+            if (diagnostic) diagnostic.stage = '解析 CSV';
             const table = HistoryCSV.parse(text), header = table.shift();
-            if (!header || ![HistoryCSV.headers, HistoryCSV.exportHeaders].some(expected => header.length === expected.length && header.every((v, i) => v === expected[i]))) throw new Error('CSV 表头不匹配，请选择本脚本或历史记录导出工具的 CSV 文件');
+            if (diagnostic) { diagnostic.stage = '校验 CSV'; diagnostic.recordCount = table.length; }
+            if (!header || ![HistoryCSV.headers, HistoryCSV.exportHeaders].some(expected => header.length === expected.length && header.every((v, i) => v === expected[i])))
+                throw ImportDiagnostics.invalid(diagnostic, 'CSV 表头不匹配，请选择本脚本或历史记录导出工具的 CSV 文件', { field: '表头', columnCount: header?.length || 0 });
             const records = new Map();
             let duplicateCount = 0;
             table.forEach((cells, index) => {
-                const fail = field => { throw new Error(`CSV 第 ${index + 2} 条：${field} 无效`); };
+                let valuesByHeader;
+                const fail = (field, value) => {
+                    const name = { '视频链接': '视频链接', '分 P 编号': '视频链接', '时长': '观看进度', '完成度': '完成度', '观看时间': '观看时间', '视频时长': '视频时长' }[field];
+                    throw ImportDiagnostics.invalid(diagnostic, `CSV 第 ${index + 2} 条：${field} 无效`, {
+                        row: index + 2, field, value: ImportDiagnostics.sample(value ?? (field === '列数' ? cells.length : valuesByHeader?.[name]), name !== '视频链接') });
+                };
                 if (cells.length !== header.length) fail('列数');
-                const valuesByHeader = Object.fromEntries(header.map((name, i) => [name, cells[i]]));
+                valuesByHeader = Object.fromEntries(header.map((name, i) => [name, cells[i]]));
                 const { 标题: title, 视频链接: link, 观看时间: time, 视频时长: durationText = '', 观看进度: progressText, 完成度: completion } = valuesByHeader;
                 let url;
                 try { url = new URL(link); } catch { fail('视频链接'); }
@@ -1841,7 +2033,9 @@
             }
             await HistoryStoreIO.set(s._BASE_INDEX_KEY, { version: 2, complete: true,
                 coverage: [...store.commits.keys()].sort(), index,
-                routes: Object.fromEntries([...store.commits].map(([key, commit]) => [key, [...new Set(commit.entries.map(entry => VideoKey.base(entry.key)))]])) });
+                routeVersion: 2,
+                routes: Object.fromEntries([...store.commits].map(([key, commit]) => [key, ['epoch', 'prune'].includes(commit.manifest.kind)
+                    ? null : [...new Set(commit.entries.map(entry => VideoKey.base(entry.key)))]])) });
         },
         async _rebuildBaseIndex() {
             await StorageManager.initialize();
@@ -1984,27 +2178,31 @@
                 return dropped.size;
             });
         },
-        validateImport(data) {
-            if (!data || Array.isArray(data) || typeof data !== 'object') throw new Error('文件必须是视频 key 对应记录的对象');
+        validateImport(data, diagnostic) {
+            if (!data || Array.isArray(data) || typeof data !== 'object') throw ImportDiagnostics.invalid(diagnostic, '文件必须是视频 key 对应记录的对象', { field: '根对象', value: ImportDiagnostics.sample(data, false) });
+            if (diagnostic) diagnostic.recordCount = Object.keys(data).length;
             const result = [], seen = new Set();
             for (const [rawKey, input] of Object.entries(data)) {
-                const fail = field => { throw new Error(rawKey + '：' + field + ' 无效'); };
-                if (!/^(?:[Bb][Vv][A-Za-z0-9]{10}|av[0-9]+)(?:\?p=[1-9][0-9]*)?$/.test(rawKey)) fail('视频 key');
+                const fail = (field, value, includeValue = true) => { throw ImportDiagnostics.invalid(diagnostic, Utils._truncate(rawKey, 120) + '：' + field + ' 无效', {
+                    key: VideoKey.normalize(rawKey) || '[无效视频编号]', field, value: ImportDiagnostics.sample(value, includeValue) }); };
+                if (!/^(?:[Bb][Vv][A-Za-z0-9]{10}|av[0-9]+)(?:\?p=[1-9][0-9]*)?$/.test(rawKey)) fail('视频 key', rawKey, false);
                 const key = VideoKey.normalize(rawKey);
                 if (seen.has(key)) fail('规范化后的视频 key 重复'); seen.add(key);
-                if (!input || typeof input !== 'object') fail('记录');
+                if (!input || typeof input !== 'object') fail('记录', input, false);
                 const v = Array.isArray(input) ? { status: input[0], currentTime: input[1], percent: input[2], savedAt: input[3], title: input[4] } : input;
                 const compact = v.s !== undefined;
                 const status = compact ? v.s : v.status;
-                if (status !== undefined && !(compact ? [0, 1, 2].includes(status) : Object.values(RECORD_STATUS).includes(status))) fail('状态');
+                if (status !== undefined && !(compact ? [0, 1, 2].includes(status) : Object.values(RECORD_STATUS).includes(status))) fail('状态', status);
                 const percent = compact ? v.p : v.percent;
-                if (percent !== undefined && percent !== '' && !(typeof percent === 'number' && Number.isFinite(percent) || typeof percent === 'string' && /^\d+(?:\.\d+)?%?$/.test(percent))) fail('百分比');
+                if (percent !== undefined && percent !== '' && !(typeof percent === 'number' && Number.isFinite(percent) || typeof percent === 'string' && /^\d+(?:\.\d+)?%?$/.test(percent))) fail('百分比', percent);
                 const numeric = parseFloat(percent || 0);
-                if (numeric < 0 || numeric > 100) fail('百分比范围');
+                if (!Number.isFinite(numeric) || numeric < 0) fail('百分比范围', percent);
                 const time = compact ? v.a : v.savedAt;
-                if (time !== undefined && time !== '' && !(compact ? typeof time === 'number' && Number.isFinite(time) && Number.isFinite(new Date(time * 1000).getTime()) : typeof time === 'string' && Number.isFinite(Date.parse(time)))) fail('保存时间');
-                for (const field of compact ? ['t', 'n'] : ['currentTime', 'title']) if (v[field] !== undefined && typeof v[field] !== 'string') fail(field);
-                result.push({ key, record: StorageManager._compact(v) });
+                if (time !== undefined && time !== '' && !(compact ? typeof time === 'number' && Number.isFinite(time) && Number.isFinite(new Date(time * 1000).getTime()) : typeof time === 'string' && Number.isFinite(Date.parse(time)))) fail('保存时间', time);
+                for (const field of compact ? ['t', 'n'] : ['currentTime', 'title']) if (v[field] !== undefined && typeof v[field] !== 'string') fail(field, v[field], !['n', 'title'].includes(field));
+                // 旧版播放采样可能超过视频时长；与 CSV 导入一样将有限正进度封顶。
+                const record = StorageManager._compact(v);
+                result.push({ key, record: numeric > 100 ? { ...record, p: 100 } : record });
             }
             return result;
         },
@@ -2064,6 +2262,7 @@
                 }
                 if (!entries.length) return options.details ? { count: 0, created: 0, updated: 0 } : 0;
                 const created = entries.filter(entry => !s.getRecord(entry.key)).length;
+                if (options.diagnostic) options.diagnostic.stage = '准备提交';
                 const transaction = await s._store.prepare(entries, 'tx', options.transactionId, options.transactionId ? version[0] : Date.now(), epoch, sampledAt);
                 let changed;
                 try {
@@ -2071,7 +2270,7 @@
                         const changes = await s._store.sync(); s._accept(changes);
                         return epoch === s._store.epoch && (source === 'playback'
                             || [...observed].every(([key, version]) => JSON.stringify(s._store.entries.get(key)?.version) === version));
-                    });
+                    }, false, options.diagnostic);
                 } catch (error) { if (error.code === 'BVH_RETRY' && epoch === s._store.epoch) continue; if (epoch !== s._store.epoch) return 0; throw error; }
                 s._accept(new Set([...changed, ...entries.map(e => e.key)]));
                 // 新提交自带 bases；旧索引 coverage 之外的提交会独立读取，无需每次保存重写全量索引。
@@ -2081,17 +2280,41 @@
                 }
             });
         },
-        async importRecords(data) {
-            const rows = StorageManager.validateImport(data);
-            const count = await StorageManager.saveRecords(rows, true, { source: 'import' });
-            return { count, skipCount: rows.length - count };
+        async importRecords(data, diagnostic = ImportDiagnostics.begin()) {
+            try {
+                diagnostic.stage = '校验 JSON';
+                const rows = StorageManager.validateImport(data, diagnostic);
+                diagnostic.stage = '读取现有历史';
+                const count = await StorageManager.saveRecords(rows, true, { source: 'import', diagnostic });
+                return { count, skipCount: rows.length - count };
+            } catch (error) { await ImportDiagnostics.capture(diagnostic, error); throw error; }
         },
-        async importFile(text, filename = '') {
-            text = text.replace(/^\uFEFF/, '');
-            if (!/\.csv$/i.test(filename)) return StorageManager.importRecords(JSON.parse(text));
-            const { rows, duplicateCount } = HistoryCSV.validate(text);
-            const count = await StorageManager.saveRecords(rows, true, { source: 'import' });
-            return { count, skipCount: rows.length - count + duplicateCount };
+        async importFile(text, filename = '', diagnostic = ImportDiagnostics.begin(filename)) {
+            try {
+                if (diagnostic.file.size === null && typeof text === 'string') diagnostic.file.size = new TextEncoder().encode(text).length;
+                diagnostic.stage = diagnostic.file.format === 'csv' ? '解析 CSV' : '解析 JSON';
+                text = text.replace(/^\uFEFF/, '');
+                if (diagnostic.file.format === 'json') return await StorageManager.importRecords(JSON.parse(text), diagnostic);
+                const { rows, duplicateCount } = HistoryCSV.validate(text, diagnostic);
+                diagnostic.stage = '读取现有历史';
+                const count = await StorageManager.saveRecords(rows, true, { source: 'import', diagnostic });
+                return { count, skipCount: rows.length - count + duplicateCount };
+            } catch (error) { await ImportDiagnostics.capture(diagnostic, error); throw error; }
+        },
+        async importLocalFile(file) {
+            const diagnostic = ImportDiagnostics.begin(file.name, file.size);
+            let text;
+            try {
+                if (typeof file.text === 'function') text = await file.text();
+                else text = await new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = event => resolve(event.target.result);
+                    reader.onerror = () => reject(reader.error || new Error('文件读取失败'));
+                    reader.onabort = () => reject(new Error('文件读取已取消'));
+                    reader.readAsText(file);
+                });
+            } catch (error) { await ImportDiagnostics.capture(diagnostic, error); throw error; }
+            return StorageManager.importFile(text, file.name, diagnostic);
         },
         deleteRecord(key, notify = true) { return StorageManager.deleteRecords([key], notify); },
         deleteRecords(keys, notify = true, options = {}) {
@@ -3111,6 +3334,12 @@
             }, duration);
             return el;
         },
+        addImportDiagnosticButton: (el) => {
+            if (!el?.appendChild) return;
+            const button = document.createElement('button'); button.textContent = '下载诊断';
+            button.addEventListener('click', () => ImportDiagnostics.download().catch(error => UIComponent.toast('诊断下载失败：' + error.message, 'error', 6000)));
+            el.appendChild(button);
+        },
         toastUndo: (msg, duration = 5000, onUndo) => {
             const el = UIComponent.toast(msg, 'success', duration);
             const button = document.createElement('button'); button.textContent = '撤销'; el.appendChild(button);
@@ -3168,6 +3397,7 @@
             };
 
             return {
+                element: el,
                 message: message => { text.innerText = message; track.setAttribute('aria-label', message); },
                 update: (percent, message) => {
                     el.classList.remove('is-pending');
@@ -3701,7 +3931,7 @@
                 <section class="bvh-section"><div class="bvh-section-heading"><span>02</span><h2>页面标记</h2></div>${toggle('showProgressBar', '观看进度条', '在视频封面上显示已观看的进度。')}${toggle('showVisitedTag', '已访问标签', '标记打开过、但还未开始观看的视频。')}</section>
                 <section class="bvh-section"><div class="bvh-section-heading"><span>03</span><h2>标签样式</h2></div><fieldset class="bvh-position"><legend>标签位置</legend><div>${[['top-left', '左上'], ['top-right', '右上'], ['bottom-left', '左下'], ['bottom-right', '右下']].map(([value, label]) => `<label><input type="radio" name="bvh-position" data-setting="tagPosition" value="${value}" ${d.tagPosition === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset><div class="bvh-setting-row"><label for="bvh-opacity-number">标签透明度<small>数值越高，标签越清晰。</small></label><div class="bvh-opacity"><input aria-label="标签透明度滑块" type="range" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><input id="bvh-opacity-number" type="number" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><span>%</span></div></div><div class="bvh-thresholds">${threshold('lowThreshold', '低进度分界')}${threshold('highThreshold', '高进度分界')}</div><p class="bvh-help">低于低分界为低进度；超过高分界为高进度。</p></section>
                 ${this.renderTagStyleSettings()}
-                <section class="bvh-section"><div class="bvh-section-heading"><span>05</span><h2>诊断与维护</h2></div>${toggle('debug', '调试日志', '需要排查问题时开启，记录脚本运行信息。')}<div class="bvh-maintenance-links"><button data-action="download-log">下载日志</button><button data-action="clear-log">清空日志</button><button data-action="reset-position">恢复悬浮位置</button>${this.options.currentKey && StorageManager.getRecord(this.options.currentKey)?.currentTime ? '<button data-action="jump">跳转到已记录进度</button>' : ''}</div><details class="bvh-storage-tools"><summary>存储维护</summary><p class="bvh-help">以下离线操作需要先关闭其他所有运行本脚本的页面。</p><button data-action="staging-info">检查暂存数据</button><button data-action="cleanup-staging">离线清理暂存数据</button><button data-action="legacy-snapshot">生成旧版兼容快照</button><p data-storage-info role="status"></p></details></section>
+                <section class="bvh-section"><div class="bvh-section-heading"><span>05</span><h2>诊断与维护</h2></div>${toggle('debug', '调试日志', '需要排查问题时开启。导入失败诊断会自动保留，无需开启此开关。')}<div class="bvh-maintenance-links"><button data-action="download-log">下载日志</button><button data-action="download-import-diagnostic">下载导入诊断</button><button data-action="clear-log">清空日志</button><button data-action="reset-position">恢复悬浮位置</button>${this.options.currentKey && StorageManager.getRecord(this.options.currentKey)?.currentTime ? '<button data-action="jump">跳转到已记录进度</button>' : ''}</div><details class="bvh-storage-tools"><summary>存储维护</summary><p class="bvh-help">以下离线操作需要先关闭其他所有运行本脚本的页面。</p><button data-action="staging-info">检查暂存数据</button><button data-action="cleanup-staging">离线清理暂存数据</button><button data-action="legacy-snapshot">生成旧版兼容快照</button><p data-storage-info role="status"></p></details></section>
                 </div><aside class="bvh-preview-panel"><div class="bvh-eyebrow">LIVE PREVIEW</div><h2>标记效果预览</h2><p>调整左侧选项，即时查看效果。</p><div class="bvh-preview-cover"><div class="bvh-preview-art">${workbenchIcon('mark')}<span>每一段观看，都有迹可循。</span><small>WATCH · PAUSE · CONTINUE</small></div><div data-preview-tag></div><div data-preview-bar></div><span class="bvh-preview-duration">12:48</span></div><h3>下一次，从这里继续</h3><p class="bvh-preview-caption">演示画幅 · 仅用于样式预览</p><div class="bvh-preview-states" aria-label="预览记录类型">${[['visited', '已访问'], ['low', '低进度'], ['mid', '中进度'], ['high', '高进度'], ['multi', '多 P']].map(([v, l]) => `<button data-preview="${v}" aria-pressed="${v === this.previewState}">${l}</button>`).join('')}</div><div class="bvh-preview-playlist"><span class="bvh-help">合集列表</span><div class="bvh-preview-episode-row"><span>01 · 下一段旅程</span><span data-preview-episode></span></div><div class="bvh-preview-grid-row"><span class="bvh-help">网格分 P</span><div class="bvh-preview-grid-cell">01<span data-preview-grid></span></div></div></div><div class="bvh-preview-note"><span class="bvh-dot"></span>预览不会修改实际记录<br><small>保存设置后，页面上的标记才会更新。</small></div></aside></div>`;
             this.organizeSettings();
             this.renderPreview();
@@ -3846,8 +4076,9 @@
                 if (action === 'export') await this.export();
                 if (action === 'export-csv') await this.export('csv');
                 if (action === 'import') this.import();
-                if (action === 'download-log') Utils.downloadDebugLog();
-                if (action === 'clear-log') { Utils.clearDebugLogs(); UIComponent.toast('日志已清空', 'success'); }
+                if (action === 'download-log') await Utils.downloadDebugLog();
+                if (action === 'download-import-diagnostic') await ImportDiagnostics.download();
+                if (action === 'clear-log') { await Utils.clearDebugLogs(); UIComponent.toast('日志已清空', 'success'); }
                 if (action === 'reset-position') { FloatingEntry.resetPosition(); UIComponent.toast('悬浮位置已恢复', 'success'); }
                 if (action === 'jump') {
                     if (EpisodeResolver.getCurrentKey() === this.options.currentKey) UIComponent.jumpToProgress(StorageManager.getRecord(this.options.currentKey));
@@ -4010,8 +4241,8 @@
             input.onchange = async () => {
                 if (!input.files[0]) return; this.busy = true;
                 const feedback = UIComponent.progressToast('正在校验并导入记录…');
-                try { const result = await StorageManager.importFile(await input.files[0].text(), input.files[0].name); feedback.close(`导入 ${result.count} 条，跳过 ${result.skipCount} 条已有或重复记录`, 'success', 4000); if (!this.disposed) this.refresh(); }
-                catch (error) { feedback.close('导入失败：' + error.message, 'error', 6000); }
+                try { const result = await StorageManager.importLocalFile(input.files[0]); feedback.close(`导入 ${result.count} 条，跳过 ${result.skipCount} 条已有或重复记录`, 'success', 4000); if (!this.disposed) this.refresh(); }
+                catch (error) { feedback.close(ImportDiagnostics.failureMessage(error), 'error', 15000); UIComponent.addImportDiagnosticButton(feedback.element); }
                 finally { this.busy = false; }
             }; input.click();
         }
@@ -5814,19 +6045,15 @@
                 const input = document.createElement('input');
                 input.type = 'file';
                 input.accept = '.json,.csv';
-                input.onchange = e => {
+                input.onchange = async e => {
                     const file = e.target.files[0];
                     if (!file) return;
-                    const reader = new FileReader();
-                    reader.onload = async ev => {
-                        try {
-                            const result = await StorageManager.importFile(ev.target.result, file.name);
-                            UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有或重复记录)`, 'success', 4000);
-                        } catch (err) {
-                            UIComponent.toast('导入失败：' + err.message, 'error', 5000);
-                        }
-                    };
-                    reader.readAsText(file);
+                    try {
+                        const result = await StorageManager.importLocalFile(file);
+                        UIComponent.toast(`成功导入 ${result.count} 条新记录 (跳过 ${result.skipCount} 条已有或重复记录)`, 'success', 4000);
+                    } catch (err) {
+                        UIComponent.addImportDiagnosticButton(UIComponent.toast(ImportDiagnostics.failureMessage(err), 'error', 15000));
+                    }
                 };
                 input.click();
             });

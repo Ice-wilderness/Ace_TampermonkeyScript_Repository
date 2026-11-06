@@ -85,7 +85,7 @@ test('异常 CSV 全量校验后拒绝，不写入前面的有效记录', async 
         const w = instance();
         await assert.rejects(w.StorageManager.importFile(content, '异常.csv'));
         assert.equal(w.StorageManager.getAllKeys().length, 0);
-        assert.equal(w.shared.calls.filter(call => call.type === 'set').length, 0);
+        assert.equal(w.shared.calls.filter(call => call.type === 'set' && !call.key.startsWith(w.ImportDiagnostics.prefix)).length, 0);
     }
 });
 
@@ -118,6 +118,45 @@ test('JSON 导入导出和旧格式校验保持原样，空 CSV 可正常导入'
     assert.equal((await s.importFile(ownHeaders + '\n', '空.csv')).count, 0);
 });
 
+test('旧 JSON 超过 100% 的进度兼容导入，保留时间、分 P 和已有记录', async () => {
+    const w = instance(), s = w.StorageManager;
+    const data = {
+        [key(1, 11)]: ['已观看', '10:01', '101%', '2026-09-05 12:00:00', '旧数组'],
+        [key(2)]: { ...record(150), v: 2 },
+        [key(3)]: { s: 1, t: '10:01', p: 100.5, a: 1788652800, n: '紧凑格式' },
+        [key(4)]: record(70)
+    };
+    const original = structuredClone(data);
+    await s.saveRecord(key(2), record(20));
+    const result = await s.importFile(JSON.stringify(data), '旧备份.json');
+    assert.deepEqual({ ...result }, { count: 3, skipCount: 1 });
+    assert.equal(s.getRecord(key(1, 11)).percent, '100%');
+    assert.equal(s.getRecord(key(1, 11)).currentTime, '10:01');
+    assert.equal(s.getRecord(key(1, 11)).savedAt, '2026-09-05 12:00:00');
+    assert.equal(s.getRecord(key(2)).percent, '20%');
+    assert.equal(s.getRecord(key(3)).percent, '100%');
+    assert.equal(s.getRecord(key(4)).percent, '70%');
+    const rows = s.validateImport(data);
+    assert.equal(rows.find(row => row.key === key(2)).record.p, 100);
+    assert.equal(rows.find(row => row.key === key(3)).record.p, 100);
+    assert.deepEqual(data, original, '校验不能修改传入的备份');
+    const exported = await download(w);
+    const target = instance();
+    assert.equal((await target.StorageManager.importFile(exported.content, exported.filename)).count, 4);
+    assert.deepEqual(structuredClone(target.StorageManager.getAllRecords()), structuredClone(s.getAllRecords()));
+});
+
+test('JSON 负进度和非有限进度仍整批拒绝，不写入有效前缀', async () => {
+    for (const percent of [-1, '-1%', 'NaN%', 'Infinity%', '9'.repeat(400) + '%']) {
+        const w = instance();
+        await assert.rejects(w.StorageManager.importFile(JSON.stringify({
+            [key(1)]: record(), [key(2)]: { ...record(), percent }
+        }), '异常.json'), /百分比/);
+        assert.equal(w.StorageManager.getAllKeys().length, 0);
+        assert.equal(w.shared.calls.filter(call => call.type === 'set' && !call.key.startsWith(w.ImportDiagnostics.prefix)).length, 0);
+    }
+});
+
 test('菜单和管理面板的导入入口均接受 CSV，菜单提供 CSV 导出', async () => {
     const w = instance(), menus = new Map(), messages = [];
     let input;
@@ -132,7 +171,7 @@ test('菜单和管理面板的导入入口均接受 CSV，菜单提供 CSV 导�
     assert(menus.has('导出历史记录（CSV）'));
     menus.get('导入历史记录')();
     assert.equal(input.accept, '.json,.csv');
-    input.onchange({ target: { files: [{ name: '菜单.csv', content: csv(row()) }] } });
+    await input.onchange({ target: { files: [{ name: '菜单.csv', content: csv(row()) }] } });
     await Promise.all(readers);
     assert.equal(w.StorageManager.getRecord(key(1)).percent, '50%');
     assert.match(messages.at(-1), /成功导入 1/);
