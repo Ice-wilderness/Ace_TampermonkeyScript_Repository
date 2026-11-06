@@ -107,6 +107,72 @@ const cases = [
         assert.equal([...replacement.events.values()].reduce((n, set) => n + set.size, 0), 0);
         replacement.fire('timeupdate'); assert.equal(w.StorageManager.getRecord(key(1)).percent, '50%');
     }],
+    ['慢速保存期间继续播放，已确认进度仍更新悬浮入口', async () => {
+        const { w, p, video } = await setup(); await w.StorageManager._queue;
+        const updates = []; w.UIComponent.updateViewPanelProgress = record => updates.push(record.currentTime);
+        let release;
+        w.StorageManager.saveRecord = () => new Promise(resolve => { release = () => resolve(1); });
+        const saving = p.saveProgress();
+        video.currentTime = 31; p.capture();
+        release(); await saving;
+        assert.equal(updates.at(-1), '00:30', '新采样导致已经确认的进度始终无法刷新');
+        p._lastKnownState = null; p.destroy();
+    }],
+    ['慢速存储只保留正在保存及最新待保存采样，暂停与离开时保留最新备份', async () => {
+        const { w, p, video } = await setup(); await w.StorageManager._queue;
+        const writes = [], gates = [];
+        w.StorageManager.saveRecord = (key, value) => {
+            writes.push({ key, value }); return new Promise(resolve => gates.push(() => resolve(1)));
+        };
+        const saving = p.saveProgress();
+        for (let i = 31; i <= 1000; i++) { video.currentTime = i; p.saveProgress(); }
+        assert.equal(writes.length, 1, '旧采样在慢速存储下不断入队');
+        const backup = JSON.parse(w.context.localStorage.getItem('BvH_backup_' + key(1)));
+        assert.equal(backup.value.currentTime, '16:40');
+        p.destroy();
+        gates.shift()();
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        assert.equal(writes.length, 2);
+        assert.equal(writes[1].value.currentTime, '16:40');
+        gates.shift()(); await saving;
+        assert.equal(writes.length, 2);
+    }],
+    ['同一秒采样复用身份，已取消提交及旧媒体不能更新新进度', async () => {
+        const { w, p, video, setVideo } = await setup(); await w.StorageManager._queue;
+        video.duration = 1000; video.currentTime = 30.1; const first = p.capture();
+        video.currentTime = 30.9; assert.equal(p.capture(), first);
+        const updates = []; w.UIComponent.updateViewPanelProgress = value => updates.push(value);
+        w.StorageManager.saveRecord = async () => 0;
+        await p.persistSnapshot(); assert.equal(updates.length, 0, '未提交的采样被显示为已保存');
+        let release;
+        w.StorageManager.saveRecord = () => new Promise(resolve => { release = () => resolve(1); });
+        const saving = p.persistSnapshot();
+        const next = media(); next.currentTime = 1; setVideo(next); p.bindVideo(next);
+        release(); await saving;
+        assert.equal(updates.length, 0, '旧媒体保存完成覆盖新媒体显示');
+        p._lastKnownState = null; p.destroy();
+    }],
+    ['回滚或回收批次变化后不提交旧的待存采样，备份保留原批次', async () => {
+        for (const field of ['epoch', 'pruneKey']) {
+            const { w, p, video } = await setup(); await w.StorageManager._queue;
+            const writes = [], updates = [];
+            w.UIComponent.updateViewPanelProgress = record => updates.push(record);
+            let release;
+            w.StorageManager.saveRecord = (key, value) => {
+                writes.push(value); return new Promise(resolve => { release = () => resolve(1); });
+            };
+            const saving = p.saveProgress();
+            video.currentTime = 40; p.saveProgress();
+            const pending = p._lastKnownState;
+            w.StorageManager._store[field] = '合成新批次';
+            p.destroy(); release(); await saving;
+            assert.equal(writes.length, 1, '回滚前采样在新批次中被重新提交');
+            assert.equal(updates.length, 0);
+            w.StorageManager.writeBackup(pending);
+            const backup = JSON.parse(w.context.localStorage.getItem('BvH_backup_' + key(1)));
+            assert.equal(backup[field], pending[field]);
+        }
+    }],
     ['等待续播的元数据回调在会话取消后失效', async () => {
         const { w, video } = await setup(); let valid = true; video.readyState = 0; video.currentTime = 0;
         w.context.sessionStorage.setItem('bvh_pending_seek', JSON.stringify({ key: key(1), currentTime: '00:45', savedAt: w.context.Date.now() }));

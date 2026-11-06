@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.6.0
+// @version      4.6.1
 // @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出与失败诊断、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -899,7 +899,15 @@
                         cachedShards: StorageManager._shardCache?.size || 0,
                         indexedBases: StorageManager._bvBaseIndex?.size || 0,
                         allKeysCached: !!StorageManager._allKeysCache,
-                        allKeysCacheSize: StorageManager._allKeysCache?.length || 0
+                        allKeysCacheSize: StorageManager._allKeysCache?.length || 0,
+                        cachedCommits: StorageManager._store?.commits.size || 0,
+                        cachedCommitEntries: [...(StorageManager._store?.commits.values() || [])].reduce((count, commit) => count + commit.entries.length, 0),
+                        cachedHeaders: StorageManager._store?.headers.size || 0,
+                        viewEntries: StorageManager._store?.entries.size || 0,
+                        queuedWrites: StorageManager._queuedWrites || 0,
+                        syncRetries: StorageManager._store?.scanRetries || 0,
+                        backgroundRunning: !!StorageManager._maintenance,
+                        playback: typeof VideoPlayerObserver === 'undefined' ? null : VideoPlayerObserver.metrics
                     }, null, 2),
                 '',
                 '# 导入失败诊断（无需开启调试，最多保留 20 条）',
@@ -1446,6 +1454,9 @@
             try { return await this.syncing; } finally { this.syncing = null; }
         }
         async _sync() {
+            const verified = new Map();
+            // 并发追加时沿用本轮已完整校验的不可变提交，避免递归保留整批历史副本。
+            for (;;) {
             const keys = await this.io.list();
             const commitKeys = keys.filter(key => key.startsWith('bvh_commit_'));
             if (this._hasView && !this._incomplete && this.seenKeys && commitKeys.length === this.seenKeys.size && commitKeys.every(key => this.seenKeys.has(key))) return new Set();
@@ -1488,6 +1499,7 @@
             });
             const loadedCommits = await readHistoryBatch(commitKeys, async key => {
                 if (this.commits.has(key)) return this.commits.get(key);
+                if (verified.has(key)) return verified.get(key);
                 if (!this.scope) { const commit = await this.readCommit(key); if (!commit) this._incomplete = true; return commit; }
                 const route = covered.has(key) && index.routes?.[key];
                 // v2 路由用 null 标记全局批次；普通无关事务可在读取清单前排除。
@@ -1512,7 +1524,7 @@
             });
             for (let index = 0; index < commitKeys.length; index++) {
                 const key = commitKeys[index], commit = loadedCommits[index];
-                if (commit) commits.set(key, commit);
+                if (commit) { commits.set(key, commit); verified.set(key, commit); }
                 await yieldIfNeeded();
             }
             // 旧索引不包含已删除的 P。批次带出的其他 P 必须追查其分片里的删除标记。
@@ -1525,11 +1537,16 @@
                 const loaded = await readHistoryBatch(extra, ([key, header]) => this.readCommit(key, header));
                 extra.forEach(([key], index) => {
                     skippedLegacy.delete(key);
-                    if (loaded[index]) commits.set(key, loaded[index]); else this._incomplete = true;
+                    if (loaded[index]) { commits.set(key, loaded[index]); verified.set(key, loaded[index]); } else this._incomplete = true;
                 });
             }
             const afterKeys = (await this.io.list()).filter(k => k.startsWith('bvh_commit_')).sort();
-            if (JSON.stringify(afterKeys) !== JSON.stringify(keys.filter(k => k.startsWith('bvh_commit_')).sort())) return this._sync();
+            if (JSON.stringify(afterKeys) !== JSON.stringify(commitKeys.sort())) {
+                this.scanRetries = (this.scanRetries || 0) + 1;
+                const present = new Set(afterKeys);
+                for (const key of verified.keys()) if (!present.has(key)) verified.delete(key);
+                continue;
+            }
             const latestEpoch = [...commits].filter(([, commit]) => ['epoch', 'prune'].includes(commit.manifest.kind))
                 .sort(([a], [b]) => b.localeCompare(a))[0];
             const activeEpoch = latestEpoch?.[1].manifest.epoch || 'initial';
@@ -1577,6 +1594,7 @@
             this.seenKeys = new Set(commitKeys);
             for (const key of this.headers.keys()) if (!this.seenKeys.has(key)) this.headers.delete(key);
             return changed;
+            }
         }
         addBaseline(rawKey, value) {
             const key = VideoKey.normalize(rawKey);
@@ -2224,7 +2242,10 @@
         },
         _enqueue(operation) {
             const s = StorageManager;
-            const promise = s._queue.then(operation); s._queue = promise.catch(() => {}); return promise;
+            s._queuedWrites = (s._queuedWrites || 0) + 1;
+            const promise = s._queue.then(operation), settled = () => { s._queuedWrites--; };
+            promise.then(settled, settled);
+            s._queue = promise.catch(() => {}); return promise;
         },
         saveRecord(key, record, notify = true, options = {}) {
             return StorageManager.saveRecords([{ key, record }], notify, options);
@@ -2372,7 +2393,8 @@
             if (done && pending.length < 128 && !prunePending) {
                 let wide = false;
                 for (const key of pending) {
-                    const manifest = await io.get(key);
+                    // 已校验的清单不可变，避免每次播放保存后重新读取全部待整理清单。
+                    const manifest = s._store.commits.get(key)?.manifest || s._store.headers.get(key) || await io.get(key);
                     if (!Array.isArray(manifest?.bases) || new Set(manifest.bases.map(s._getShardId)).size > 1) { wide = true; break; }
                 }
                 if (!wide) return;
@@ -2407,7 +2429,8 @@
         },
         writeBackup(snapshot) {
             try { localStorage.setItem(BACKUP_PREFIX + snapshot.key, JSON.stringify({ ...snapshot,
-                epoch: StorageManager._store.epoch, pruneKey: StorageManager._store.pruneKey,
+                epoch: snapshot.epoch === undefined ? StorageManager._store.epoch : snapshot.epoch,
+                pruneKey: snapshot.pruneKey === undefined ? StorageManager._store.pruneKey : snapshot.pruneKey,
                 savedAt: snapshot.version?.[0] || Date.now() })); }
             catch (error) { Utils.error('临时备份无法写入', error); }
         },
@@ -3434,9 +3457,9 @@
             if (shouldHideVideoPageFloat()) { FloatingEntry.remove(); return; }
             if (record) FloatingEntry.show(record, bvId);
         },
-        updateViewPanelProgress: record => {
+        updateViewPanelProgress: (record, key) => {
             const state = FloatingEntry.current;
-            if (!state || state.el.id !== 'bvh-view-panel' || !record) return;
+            if (!state || state.el.id !== 'bvh-view-panel' || !record || key && key !== state.key) return;
             FloatingEntry.render(state.el, record, state.key); FloatingEntry.place();
         },
         showQuickEntry: () => {
@@ -4721,16 +4744,17 @@
     // --- 播放器监控层 ---
     class VideoPlayerObserver {
         static retired = new WeakMap();
+        static metrics = { activeSaves: 0, coalesced: 0, completed: 0, failed: 0 };
         constructor(onIdentityChange = null) {
             this.generation = crypto.randomUUID(); this.state = 'waiting'; this.destroyed = false;
             this.onIdentityChange = onIdentityChange; this.cid = null;
             this.bvId = null; this.title = ''; this.videoEl = null; this.hasPlayed = false;
-            this._lastKnownState = null; this._source = ''; this._metadataSeen = false;
+            this._lastKnownState = null; this._source = ''; this._metadataSeen = false; this._mediaGeneration = 0;
             this._onPlay = () => { this.hasPlayed = true; this.saveProgressDebounced(); };
             this._onTimeUpdate = () => { if (this.videoEl?.currentTime > 0) this.hasPlayed = true; this.capture(); this.saveProgressDebounced(); };
             this._onPause = () => { this.capture(); this.persistSnapshot(); };
             this._onBeforeUnload = () => { this.capture(); this.persistSnapshot(); };
-            this._onLoadStart = () => { this.state = 'switching'; this._metadataSeen = false; this._cancelSeek?.(); };
+            this._onLoadStart = () => { this.state = 'switching'; this._mediaGeneration++; this._metadataSeen = false; this._cancelSeek?.(); };
             this._onMetadata = () => {
                 this._metadataSeen = true;
                 if (this._metadataTimer) clearTimeout(this._metadataTimer);
@@ -4782,7 +4806,7 @@
             if (!video || this.destroyed || video === this.videoEl) return;
             this.ensureVisitedRecord();
             this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
-            this.videoEl = video; this._metadataSeen = false; this.state = 'waiting';
+            this.videoEl = video; this._mediaGeneration++; this._metadataSeen = false; this.state = 'waiting';
             this.bindEvents();
             const retired = VideoPlayerObserver.retired.get(video);
             if (!retired || (retired.key === this.bvId && retired.source === (video.currentSrc || video.src || ''))) this.confirmMedia();
@@ -4873,24 +4897,55 @@
             if ((this.videoEl.currentSrc || this.videoEl.src || '') !== this._source) { this.state = 'switching'; return null; }
             const current = this.videoEl.currentTime, duration = this.videoEl.duration;
             if (!Number.isFinite(current) || !Number.isFinite(duration) || duration <= 0 || current < MIN_WATCH_SAVE_SECONDS) return null;
-            if (this._lastKnownState?.seconds === current) return this._lastKnownState;
+            const seconds = Math.floor(current), percent = Math.min(100, Math.round(current / duration * 100)) + '%';
+            if (this._lastKnownState?.seconds === seconds && this._lastKnownState.mediaGeneration === this._mediaGeneration
+                && this._lastKnownState.epoch === StorageManager._store.epoch && this._lastKnownState.pruneKey === StorageManager._store.pruneKey
+                && this._lastKnownState.value.percent === percent && this._lastKnownState.value.title === this.title) return this._lastKnownState;
             const pad = n => String(n).padStart(2, '0');
-            const seconds = Math.floor(current), h = Math.floor(seconds / 3600);
+            const h = Math.floor(seconds / 3600);
             const time = (h ? pad(h) + ':' : '') + pad(Math.floor(seconds % 3600 / 60)) + ':' + pad(seconds % 60);
-            this._lastKnownState = { key: this.bvId, seconds: current, transactionId: StorageManager._store.transactionId(), version: StorageManager.sampleVersion(), value: {
-                v: 3, status: RECORD_STATUS.WATCHED, currentTime: time, percent: Math.min(100, Math.round(current / duration * 100)) + '%',
+            this._lastKnownState = { key: this.bvId, seconds, mediaGeneration: this._mediaGeneration,
+                epoch: StorageManager._store.epoch, pruneKey: StorageManager._store.pruneKey,
+                transactionId: StorageManager._store.transactionId(), version: StorageManager.sampleVersion(), value: {
+                v: 3, status: RECORD_STATUS.WATCHED, currentTime: time, percent,
                 savedAt: Utils.formatTime(), title: this.title
             } };
             return this._lastKnownState;
         }
-        persistSnapshot() {
-            const snapshot = this._lastKnownState;
-            if (!snapshot || snapshot === this._savedSnapshot || snapshot === this._savingSnapshot) return Promise.resolve();
-            StorageManager.writeBackup(snapshot); this._savingSnapshot = snapshot;
-            return StorageManager.saveRecord(snapshot.key, snapshot.value, true, { version: snapshot.version, transactionId: snapshot.transactionId }).then(() => {
-                this._savedSnapshot = snapshot;
-                if (this._lastKnownState === snapshot && !this.destroyed) UIComponent.updateViewPanelProgress(snapshot.value);
-            }).catch(error => { Utils.error('播放进度保存失败，保留原采样备份', error); }).finally(() => { if (this._savingSnapshot === snapshot) this._savingSnapshot = null; });
+        persistSnapshot(snapshot = this._lastKnownState) {
+            if (!snapshot || snapshot === this._savedSnapshot || snapshot === this._savingSnapshot || snapshot === this._pendingSnapshot)
+                return this._saveTask || Promise.resolve();
+            StorageManager.writeBackup(snapshot); this._pendingSnapshot = snapshot;
+            if (this._saveTask) { VideoPlayerObserver.metrics.coalesced++; return this._saveTask; }
+            // 最多一个写入在途、一个最新采样待存；慢扩展不再积压每个旧采样。
+            const flush = async () => {
+                while (this._pendingSnapshot) {
+                    const next = this._pendingSnapshot; this._pendingSnapshot = null; this._savingSnapshot = next;
+                    if (next.epoch !== StorageManager._store.epoch || next.pruneKey !== StorageManager._store.pruneKey) {
+                        this._savingSnapshot = null; continue;
+                    }
+                    VideoPlayerObserver.metrics.activeSaves++;
+                    try {
+                        const count = await StorageManager.saveRecord(next.key, next.value, true, { version: next.version, transactionId: next.transactionId });
+                        if (count > 0) {
+                            this._savedSnapshot = next; VideoPlayerObserver.metrics.completed++;
+                            // 新采样不妨碍显示已确认进度；离开路由或切换媒体后旧结果不能覆盖新界面。
+                            if (this.identityMatches() && this.state === 'bound' && next.mediaGeneration === this._mediaGeneration
+                                && next.epoch === StorageManager._store.epoch && next.pruneKey === StorageManager._store.pruneKey)
+                                UIComponent.updateViewPanelProgress(next.value, next.key);
+                        }
+                    } catch (error) { VideoPlayerObserver.metrics.failed++; Utils.error('播放进度保存失败，保留原采样备份', error); }
+                    finally { this._savingSnapshot = null; VideoPlayerObserver.metrics.activeSaves--; }
+                }
+            };
+            this._saveTask = flush().finally(() => {
+                this._saveTask = null;
+                if (this._pendingSnapshot) {
+                    const next = this._pendingSnapshot; this._pendingSnapshot = null;
+                    return this.persistSnapshot(next);
+                }
+            });
+            return this._saveTask;
         }
         saveProgress() { this.capture(); return this.persistSnapshot(); }
         startVideoWatch() {
