@@ -17,6 +17,67 @@ const setup = async () => {
     return { w, p, get video() { return video; }, setVideo(v) { video = v; }, setKey(k) { currentKey = k; } };
 };
 const cases = [
+    ['分 P 优先保存独立标题，并安全修正同一视频的旧主标题及站点后缀', async () => {
+        const { w, p, video } = await setup(); await w.StorageManager._queue;
+        const base = key(1), second = base + '?p=2', deleted = base + '?p=3';
+        const original = { status: '已观看', currentTime: '05:10', percent: '40%', savedAt: '2026-09-01 09:10:11', title: '合集主标题' };
+        await w.StorageManager.saveRecords([
+            { key: base, record: original },
+            { key: second, record: { ...original, title: '合集主标题_哔哩哔哩_bilibili' } },
+            { key: deleted, record: original }
+        ]);
+        await w.StorageManager.deleteRecords([deleted]);
+        w.context.unsafeWindow = { __INITIAL_STATE__: { bvid: base, videoData: { title: '合集主标题', pages: [
+            { page: 1, cid: 101, part: '01（一之刻）' }, { page: 2, cid: 102, part: '02（二之刻）' }, { page: 3, cid: 103, part: '03（三之刻）' }
+        ] } } };
+        video.paused = true;
+        await p.completeMissingTitle();
+        for (const [id, title] of [[base, '01（一之刻）'], [second, '02（二之刻）']]) {
+            const record = w.StorageManager.getRecord(id);
+            assert.equal(record.title, title);
+            for (const field of ['status', 'currentTime', 'percent', 'savedAt']) assert.equal(record[field], original[field]);
+        }
+        assert.equal(w.StorageManager.getRecord(deleted), null);
+        assert.equal(p.title, '01（一之刻）');
+        assert.equal(p.capture().value.title, '01（一之刻）');
+        const writes = w.shared.calls.filter(call => call.type === 'set').length;
+        await p.completeMissingTitle(); assert.equal(w.shared.calls.filter(call => call.type === 'set').length, writes);
+        p.destroy();
+    }],
+    ['P2 元信息按 page 匹配，已核对页面的列表标题可降级使用且拒绝其他 BV', async () => {
+        const { w, p, setKey } = await setup(); await w.StorageManager._queue;
+        const base = key(1), second = base + '?p=2'; setKey(second); p.bvId = second;
+        w.context.window.__INITIAL_STATE__ = { videoData: { bvid: base, title: '主标题', pages: [
+            { page: 2, part: '02 独立标题' }, { page: 1, part: '01 独立标题' }
+        ] } };
+        assert.equal(p.getConfirmedTitle(), '02 独立标题');
+        delete w.context.window.__INITIAL_STATE__.videoData.pages;
+        w.EpisodeResolver.getItems = () => [{ key: second, title: '02 独立标题_哔哩哔哩_bilibili', el: { matches: () => true } }];
+        assert.equal(p.getConfirmedTitle(), '02 独立标题');
+        w.context.window.__INITIAL_STATE__.videoData.bvid = key(2);
+        assert.equal(p.getConfirmedTitle(), ''); p.destroy();
+    }],
+    ['标题修正合并最新进度，并拒绝覆盖并发新标题或复活删除记录', async () => {
+        const { w, p } = await setup(); await w.StorageManager._queue;
+        const id = key(1);
+        await w.StorageManager.saveRecord(id, { status: '已观看', percent: '54%', currentTime: '05:40', savedAt: '2026-09-06 08:00:00', title: '主标题' });
+        await w.StorageManager.saveRecords([{ key: id, record: { title: '分 P 标题' }, expectedTitle: '主标题' }], true, { source: 'part-title' });
+        assert.equal(w.StorageManager.getRecord(id).percent, '54%'); assert.equal(w.StorageManager.getRecord(id).savedAt, '2026-09-06 08:00:00');
+        await w.StorageManager.saveRecords([{ key: id, record: { title: '迟到修正' }, expectedTitle: '主标题' }], true, { source: 'part-title' });
+        assert.equal(w.StorageManager.getRecord(id).title, '分 P 标题');
+        p.destroy(); await w.StorageManager._queue; await w.StorageManager.deleteRecords([id]);
+        await w.StorageManager.saveRecords([{ key: id, record: { title: '分 P 标题' }, expectedTitle: '分 P 标题' }], true, { source: 'part-title' });
+        assert.equal(w.StorageManager.getRecord(id), null);
+    }],
+    ['官方历史同步提升多 P 进度时保留已有独立标题', async () => {
+        const { w, p } = await setup(); await w.StorageManager._queue;
+        for (const id of [key(1), key(1) + '?p=2']) await w.StorageManager.saveRecord(id, { status: '已观看', percent: '20%', title: '独立分 P 标题', savedAt: '2026-09-06 08:00:00' });
+        for (const id of [key(1), key(1) + '?p=2']) {
+            await w.StorageManager.saveRecord(id, { status: '已观看', percent: '90%', title: '合集主标题', savedAt: '2026-09-06 09:00:00' }, true, { source: 'history' });
+            assert.equal(w.StorageManager.getRecord(id).title, '独立分 P 标题'); assert.equal(w.StorageManager.getRecord(id).percent, '90%');
+        }
+        p.destroy();
+    }],
     ['标题来自站点窗口或顶层 bvid，不依赖沙箱 window', async () => {
         for (const nested of [true, false]) {
             const { w, p, video } = await setup(); await w.StorageManager._queue;

@@ -25,6 +25,11 @@ for (const value of ['', null, false, 'NaN', 101, 60.5]) {
     assert.equal(legacy.CONFIG.floatingOpacity, 100);
 }
 assert.equal(instance().CONFIG.floatingMode, 'detailed');
+assert.equal(instance().CONFIG.floatingEdgeHide, false);
+for (const [value, expected] of [[true, true], [false, false], ['true', false], [1, false], [null, false]]) {
+    shared.data.set('bvh_settings', { floatingEdgeHide: value });
+    assert.equal(instance(shared).CONFIG.floatingEdgeHide, expected);
+}
 for (const [value, expected] of [['small', 92], ['medium', 100], ['large', 108], [123, 123], [79, 100], [161, 100], [90.5, 100], ['', 100]]) {
     shared.data.set('bvh_settings', { floatingSize: value });
     assert.equal(instance(shared).CONFIG.floatingSize, expected);
@@ -193,10 +198,17 @@ try {
     assert.equal(await page.locator('.bvh-setting-groups > .bvh-section:visible').count(), 1);
     assert.equal(await page.locator('.bvh-preview-panel').isVisible(), false);
     assert.equal(await page.locator('.bvh-floating-preview-panel').isVisible(), false);
+    const multiDetail = page.locator('[data-setting="showMultiPageHistory"]');
+    assert.equal(await multiDetail.isChecked(), false);
+    await multiDetail.check();
+    assert.equal(await page.evaluate(() => testAPI.CONFIG.showMultiPageHistory), false, '多 P 详情草稿不应提前生效');
     await page.locator('.bvh-settings-nav [data-settings-group=floating]').click();
     const field = key => page.locator(`[data-setting="${key}"]`);
     const actualStyle = () => entry.evaluate(el => ({ bg: getComputedStyle(el).backgroundColor, mode: el.dataset.mode, theme: el.dataset.theme }));
     const originalStyle = await actualStyle();
+    assert.equal(await field('floatingEdgeHide').isChecked(), false);
+    await field('floatingEdgeHide').check();
+    assert.equal(await page.evaluate(() => testAPI.CONFIG.floatingEdgeHide), false, '贴边隐藏草稿提前生效');
     await field('floatingTheme').selectOption('dark');
     await page.locator('#bvh-floatingSize').fill('123');
     assert.equal(await field('floatingSize').first().inputValue(), '123');
@@ -254,6 +266,8 @@ try {
     assert.deepEqual(await actualStyle(), previewStyle);
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingOpacity), 75);
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingSize), 123);
+    assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingEdgeHide), true);
+    assert.equal(await page.evaluate(() => gmData.get('bvh_settings').showMultiPageHistory), true);
 
     await field('floatingTheme').selectOption('light');
     await page.locator('[data-close]').click();
@@ -282,6 +296,7 @@ try {
     await page.locator('[data-action=floating-defaults]').click();
     assert.equal(await field('floatingTheme').inputValue(), 'light');
     assert.equal(await field('floatingMode').inputValue(), 'detailed');
+    assert.equal(await field('floatingEdgeHide').isChecked(), false);
     assert.deepEqual(await page.evaluate(() => ({ tagOpacity: panel.draft.tagOpacity, visibility: panel.draft.floatingButtonVisibility })), otherSettings);
     assert.deepEqual(await page.evaluate(() => gmData.get('bvh_panel_position')), { left: '70px', top: '100px' });
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingMode), 'compact', '局部恢复提前写入');
@@ -289,6 +304,7 @@ try {
     await page.locator('[data-action=reset-position]').click();
     assert.equal(await page.evaluate(() => gmData.has('bvh_panel_position')), false);
     await page.locator('[data-action=defaults]').click();
+    assert.equal(await multiDetail.isChecked(), false);
     assert.equal(await field('floatingButtonVisibility').inputValue(), 'show-all');
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingButtonVisibility), 'hide-all');
     await page.locator('[data-action=save]').click(); await page.waitForFunction(() => !panel.saving && !panel.dirty);

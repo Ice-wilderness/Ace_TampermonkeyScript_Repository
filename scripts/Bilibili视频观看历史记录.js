@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.6.5
-// @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出与失败诊断、官方历史页同步及可选 WebDAV 云同步与日期备份。
+// @version      4.7.0
+// @description  记录并提示 Bilibili 视频观看进度，支持分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -54,9 +54,10 @@
 
     const FLOATING_STYLE_DEFAULTS = {
         floatingTheme: 'light', floatingAccentColor: '#00aeec', floatingSize: 100,
-        floatingOpacity: 100, floatingMode: 'detailed'
+        floatingOpacity: 100, floatingMode: 'detailed', floatingEdgeHide: false
     };
     const isFloatingStyleValid = (key, value) => {
+        if (key === 'floatingEdgeHide') return typeof value === 'boolean';
         if (key === 'floatingSize') return /^\d+$/.test(String(value ?? '')) && Number(value) >= 80 && Number(value) <= 160;
         if (key === 'floatingOpacity') return /^(?:\d+)$/.test(String(value ?? '')) && Number(value) >= 60 && Number(value) <= 100;
         if (key === 'floatingAccentColor') return /^#[0-9a-f]{6}$/i.test(value);
@@ -94,6 +95,7 @@
         ...TAG_STYLE_DEFAULTS,
         showProgressBar: true,
         showVisitedTag: true,
+        showMultiPageHistory: false,
         debug: false,
         tagOpacity: 100,
         tagPosition: 'top-left',
@@ -106,6 +108,7 @@
     const CONFIG = Object.assign({}, DEFAULT_CONFIG, GM_getValue('bvh_settings', {}));
     Object.assign(CONFIG, normalizeTagStyle(CONFIG));
     Object.assign(CONFIG, normalizeFloatingStyle(CONFIG));
+    CONFIG.showMultiPageHistory = CONFIG.showMultiPageHistory === true;
 
     const getFloatingButtonVisibility = () => (
         FLOATING_BUTTON_VISIBILITY_VALUES.includes(CONFIG.floatingButtonVisibility)
@@ -341,6 +344,7 @@
     let stylesInjected = false;
     const injectStyles = () => {
         if (stylesInjected) return;
+        const multi = ':is(#bvh-multi-history, .bvh-multi-history).bvh-multi-history';
         try {
             GM_addStyle(`
         .bvh-tag { position: absolute; margin: .5em!important; padding: 0 5px!important; height: 20px; line-height: 20px; border-radius: 4px; color: #fff; font-style: normal; font-size: 12px; white-space: nowrap; background-color: rgba(122, 134, 234, 0.7); z-index: 108; pointer-events: none; }
@@ -377,12 +381,62 @@
         .bvh-progress-toast.is-pending .bvh-toast-progress-fill { width: 35%; animation: bvh-undo-pending 1.2s ease-in-out infinite alternate; }
         @keyframes bvh-undo-pending { from { transform: translateX(0); } to { transform: translateX(185%); } }
         @media (prefers-reduced-motion: reduce) { .bvh-progress-toast.is-pending .bvh-toast-progress-fill { animation: none; } }
-        .bvh-floating-entry { position: fixed; left: 15px; bottom: 15px; z-index: 9999; box-sizing: border-box; width: max-content; max-width: min(12em, calc(100vw - 16px)); min-width: 44px; min-height: 36px; margin: 0; padding: .7em .8em; border: 1px solid var(--bvh-float-line); border-radius: .9em; background: var(--bvh-float-bg); color: var(--bvh-float-ink); font: 500 var(--bvh-float-font)/1.35 "HarmonyOS Sans SC","Microsoft YaHei",sans-serif; font-variant-numeric: tabular-nums; text-align: left; box-shadow: 0 3px 12px #14253618, 0 1px 2px #14253612; cursor: pointer; user-select: none; touch-action: none; appearance: none; transition: box-shadow .16s ease; }
+        .bvh-floating-entry { position: fixed; left: 15px; bottom: 15px; z-index: 9999; box-sizing: border-box; width: max-content; max-width: min(12em, calc(100vw - 16px)); min-width: 44px; min-height: 36px; margin: 0; padding: .7em .8em; border: 1px solid var(--bvh-float-line); border-radius: .9em; background: var(--bvh-float-bg); color: var(--bvh-float-ink); font: 500 var(--bvh-float-font)/1.35 "HarmonyOS Sans SC","Microsoft YaHei",sans-serif; font-variant-numeric: tabular-nums; text-align: left; box-shadow: 0 3px 12px #14253618, 0 1px 2px #14253612; cursor: pointer; user-select: none; touch-action: none; appearance: none; transition: transform .24s cubic-bezier(.22, 1, .36, 1), box-shadow .16s ease; }
         .bvh-floating-entry *, .bvh-floating-entry *::before { box-sizing: border-box; }
         .bvh-floating-entry [hidden] { display: none !important; }
         .bvh-floating-entry:hover { box-shadow: 0 4px 16px #1425362b, 0 1px 3px #14253618; }
         .bvh-floating-entry:focus-visible { outline: 3px solid var(--bvh-float-ink); outline-offset: 3px; }
         .bvh-floating-entry[data-dragging=true] { cursor: grabbing; transition: none; }
+        .bvh-floating-entry > * { transition: opacity .16s ease; }
+        .bvh-floating-entry[data-collapsed=true] > * { opacity: 0; }
+        .bvh-floating-entry::after { content: ''; position: absolute; top: calc(50% - 9px); width: 3px; height: 18px; border-radius: 3px; background: var(--bvh-float-accent); opacity: 0; transition: opacity .16s ease; pointer-events: none; }
+        .bvh-floating-entry[data-collapsed=true]::after { opacity: 1; }
+        .bvh-floating-entry[data-dock=left]::after { right: 3px; }
+        .bvh-floating-entry[data-dock=right]::after { left: 3px; }
+        ${multi} { position: fixed; inset: auto; z-index: 2147482800; box-sizing: border-box; display: flex; flex-direction: column; width: min(340px, calc(100vw - 16px)); max-width: calc(100vw - 16px); height: auto; max-height: min(430px, calc(100dvh - 16px)); margin: 0; padding: 0; border: 1px solid var(--bvh-multi-line); border-radius: 14px; background: var(--bvh-multi-paper); color: var(--bvh-multi-ink); font: 400 13px/1.55 "HarmonyOS Sans SC","Microsoft YaHei",sans-serif; font-variant-numeric: tabular-nums; text-align: left; white-space: normal; box-shadow: 0 14px 36px #1425361f, 0 2px 8px #1425360a; animation: bvh-multi-enter .16s ease-out both; }
+        ${multi} * { box-sizing: border-box; margin: 0; padding: 0; border: 0; font: inherit; color: inherit; text-align: inherit; letter-spacing: normal; text-indent: 0; white-space: normal; }
+        ${multi}[popover] { overflow: visible; }
+        ${multi}::backdrop { background: transparent; pointer-events: none; }
+        ${multi}[data-side]::before { content: ''; position: absolute; top: 0; bottom: 0; width: 8px; }
+        ${multi}[data-side=left]::before { right: -8px; }
+        ${multi}[data-side=right]::before { left: -8px; }
+        ${multi}[data-inline=true] { position: relative; inset: auto; width: auto; max-width: 100%; margin: 8px 0; }
+        ${multi}.bvh-multi-leaving { pointer-events: none; animation: bvh-multi-exit .12s ease-in both; }
+        @keyframes bvh-multi-enter { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes bvh-multi-exit { from { opacity: var(--bvh-multi-exit-opacity, 1); } to { opacity: 0; } }
+        ${multi} .bvh-multi-heading, ${multi} .bvh-multi-heading>span, ${multi} .bvh-multi-status { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        ${multi} .bvh-multi-heading { flex-shrink: 0; padding: 14px 16px 12px; border-bottom: 1px solid var(--bvh-multi-line); }
+        ${multi} .bvh-multi-heading { flex-wrap: wrap; }
+        ${multi} .bvh-multi-tools { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+        ${multi} .bvh-multi-refresh { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-width: 62px; min-height: 26px; padding: 3px 7px; border: 1px solid var(--bvh-multi-line); border-radius: 6px; background: var(--bvh-multi-paper); color: var(--bvh-multi-ink); font: inherit; font-size: 10px; line-height: 1.5; white-space: nowrap; cursor: pointer; }
+        ${multi} .bvh-multi-refresh:hover:not(:disabled) { background: var(--bvh-multi-soft); border-color: var(--bvh-multi-accent); }
+        ${multi} .bvh-multi-refresh:focus-visible { outline: 2px solid var(--bvh-multi-accent); outline-offset: 2px; }
+        ${multi} .bvh-multi-refresh:disabled { opacity: .6; cursor: wait; }
+        ${multi} .bvh-multi-icon { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; background: var(--bvh-multi-soft); }
+        ${multi} .bvh-multi-heading svg { display: block; width: 15px; height: 15px; color: var(--bvh-multi-accent); }
+        ${multi} .bvh-multi-heading strong { font-size: 13px; font-weight: 600; }
+        ${multi} .bvh-multi-heading small { flex-shrink: 0; padding: 2px 7px; border: 1px solid var(--bvh-multi-line); border-radius: 999px; font-size: 10px; color: var(--bvh-multi-muted); }
+        ${multi}[data-shared-title=true] .bvh-multi-heading { padding-bottom: 8px; border-bottom: 0; }
+        ${multi} .bvh-multi-video-title { flex-shrink: 0; padding: 0 16px 12px; border-bottom: 1px solid var(--bvh-multi-line); font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+        ${multi} .bvh-multi-video-title>span, ${multi} .bvh-multi-title { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        ${multi} .bvh-multi-rows { min-height: 0; padding: 0 16px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+        ${multi} .bvh-multi-row { display: flex; align-items: flex-start; gap: 10px; padding: 12px 0; }
+        ${multi} .bvh-multi-row+.bvh-multi-row { border-top: 1px solid var(--bvh-multi-line); }
+        ${multi} .bvh-multi-page { flex-shrink: 0; min-width: 32px; padding: 3px 6px; border-radius: 6px; background: var(--bvh-multi-surface); color: var(--bvh-multi-muted); font-size: 11px; font-weight: 600; text-align: center; }
+        ${multi} .bvh-multi-detail { flex: 1; min-width: 0; }
+        ${multi} .bvh-multi-title { margin-bottom: 5px; font-size: 12px; font-weight: 500; overflow-wrap: anywhere; }
+        ${multi} .bvh-multi-status { font-size: 12px; overflow-wrap: anywhere; }
+        ${multi} .bvh-multi-status strong { display: flex; align-items: center; flex-shrink: 0; gap: 4px; color: var(--bvh-multi-ink); font-size: 11px; font-weight: 600; }
+        ${multi} .bvh-multi-row[data-complete=true] .bvh-multi-status strong { color: var(--bvh-multi-complete); }
+        ${multi} .bvh-multi-status svg { width: 12px; height: 12px; }
+        ${multi} .bvh-multi-track { height: 3px; margin: 7px 0; border-radius: 3px; background: var(--bvh-multi-line); overflow: hidden; }
+        ${multi} .bvh-multi-track>span { display: block; height: 100%; border-radius: inherit; background: var(--bvh-multi-progress); }
+        ${multi} .bvh-multi-row[data-complete=true] .bvh-multi-track>span { background: var(--bvh-multi-complete); opacity: .55; }
+        ${multi} .bvh-multi-detail time { display: block; margin-top: 6px; font-size: 10px; line-height: 1.4; color: var(--bvh-multi-muted); }
+        ${multi} .bvh-multi-note { display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding: 9px 16px; border-top: 1px solid var(--bvh-multi-line); border-radius: 0 0 13px 13px; background: var(--bvh-multi-surface); color: var(--bvh-multi-muted); font-size: 10px; }
+        ${multi} .bvh-multi-note::before { content: ''; width: 4px; height: 4px; border-radius: 50%; background: currentColor; opacity: .5; }
+        ${multi} .bvh-multi-note[data-state=error] { color: var(--bvh-multi-error); }
+        ${multi} .bvh-multi-note[data-state=success] { color: var(--bvh-multi-complete); }
         .bvh-float-heading { display: flex; align-items: center; gap: .5em; min-width: 0; }
         .bvh-float-icon { display: grid; place-items: center; color: var(--bvh-float-accent); flex: 0 0 auto; }
         .bvh-float-icon svg { width: 1.25em; height: 1.25em; }
@@ -399,7 +453,7 @@
         .bvh-floating-entry[data-mode=compact] .bvh-float-heading { flex-wrap: nowrap; }
         .bvh-float-compact-percent { font-size: .92em; margin-left: 3px; color: var(--bvh-float-muted); flex-shrink: 0; }
         .bvh-floating-entry.bvh-floating-preview { position: relative; inset: auto; z-index: auto; max-width: 100%; cursor: default; touch-action: auto; }
-        @media(prefers-reduced-motion:reduce) { .bvh-floating-entry { transition: none; } }
+        @media(prefers-reduced-motion:reduce) { .bvh-floating-entry, .bvh-floating-entry > *, .bvh-floating-entry::after { transition: none; } .bvh-multi-history { animation: none !important; } }
         .bvh-history-sync-float { position: fixed; right: 22px; bottom: 86px; z-index: 9998; border: 1px solid #00aeec; background: #00aeec; color: #fff; border-radius: 6px; padding: 9px 13px; cursor: pointer; font-weight: 800; font-size: 13px; line-height: 1.2; box-shadow: 0 4px 16px rgba(0,174,236,.28); transition: opacity .18s ease, transform .18s ease, background .18s ease; }
         .bvh-history-sync-float:hover { background: #0097d8; transform: translateY(-1px); }
         .bvh-history-sync-float.loading, .bvh-history-sync-float:disabled { opacity: .72; cursor: wait; transform: none; }
@@ -981,6 +1035,7 @@
         ...Object.keys(TAG_STYLE_DEFAULTS),
         'showProgressBar',
         'showVisitedTag',
+        'showMultiPageHistory',
         'tagOpacity',
         'tagPosition',
         'lowThreshold',
@@ -992,6 +1047,7 @@
             const next = Object.assign({}, CONFIG, patch);
             Object.assign(next, normalizeTagStyle(next));
             Object.assign(next, normalizeFloatingStyle(next));
+            next.showMultiPageHistory = next.showMultiPageHistory === true;
             await HistoryStoreIO.set('bvh_settings', next);
             Object.assign(CONFIG, next);
             if (patch.debug) Utils.installIssueHooks();
@@ -1182,6 +1238,60 @@
         getPageLabel: (keyOrPage) => {
             const page = typeof keyOrPage === 'number' ? keyOrPage : VideoKey.page(keyOrPage);
             return `P${page || 1}`;
+        },
+        cleanTitle: value => String(value || '').trim().replace(/\s*(?:[_-]\s*哔哩哔哩(?:[_-]bilibili)?|_\s*bilibili)\s*$/i, '').trim(),
+        getTitleInfo: base => {
+            const info = { title: '', parts: new Map(), confirmed: false };
+            for (const state of [Utils._getPageWindow()?.__INITIAL_STATE__, window.__INITIAL_STATE__]) {
+                const data = state?.videoData, id = data?.bvid || state?.bvid;
+                if (!id || VideoKey.base(id) !== base) continue;
+                info.confirmed = true;
+                info.title ||= EpisodeResolver.cleanTitle(data?.title);
+                if (!Array.isArray(data?.pages)) continue;
+                data.pages.forEach((part, index) => {
+                    const page = part?.page ?? index + 1, title = typeof part?.part === 'string' ? EpisodeResolver.cleanTitle(part.part) : '';
+                    if (Number.isSafeInteger(page) && page > 0 && title) info.parts.set(VideoKey.withPage(base, page), title);
+                });
+            }
+            return info;
+        },
+        resolvePartTitle: (key, storedTitle, info) => {
+            const stored = EpisodeResolver.cleanTitle(storedTitle), part = info.parts.get(key);
+            // 已保存的独立标题可能来自手动刷新，不让仍在播放的旧页面元数据把它改回去。
+            return part && (!stored || stored === info.title || stored === part) ? part : stored;
+        },
+        fetchTitleInfo: base => {
+            if (!/^(?:BV[A-Za-z0-9]{10}|av[0-9]+)$/.test(base)) return Promise.reject(new Error('视频编号无效'));
+            if (typeof GM_xmlhttpRequest !== 'function') return Promise.reject(new Error('用户脚本管理器不支持标题请求'));
+            const query = base.startsWith('av') ? `aid=${encodeURIComponent(base.slice(2))}` : `bvid=${encodeURIComponent(base)}`;
+            return new Promise((resolve, reject) => {
+                GM_xmlhttpRequest({ method: 'GET', url: `https://api.bilibili.com/x/web-interface/view?${query}`, responseType: 'json', timeout: 15000,
+                    headers: { Accept: 'application/json', Referer: 'https://www.bilibili.com/' },
+                    onload: response => {
+                        try {
+                            if ([412, 429].includes(response.status)) throw new Error('B 站请求受限，请稍后重试');
+                            if (response.status !== 200) throw new Error(`获取标题失败（HTTP ${response.status}）`);
+                            const body = response.response && typeof response.response === 'object' ? response.response : JSON.parse(response.responseText || response.response || '');
+                            if (body.code !== 0) throw new Error([-352, -412].includes(body.code) ? 'B 站请求受限，请稍后重试' : `B 站未能返回标题（${body.code ?? '未知错误'}）`);
+                            const data = body.data;
+                            const matches = base.startsWith('av') ? String(data?.aid) === base.slice(2).replace(/^0+(?=\d)/, '') : data?.bvid === base;
+                            if (!matches || !Array.isArray(data.pages) || !data.pages.length) throw new Error('返回的视频信息不匹配，已保留原标题');
+                            const info = { title: EpisodeResolver.cleanTitle(data.title), parts: new Map(), confirmed: true };
+                            for (const part of data.pages) {
+                                const title = typeof part?.part === 'string' ? EpisodeResolver.cleanTitle(part.part) : '';
+                                if (!Number.isSafeInteger(part?.page) || part.page < 1 || !title) throw new Error('返回的分 P 标题不完整，已保留原标题');
+                                const key = VideoKey.withPage(base, part.page);
+                                if (info.parts.has(key)) throw new Error('返回的分 P 编号重复，已保留原标题');
+                                info.parts.set(key, title);
+                            }
+                            resolve(info);
+                        } catch (error) { reject(error instanceof SyntaxError ? new Error('标题响应格式无效，请稍后重试') : error); }
+                    },
+                    onerror: () => reject(new Error('网络请求失败，请稍后重试')),
+                    ontimeout: () => reject(new Error('获取标题超时，请稍后重试')),
+                    onabort: () => reject(new Error('标题请求已取消'))
+                });
+            });
         },
         getLatestRecord: (base) => {
             const done = Utils.debugTime('EpisodeResolver.getLatestRecord');
@@ -2696,10 +2806,16 @@
                         const title = record.n.trim();
                         Object.assign(record, current.record, { n: title });
                     }
+                    if (source === 'part-title') {
+                        // 只修正采样时核对过的标题；提交时保留最新进度、时间及删除状态。
+                        if (!current || current.deleted || (current.record.n || '') !== item.expectedTitle || !record.n?.trim()) continue;
+                        Object.assign(record, current.record, { n: record.n.trim() });
+                    }
                     if (source === 'history' && current && !current.deleted) {
                         if (record.p - current.record.p <= 5) continue;
                         if (!record.t) record.t = current.record.t;
                         if (!record.n) record.n = current.record.n;
+                        if (current.record.n && (VideoKey.page(key) > 1 || s._bvBaseIndex.get(VideoKey.base(key))?.size > 1)) record.n = current.record.n;
                     }
                     if (source === 'backup' && current && HistoryCommitStore.compare(version, current.version) <= 0) continue;
                     if (source === 'undo' && (!current?.deleted || current.deleteId !== options.deleteId)) continue;
@@ -3705,7 +3821,7 @@
         readPosition() {
             const pos = GM_getValue('bvh_panel_position');
             return pos && ['left', 'top'].every(key => typeof pos[key] === 'string' && /^-?\d+(?:\.\d+)?px$/.test(pos[key]) && Number.isFinite(parseFloat(pos[key])))
-                ? { left: parseFloat(pos.left), top: parseFloat(pos.top) } : null;
+                ? { left: parseFloat(pos.left), top: parseFloat(pos.top), ...(['left', 'right'].includes(pos.dock) ? { dock: pos.dock } : {}) } : null;
         },
         place() {
             const state = this.current;
@@ -3713,8 +3829,16 @@
             const { el, position } = state, rect = el.getBoundingClientRect();
             const width = document.documentElement.clientWidth, height = window.innerHeight;
             const limit = (value, extent, size) => Math.max(8, Math.min(value, Math.max(8, extent - size - 8)));
-            if (position) Object.assign(el.style, { left: `${limit(position.left, width, rect.width)}px`, top: `${limit(position.top, height, rect.height)}px`, bottom: 'auto' });
+            const desiredLeft = CONFIG.floatingEdgeHide && position?.dock ? (position.dock === 'left' ? 8 : width - rect.width - 8) : position?.left;
+            if (position) Object.assign(el.style, { left: `${limit(desiredLeft, width, rect.width)}px`, top: `${limit(position.top, height, rect.height)}px`, bottom: 'auto' });
             else Object.assign(el.style, { left: `${limit(15, width, rect.width)}px`, top: 'auto', bottom: `${Math.min(15, Math.max(8, height - rect.height - 8))}px` });
+            let left = parseFloat(el.style.left);
+            const right = width - left - rect.width;
+            const side = CONFIG.floatingEdgeHide ? (left <= 24 ? 'left' : right <= 24 ? 'right' : '') : '';
+            if (side) { left = side === 'left' ? 0 : width - rect.width; el.style.left = `${left}px`; }
+            const collapsed = !!side && !state.hovered && !state.focused && !state.dragging;
+            el.dataset.dock = side; el.dataset.collapsed = String(collapsed);
+            el.style.transform = collapsed ? `translateX(${side === 'left' ? 12 - left - rect.width : width - left - 12}px)` : '';
         },
         resetPosition() {
             GM_deleteValue('bvh_panel_position');
@@ -3749,16 +3873,19 @@
                     if (cancelled) state.position = previous.position;
                     else {
                         const rect = el.getBoundingClientRect(); state.position = { left: rect.left, top: rect.top };
-                        GM_setValue('bvh_panel_position', { left: `${rect.left}px`, top: `${rect.top}px` });
+                        const dock = CONFIG.floatingEdgeHide && el.dataset.dock ? { dock: el.dataset.dock } : {};
+                        Object.assign(state.position, dock);
+                        GM_setValue('bvh_panel_position', { left: `${rect.left}px`, top: `${rect.top}px`, ...dock });
                     }
                 }
-                el.removeAttribute('data-dragging');
+                state.dragging = false; el.removeAttribute('data-dragging');
                 if (el.hasPointerCapture(previous.id)) el.releasePointerCapture(previous.id);
                 this.place();
             };
             const down = event => {
                 if (event.button !== 0 || !event.isPrimary) return;
                 suppressClick = false;
+                state.dragging = true; state.focused = false; el.dataset.dragging = 'true'; this.place();
                 const rect = el.getBoundingClientRect();
                 drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: rect.left, top: rect.top, moved: false, position: state.position && { ...state.position } };
                 el.setPointerCapture(event.pointerId);
@@ -3778,7 +3905,12 @@
                 UIComponent.showManagerPanel({ activeTab: 'settings', ...(state.key ? { currentKey: state.key } : {}) });
             };
             const resize = () => this.place();
-            const events = { pointerdown: down, pointermove: move, pointerup: up, pointercancel: cancel, lostpointercapture: cancel, click };
+            const enter = () => { state.hovered = true; this.place(); };
+            const leave = () => { state.hovered = false; this.place(); };
+            const focus = () => { state.focused = el.matches(':focus-visible'); this.place(); };
+            const blur = () => { state.focused = false; this.place(); };
+            const events = { pointerdown: down, pointermove: move, pointerup: up, pointercancel: cancel, lostpointercapture: cancel, click,
+                pointerenter: enter, pointerleave: leave, focus, blur };
             for (const [type, handler] of Object.entries(events)) el.addEventListener(type, handler);
             window.addEventListener('resize', resize);
             state.cancelDrag = () => finish(true);
@@ -4200,7 +4332,7 @@
             this.unsubscribe = StorageManager.onDataChange(change => {
                 if (this.disposed) return;
                 for (const key of this.selected) if (!StorageManager.getRecord(key)) this.selected.delete(key);
-                if (this.tab === 'history' || this.tab === 'stats') this.refresh();
+                if (this.tab === 'history' || this.tab === 'stats') this.refresh({ background: true });
             });
         }
         q(selector) { return this.root.querySelector(selector); }
@@ -4320,6 +4452,7 @@
                 <div class="bvh-setting-row"><label for="bvh-floatingSize">入口大小<small>按比例调整文字与留白。</small></label><div><div class="bvh-opacity"><input type="range" data-setting="floatingSize" min="80" max="160" value="${esc(d.floatingSize)}" aria-label="悬浮入口大小滑块"><input id="bvh-floatingSize" type="number" data-setting="floatingSize" min="80" max="160" step="1" value="${esc(d.floatingSize)}" aria-describedby="bvh-error-floatingSize"><span>%</span></div><small class="bvh-field-error" id="bvh-error-floatingSize"></small></div></div>
                 <div class="bvh-setting-row"><label for="bvh-floatingOpacity">背景不透明度<small>文字始终保持清晰。</small></label><div><div class="bvh-opacity"><input type="range" data-setting="floatingOpacity" min="60" max="100" value="${esc(d.floatingOpacity)}" aria-label="悬浮背景不透明度滑块"><input id="bvh-floatingOpacity" type="number" data-setting="floatingOpacity" min="60" max="100" step="1" value="${esc(d.floatingOpacity)}" aria-describedby="bvh-error-floatingOpacity"><span>%</span></div><small class="bvh-field-error" id="bvh-error-floatingOpacity"></small></div></div>
                 ${field('floatingMode', '信息模式', [['compact', '简洁 · 胶囊'], ['detailed', '详细 · 小卡片']])}
+                <div class="bvh-setting-row"><label for="bvh-floatingEdgeHide">贴边隐藏<small>默认关闭。拖到左侧或右侧边缘后收起，鼠标移入或键盘聚焦时展开。</small></label><input class="bvh-switch" id="bvh-floatingEdgeHide" data-setting="floatingEdgeHide" type="checkbox" ${d.floatingEdgeHide ? 'checked' : ''}></div>
                 <div class="bvh-floating-samples" aria-label="悬浮入口外观预览"><div><span class="bvh-help">视频页 · 示例</span><div class="bvh-floating-preview" data-floating-preview="video"></div></div><div><span class="bvh-help">其他页面</span><div class="bvh-floating-preview" data-floating-preview="quick"></div></div></div>
                 <p class="bvh-help">预览不会改变页面入口，保存后生效。实际入口可拖拽移动。</p><button data-action="floating-defaults">恢复悬浮外观默认</button></details>`;
         }
@@ -4404,7 +4537,7 @@
             const threshold = (key, label) => `<label class="bvh-number-field">${label}<div><input id="bvh-setting-${key}" data-setting="${key}" type="number" min="1" max="99" value="${esc(d[key])}" aria-describedby="bvh-error-${key}"><span>%</span></div><small class="bvh-field-error" id="bvh-error-${key}"></small></label>`;
             this.q('[data-pane="settings"]').innerHTML = `<div class="bvh-settings-layout"><div class="bvh-setting-groups">
                 <section class="bvh-section"><div class="bvh-section-heading"><span>01</span><h2>播放与提示</h2></div>${toggle('autoResumePrompt', '续播提示', '再次打开视频时，提示上次观看的位置。')}<div class="bvh-setting-row"><label for="bvh-setting-floatingButtonVisibility">悬浮入口<small>选择在哪些页面显示快捷入口。</small></label><select id="bvh-setting-floatingButtonVisibility" data-setting="floatingButtonVisibility">${[['show-all', '所有页面显示'], ['hide-video', '仅非视频页显示'], ['hide-non-video', '仅视频页显示'], ['hide-all', '全部隐藏']].map(([value, text]) => `<option value="${value}" ${d.floatingButtonVisibility === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div></section>
-                <section class="bvh-section"><div class="bvh-section-heading"><span>02</span><h2>页面标记</h2></div>${toggle('showProgressBar', '观看进度条', '在视频封面上显示已观看的进度。')}${toggle('showVisitedTag', '已访问标签', '标记打开过、但还未开始观看的视频。')}</section>
+                <section class="bvh-section"><div class="bvh-section-heading"><span>02</span><h2>页面标记</h2></div>${toggle('showProgressBar', '观看进度条', '在视频封面上显示已观看的进度。')}${toggle('showVisitedTag', '已访问标签', '标记打开过、但还未开始观看的视频。')}${toggle('showMultiPageHistory', '多 P 悬停详情', '默认关闭。悬停显示分 P 记录；收藏夹、历史记录等悬浮菜单内优先在侧边显示，空间不足时在列表内展开。')}</section>
                 <section class="bvh-section"><div class="bvh-section-heading"><span>03</span><h2>标签样式</h2></div><fieldset class="bvh-position"><legend>标签位置</legend><div>${[['top-left', '左上'], ['top-right', '右上'], ['bottom-left', '左下'], ['bottom-right', '右下']].map(([value, label]) => `<label><input type="radio" name="bvh-position" data-setting="tagPosition" value="${value}" ${d.tagPosition === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset><div class="bvh-setting-row"><label for="bvh-opacity-number">标签透明度<small>数值越高，标签越清晰。</small></label><div class="bvh-opacity"><input aria-label="标签透明度滑块" type="range" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><input id="bvh-opacity-number" type="number" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><span>%</span></div></div><div class="bvh-thresholds">${threshold('lowThreshold', '低进度分界')}${threshold('highThreshold', '高进度分界')}</div><p class="bvh-help">低于低分界为低进度；超过高分界为高进度。</p></section>
                 ${this.renderTagStyleSettings()}
                 <section class="bvh-section"><div class="bvh-section-heading"><span>05</span><h2>诊断与维护</h2></div>${toggle('debug', '调试日志', '需要排查问题时开启。导入失败诊断会自动保留，无需开启此开关。')}<div class="bvh-maintenance-links"><button data-action="download-log">下载日志</button><button data-action="download-import-diagnostic">下载导入诊断</button><button data-action="clear-log">清空日志</button><button data-action="reset-position">恢复悬浮位置</button>${this.options.currentKey && StorageManager.getRecord(this.options.currentKey)?.currentTime ? '<button data-action="jump">跳转到已记录进度</button>' : ''}</div><details class="bvh-storage-tools"><summary>存储维护</summary><p class="bvh-help">以下离线操作需要先关闭其他所有运行本脚本的页面。</p><button data-action="staging-info">检查暂存数据</button><button data-action="cleanup-staging">离线清理暂存数据</button><button data-action="legacy-snapshot">生成旧版兼容快照</button><p data-storage-info role="status"></p></details></section>
@@ -4441,27 +4574,63 @@
         historyShell() {
             this.q('[data-pane="history"]').innerHTML = `<div class="bvh-search-row"><label class="bvh-search">${workbenchIcon('history')}<input data-query aria-label="搜索标题或视频编号" placeholder="搜索视频标题、BV / AV 编号…"></label><button data-action="clear-query">清除</button></div><div class="bvh-history-tools"><label>状态 <select data-filter="status"><option value="all">全部记录</option><option>已观看</option><option>已访问</option></select></label><label>排序 <select data-filter="sort"><option value="savedAt-desc">最近保存优先</option><option value="savedAt-asc">最早保存优先</option><option value="percent-desc">进度从高到低</option><option value="percent-asc">进度从低到高</option><option value="title-asc">标题顺序</option></select></label><div class="bvh-tool-spacer"></div><button data-action="import">导入</button><button data-action="export">导出 JSON</button><button data-action="export-csv">导出 CSV</button></div><div class="bvh-selection-bar"><span data-selection-info>选择记录后可批量操作</span><button data-action="clear-selection">取消选择</button><button class="danger" data-action="delete-selected" disabled>删除选中</button></div><div data-results aria-live="polite"></div><details class="bvh-retention"><summary>数据维护 · 清理久远记录</summary><div><label>保留最近 <input data-retention-value type="number" min="1" step="1" value="6" aria-label="保留数量"></label><select data-retention-unit aria-label="保留时间单位"><option value="months">个月</option><option value="days">天</option><option value="years">年</option></select><button class="danger" data-action="retention">检查清理范围</button></div><p>清理全部历史中的过期记录，不受搜索、筛选或勾选范围影响；确认前会显示截止时间和记录数量。</p></details>`;
         }
-        async refresh() {
+        async refresh({ background = false } = {}) {
             if (this.tab === 'settings' || this.disposed) return;
             if (this.tab === 'cloud') { this.updateCloudStatus(WebDavSync._status); this.loadCloudBackups(); return; }
             const generation = ++this.generation, tab = this.tab;
             const target = this.q(tab === 'history' ? '[data-results]' : '[data-pane="stats"]');
-            target.innerHTML = '<div class="bvh-empty" role="status"><span class="bvh-loader"></span><h3>正在整理记录…</h3><p>你可以继续搜索、切换页签或关闭面板。</p></div>';
+            const keepHistory = background && tab === 'history' && !!target.querySelector('.bvh-table-scroll');
+            if (!keepHistory) target.innerHTML = '<div class="bvh-empty" role="status"><span class="bvh-loader"></span><h3>正在整理记录…</h3><p>你可以继续搜索、切换页签或关闭面板。</p></div>';
             try {
                 const result = tab === 'history' ? await HistoryQueries.query(this.state, { cancelled: () => this.disposed || generation !== this.generation }) : await HistoryQueries.stats(this.state.range);
                 if (this.disposed || generation !== this.generation || tab !== this.tab) return;
                 if (tab === 'history') { this.filtered = result; this.renderHistory(); } else this.renderStats(result);
             } catch (error) {
                 if (this.disposed || generation !== this.generation) return;
+                if (keepHistory) { UIComponent.toast('历史记录更新失败，已保留当前列表：' + error.message, 'error'); return; }
                 target.innerHTML = `<div class="bvh-empty"><h3>记录暂时无法加载</h3><p>${Utils.escapeHTML(error.message)}</p><button data-action="retry">重试</button></div>`;
             }
         }
-        renderHistory() {
+        renderHistory({ resetScroll = false } = {}) {
             const rows = this.filtered || [], pages = Math.max(1, Math.ceil(rows.length / this.state.pageSize));
             this.state.page = Math.min(pages, Math.max(1, this.state.page));
             this.pageRows = rows.slice((this.state.page - 1) * this.state.pageSize, this.state.page * this.state.pageSize);
-            const esc = Utils.escapeHTML;
-            this.q('[data-results]').innerHTML = rows.length ? `<div class="bvh-table-scroll"><table><thead><tr><th><input data-select-page type="checkbox" aria-label="选择当前页全部记录"></th><th>视频记录</th><th>观看进度</th><th>最近保存</th><th><span class="bvh-sr-only">操作</span></th></tr></thead><tbody>${this.pageRows.map(row => `<tr><td><input type="checkbox" data-select="${row.key}" ${this.selected.has(row.key) ? 'checked' : ''} aria-label="选择 ${esc(row.record.title || row.key)}"></td><td class="bvh-title-cell"><a href="https://www.bilibili.com/video/${row.key}" target="_blank" rel="noopener" title="${esc(row.record.title)}">${esc(row.record.title || '未记录标题')}</a><small>${esc(row.key)} <span class="bvh-status-badge">${esc(row.record.status)}</span></small></td><td><span class="bvh-progress-number">${esc(row.record.percent || '—')}</span><div class="bvh-row-progress"><i style="width:${row.percent}%"></i></div></td><td class="bvh-time-cell">${esc(row.record.savedAt)}</td><td><button class="bvh-text-danger" data-delete="${row.key}" aria-label="删除 ${esc(row.record.title || row.key)}">删除</button></td></tr>`).join('')}</tbody></table></div>` : `<div class="bvh-empty">${workbenchIcon('history')}<h3>${StorageManager.getAllKeys().length ? '没有匹配的记录' : '你的观看记录，从下一次播放开始'}</h3><p>${StorageManager.getAllKeys().length ? '试试其他关键词，或清除当前筛选条件。' : '观看视频后会自动记录，也可以导入已有备份。'}</p><button data-action="${StorageManager.getAllKeys().length ? 'clear-query' : 'import'}">${StorageManager.getAllKeys().length ? '清除筛选' : '导入历史备份'}</button></div>`;
+            const target = this.q('[data-results]'), content = this.q('.bvh-content'), contentTop = content.scrollTop;
+            const focus = document.activeElement;
+            if (rows.length) {
+                if (!target.querySelector('.bvh-table-scroll')) target.innerHTML = '<div class="bvh-table-scroll"><table><thead><tr><th><input data-select-page type="checkbox" aria-label="选择当前页全部记录"></th><th>视频记录</th><th>观看进度</th><th>最近保存</th><th><span class="bvh-sr-only">操作</span></th></tr></thead><tbody></tbody></table></div>';
+                const scroll = target.querySelector('.bvh-table-scroll'), body = scroll.querySelector('tbody');
+                const oldTop = scroll.scrollTop, oldLeft = scroll.scrollLeft, top = scroll.getBoundingClientRect().top;
+                const visibleTop = top + scroll.querySelector('thead').getBoundingClientRect().height;
+                const visible = Array.from(body.children).find(row => row.getBoundingClientRect().bottom > visibleTop);
+                const offset = visible ? visible.getBoundingClientRect().top - top : 0;
+                const nodes = new Map(Array.from(body.children, row => [row.dataset.historyKey, row]));
+                const text = (el, value) => { if (el.textContent !== value) el.textContent = value; };
+                this.pageRows.forEach((item, index) => {
+                    const { key, record } = item;
+                    const row = nodes.get(key) || document.createElement('tr');
+                    if (!row.dataset.historyKey) {
+                        row.dataset.historyKey = key;
+                        row.innerHTML = '<td><input type="checkbox" data-select></td><td class="bvh-title-cell"><a target="_blank" rel="noopener"></a><small><span data-record-key></span> <span class="bvh-status-badge"></span></small></td><td><span class="bvh-progress-number"></span><div class="bvh-row-progress"><i></i></div></td><td class="bvh-time-cell"></td><td><button class="bvh-text-danger" data-delete>删除</button></td>';
+                    }
+                    const checkbox = row.querySelector('[data-select]'), link = row.querySelector('a'), button = row.querySelector('[data-delete]');
+                    checkbox.dataset.select = key; checkbox.checked = this.selected.has(key); checkbox.setAttribute('aria-label', `选择 ${record.title || key}`);
+                    link.href = `https://www.bilibili.com/video/${key}`; link.title = record.title || ''; text(link, record.title || '未记录标题');
+                    text(row.querySelector('[data-record-key]'), key); text(row.querySelector('.bvh-status-badge'), record.status || '');
+                    text(row.querySelector('.bvh-progress-number'), record.percent || '—'); row.querySelector('.bvh-row-progress i').style.width = `${item.percent}%`;
+                    text(row.querySelector('.bvh-time-cell'), record.savedAt || ''); button.dataset.delete = key; button.setAttribute('aria-label', `删除 ${record.title || key}`);
+                    if (body.children[index] !== row) body.insertBefore(row, body.children[index] || null);
+                    nodes.delete(key);
+                });
+                for (const row of nodes.values()) row.remove();
+                // 排序变化时保持当前阅读行；勾选及后台更新也复用滚动容器和控件。
+                if (!resetScroll && focus?.isConnected && target.contains(focus) && document.activeElement !== focus) focus.focus({ preventScroll: true });
+                content.scrollTop = contentTop;
+                scroll.scrollLeft = resetScroll ? 0 : oldLeft;
+                if (resetScroll) scroll.scrollTop = 0;
+                else if (visible?.isConnected) scroll.scrollTop += visible.getBoundingClientRect().top - scroll.getBoundingClientRect().top - offset;
+                else scroll.scrollTop = oldTop;
+            } else target.innerHTML = `<div class="bvh-empty">${workbenchIcon('history')}<h3>${StorageManager.getAllKeys().length ? '没有匹配的记录' : '你的观看记录，从下一次播放开始'}</h3><p>${StorageManager.getAllKeys().length ? '试试其他关键词，或清除当前筛选条件。' : '观看视频后会自动记录，也可以导入已有备份。'}</p><button data-action="${StorageManager.getAllKeys().length ? 'clear-query' : 'import'}">${StorageManager.getAllKeys().length ? '清除筛选' : '导入历史备份'}</button></div>`;
             this.q('[data-page-info]').textContent = `共 ${rows.length.toLocaleString()} 条 · ${this.state.page} / ${pages} 页`;
             this.q('[data-action="prev"]').disabled = this.state.page <= 1;
             this.q('[data-action="next"]').disabled = this.state.page >= pages;
@@ -4508,7 +4677,7 @@
             if (el.dataset.cloudField) this.input(event);
             if (el.dataset.setting) this.input(event);
             if (el.dataset.filter) { this.state[el.dataset.filter] = el.value; this.state.page = 1; this.refresh(); }
-            if (el.hasAttribute('data-page-size')) { this.state.pageSize = Number(el.value); this.state.page = 1; if (this.filtered) this.renderHistory(); }
+            if (el.hasAttribute('data-page-size')) { this.state.pageSize = Number(el.value); this.state.page = 1; if (this.filtered) this.renderHistory({ resetScroll: true }); }
             if (el.dataset.select) { el.checked ? this.selected.add(el.dataset.select) : this.selected.delete(el.dataset.select); this.selectionState(); }
             if (el.hasAttribute('data-select-page')) { for (const row of this.pageRows) el.checked ? this.selected.add(row.key) : this.selected.delete(row.key); this.renderHistory(); }
         }
@@ -4539,12 +4708,12 @@
                 }
                 if (action === 'floating-defaults') {
                     Object.assign(this.draft, FLOATING_STYLE_DEFAULTS);
-                    for (const [key, value] of Object.entries(FLOATING_STYLE_DEFAULTS)) this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(input => { input.value = value; input.removeAttribute('aria-invalid'); });
+                    for (const [key, value] of Object.entries(FLOATING_STYLE_DEFAULTS)) this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(input => { if (input.type === 'checkbox') input.checked = value; else input.value = value; input.removeAttribute('aria-invalid'); });
                     this.q('.bvh-floating-settings').querySelectorAll('.bvh-field-error').forEach(el => el.textContent = '');
                     this.renderPreview(); this.renderFooter();
                 }
                 if (action === 'retry') this.refresh();
-                if ((action === 'prev' || action === 'next') && this.filtered) { this.state.page += action === 'prev' ? -1 : 1; this.renderHistory(); }
+                if ((action === 'prev' || action === 'next') && this.filtered) { this.state.page += action === 'prev' ? -1 : 1; this.renderHistory({ resetScroll: true }); }
                 if (action === 'clear-selection') { this.selected.clear(); this.renderHistory(); }
                 if (action === 'clear-query') { this.state.query = ''; this.state.status = 'all'; this.q('[data-query]').value = ''; this.q('[data-filter="status"]').value = 'all'; this.state.page = 1; this.refresh(); }
                 if (action === 'delete-selected') await this.deleteKeys([...this.selected]);
@@ -5230,8 +5399,7 @@
         }
         setupRecord() {
             if (this.destroyed) return;
-            const data = window.__INITIAL_STATE__?.videoData;
-            this.title = data?.bvid && VideoKey.base(data.bvid) === VideoKey.base(this.bvId) ? data.title || '' : '';
+            this.title = this.getConfirmedTitle();
             const record = StorageManager.getRecord(this.bvId);
             if (record) UIComponent.showViewPanel(record, this.bvId);
             this.ensureVisitedRecord();
@@ -5273,8 +5441,7 @@
             if (this.state === 'switching' && !this._metadataSeen) return false;
             this.state = 'bound'; this._source = source;
             this.cid = window.__INITIAL_STATE__?.cid ? String(window.__INITIAL_STATE__.cid) : null;
-            const data = window.__INITIAL_STATE__?.videoData;
-            this.title = data?.title || document.title || this.title;
+            this.title = this.getConfirmedTitle() || this.title;
             this.ensureVisitedRecord();
             this.completeMissingTitle();
             if (!this._resumeShown) {
@@ -5310,13 +5477,23 @@
         }
         completeMissingTitle() {
             if (this.destroyed || !this.bvId || EpisodeResolver.getCurrentKey() !== this.bvId || this._titlePending) return;
-            const title = this.getConfirmedTitle();
+            const info = EpisodeResolver.getTitleInfo(VideoKey.base(this.bvId));
+            const title = this.getConfirmedTitle(info);
             if (!title) return;
             this.title = title;
             const current = StorageManager.getRecord(this.bvId);
-            if (!current || current.title) return;
-            // 提交时只补最新记录的空标题，不重写旧进度、保存时间，也不复活删除记录。
-            this._titlePending = StorageManager.saveRecord(this.bvId, { title }, true, { source: 'title' })
+            const fixes = [];
+            for (const [key, partTitle] of info.parts) {
+                const record = StorageManager.getRecord(key);
+                if (!record || record.title === partTitle) continue;
+                const clean = EpisodeResolver.cleanTitle(record.title);
+                if (!clean || clean === info.title || clean === partTitle)
+                    fixes.push({ key, record: { title: partTitle }, expectedTitle: record.title });
+            }
+            if (!fixes.length && (!current || current.title)) return;
+            // 普通标题只补空值；已核对的分 P 标题可修正旧主标题，均保留最新进度、时间和删除状态。
+            this._titlePending = (fixes.length ? StorageManager.saveRecords(fixes, true, { source: 'part-title' })
+                : StorageManager.saveRecord(this.bvId, { title }, true, { source: 'title' }))
                 .then(() => {
                     if (!this.destroyed && EpisodeResolver.getCurrentKey() === this.bvId) {
                         const record = StorageManager.getRecord(this.bvId);
@@ -5327,24 +5504,27 @@
                 .finally(() => { this._titlePending = null; });
             return this._titlePending;
         }
-        getConfirmedTitle() {
+        getConfirmedTitle(info = EpisodeResolver.getTitleInfo(VideoKey.base(this.bvId))) {
             if (this.destroyed || EpisodeResolver.getCurrentKey() !== this.bvId) return '';
             const base = VideoKey.base(this.bvId);
-            // 油猴沙箱 window 不一定暴露站点数据；部分页面的 bvid 只在状态顶层。
-            for (const state of [Utils._getPageWindow()?.__INITIAL_STATE__, window.__INITIAL_STATE__]) {
-                const data = state?.videoData;
-                const id = data?.bvid || state?.bvid;
-                if (id && VideoKey.base(id) === base && typeof data?.title === 'string' && data.title.trim()) return data.title.trim();
-            }
-            // 无页面全局数据时，用带视频身份的页面元信息核对标题；不直接采用 document.title。
+            if (info.parts.has(this.bvId)) return EpisodeResolver.resolvePartTitle(this.bvId, StorageManager.getRecord(this.bvId)?.title, info);
+            // 用页面状态或带视频身份的元信息核对列表标题；不直接采用 document.title。
             const canonical = document.querySelector('link[rel="canonical"]')?.getAttribute?.('href');
             const ogUrl = document.querySelector('meta[property="og:url"]')?.getAttribute?.('content');
             const identityUrl = ogUrl || canonical;
-            if (!identityUrl || VideoKey.base(VideoKey.fromUrl(identityUrl)) !== base) return '';
+            if (!info.confirmed && (!identityUrl || VideoKey.base(VideoKey.fromUrl(identityUrl)) !== base)) return '';
+            const items = EpisodeResolver.getItems().filter(item => VideoKey.normalize(item.key) === this.bvId && item.title);
+            const item = items.find(item => item.el.matches?.('.video-pod__list.section .simple-base-item.page-item, .bpx-player-ctrl-eplist-multi-menu-item'))
+                || items.find(item => !item.el.querySelector?.('.page-list .simple-base-item.page-item'));
+            if (item) {
+                const title = EpisodeResolver.cleanTitle(item.title);
+                if (title) { info.parts.set(this.bvId, title); return EpisodeResolver.resolvePartTitle(this.bvId, StorageManager.getRecord(this.bvId)?.title, info); }
+            }
+            if (info.title) return info.title;
             const heading = document.querySelector('h1.video-title, h1[title]');
             const title = heading?.getAttribute?.('title') || heading?.textContent
                 || document.querySelector('meta[property="og:title"]')?.getAttribute?.('content');
-            return typeof title === 'string' ? title.trim() : '';
+            return typeof title === 'string' ? EpisodeResolver.cleanTitle(title) : '';
         }
         capture() {
             if (this.state !== 'bound' || !this.identityMatches() || !this.videoEl || !this.hasPlayed) return null;
@@ -5436,6 +5616,225 @@
     }
 
     // --- DOM监控与渲染层 ---
+    const MultiPageHistoryPreview = {
+        anchor: null, panel: null, menu: null, showTimer: null, hideTimer: null, closingPanel: null, removeTimer: null, initialized: false,
+        titleRequest: null, titleFeedback: null,
+        cardSelector: '.bili-video-card, .video-card, .video-page-card-small, .video-page-card, .card-box, .history-card, .header-history-card',
+        init() {
+            if (this.initialized) return;
+            this.initialized = true;
+            const find = node => node?.closest?.('[data-bvh-multi-base]')
+                || node?.closest?.(this.cardSelector)?.querySelector('[data-bvh-multi-base]');
+            const inside = node => !!node && !!this.panel?.contains(node);
+            const enter = event => {
+                if (!CONFIG.showMultiPageHistory) return;
+                if (inside(event.target)) { clearTimeout(this.hideTimer); return; }
+                const anchor = find(event.target);
+                if (!anchor) return;
+                clearTimeout(this.hideTimer);
+                if (anchor === this.anchor) return;
+                this.hide(); this.anchor = anchor;
+                this.showTimer = setTimeout(() => this.show(), 180);
+            };
+            const leave = event => {
+                if (!CONFIG.showMultiPageHistory) return;
+                if (inside(event.relatedTarget) || (this.anchor && find(event.relatedTarget) === this.anchor)) return;
+                // 禁用正在请求的按钮会触发 focusout，不能把这当作用户移出了详情。
+                if (event.type === 'focusout' && (this.panel?.matches(':hover') || (this.titleRequest && inside(event.target)))) return;
+                clearTimeout(this.hideTimer);
+                this.hideTimer = setTimeout(() => this.hide(), 120);
+            };
+            document.addEventListener('pointerover', enter);
+            document.addEventListener('pointerout', leave);
+            document.addEventListener('focusin', enter);
+            document.addEventListener('focusout', leave);
+            document.addEventListener('keydown', event => { if (event.key === 'Escape') this.hide(); });
+            window.addEventListener('scroll', event => {
+                if (inside(event.target)) return;
+                if (this.menu?.contains(event.target) && event.target.contains?.(this.anchor)) {
+                    if (this.panel?.dataset.inline !== 'true') this.place();
+                    return;
+                }
+                this.hide();
+            }, true);
+            window.addEventListener('resize', () => this.hide());
+            StorageManager.onDataChange(change => {
+                if (!CONFIG.showMultiPageHistory) { this.hide(); return; }
+                if (!this.anchor) return;
+                if (change.fullReset || change.settingsChanged || change.changedBases?.has(this.anchor.dataset.bvhMultiBase)) this.show();
+            });
+        },
+        show() {
+            if (!CONFIG.showMultiPageHistory) { this.hide(); return; }
+            const anchor = this.anchor;
+            if (!anchor?.isConnected || !anchor.dataset.bvhMultiBase) { this.hide(); return; }
+            const titleInfo = EpisodeResolver.getTitleInfo(anchor.dataset.bvhMultiBase);
+            const rows = StorageManager.getRelatedKeys(anchor.dataset.bvhMultiBase)
+                .map(key => ({ key, record: StorageManager.getRecord(key) })).filter(row => row.record)
+                .map(({ key, record }) => ({ key, record: { ...record, title: EpisodeResolver.resolvePartTitle(key, record.title, titleInfo) } }))
+                .sort((a, b) => VideoKey.page(a.key) - VideoKey.page(b.key));
+            if (!rows.length || (rows.length === 1 && VideoKey.page(rows[0].key) === 1)) { this.hide(); return; }
+            if (!this.panel) {
+                clearTimeout(this.removeTimer); this.closingPanel?.remove(); this.closingPanel = null;
+                this.panel = document.createElement('section'); this.panel.id = 'bvh-multi-history';
+                this.panel.className = 'bvh-multi-history'; this.panel.setAttribute('role', 'region'); this.panel.setAttribute('aria-label', '分 P 观看记录');
+                this.panel.addEventListener('click', event => {
+                    if (!event.target.closest('[data-refresh-titles]')) return;
+                    event.preventDefault(); event.stopPropagation(); this.refreshTitles();
+                });
+                this.menu = anchor.closest(HEADER_POPOVER_SELECTOR);
+                for (let parent = this.menu?.parentElement?.closest(HEADER_POPOVER_SELECTOR); parent; parent = parent.parentElement?.closest(HEADER_POPOVER_SELECTOR)) this.menu = parent;
+                // 保留在原菜单的 DOM 内，移入详情仍属于菜单的悬停范围。
+                // 顶层展示避免被菜单的滚动裁切或 transform 限制，也不触发其他菜单关闭。
+                (this.menu ? anchor.parentElement : document.body).append(this.panel);
+                if (this.menu) {
+                    if (typeof this.panel.showPopover === 'function') {
+                        this.panel.setAttribute('popover', 'manual');
+                        try { this.panel.showPopover(); }
+                        catch { this.showInline(); }
+                    } else this.showInline();
+                }
+                // 保留页面原有的辅助说明；关闭时只移除本浮层的 ID。
+                const ids = (anchor.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean);
+                anchor.setAttribute('aria-describedby', [...new Set([...ids, this.panel.id])].join(' '));
+            }
+            const dark = CONFIG.floatingTheme === 'dark', panel = this.panel;
+            const vars = { paper: dark ? '#202631' : '#fffdf9', ink: dark ? '#f3f6fa' : '#243040',
+                muted: dark ? '#a4b1c1' : '#78838f', line: dark ? '#ffffff1a' : '#e8ecef', accent: CONFIG.floatingAccentColor,
+                soft: `${CONFIG.floatingAccentColor}14`, surface: dark ? '#ffffff06' : '#f4f6f7',
+                progress: `${CONFIG.floatingAccentColor}99`, complete: dark ? '#9bc3ae' : '#507b65', error: dark ? '#efa79a' : '#b24d42' };
+            for (const [name, value] of Object.entries(vars)) panel.style.setProperty(`--bvh-multi-${name}`, value);
+            const esc = Utils.escapeHTML;
+            const titles = rows.map(({ record }) => String(record.title || '').trim()).filter(Boolean);
+            const sharedTitle = titles.length > 1 && titles.every(title => title === titles[0]) ? titles[0] : '';
+            panel.dataset.sharedTitle = String(!!sharedTitle);
+            if (!panel.querySelector('.bvh-multi-rows')) panel.innerHTML = `<div class="bvh-multi-heading"><span><span class="bvh-multi-icon">${workbenchIcon('history')}</span><strong>分 P 观看记录</strong></span><div class="bvh-multi-tools"><small></small><button type="button" class="bvh-multi-refresh" data-refresh-titles title="从 B 站获取当前视频最新的分 P 标题">刷新标题</button></div></div><div class="bvh-multi-rows"></div><div class="bvh-multi-note" role="status" aria-live="polite">仅显示本地已记录的分 P</div>`;
+            const list = panel.querySelector('.bvh-multi-rows'), oldScrollTop = list.scrollTop;
+            const top = list.getBoundingClientRect().top;
+            const visible = Array.from(list.children).find(row => row.getBoundingClientRect().bottom > top);
+            const visibleOffset = visible ? visible.getBoundingClientRect().top - top : 0;
+            panel.querySelector('.bvh-multi-heading small').textContent = `${rows.length} 条记录`;
+            let heading = panel.querySelector('.bvh-multi-video-title');
+            if (sharedTitle) {
+                if (!heading) { heading = document.createElement('div'); heading.className = 'bvh-multi-video-title'; heading.append(document.createElement('span')); list.before(heading); }
+                const text = heading.firstElementChild;
+                if (text.textContent !== sharedTitle) { text.textContent = sharedTitle; text.title = sharedTitle; }
+            } else heading?.remove();
+            const nodes = new Map(Array.from(list.children, row => [row.dataset.key, row]));
+            rows.forEach(({ key, record }, index) => {
+                const raw = String(record.percent || ''), value = /^\d+(?:\.\d+)?%$/.test(raw) ? Number(raw.slice(0, -1)) : NaN;
+                const progress = record.status === RECORD_STATUS.WATCHED && value >= 0 && value <= 100 ? value : null;
+                const percent = progress === null ? '' : `${progress}%`;
+                const complete = progress === 100;
+                const check = complete ? '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m3.5 8 3 3 6-6"/></svg>' : '';
+                const markup = `<span class="bvh-multi-page">P${VideoKey.page(key)}</span><div class="bvh-multi-detail">${record.title && !sharedTitle ? `<div class="bvh-multi-title" title="${esc(record.title)}">${esc(record.title)}</div>` : ''}<div class="bvh-multi-status"><span>${esc(record.status || '观看记录')}${record.currentTime ? ` · ${esc(record.currentTime)}` : ''}</span><strong>${check}${esc(percent)}</strong></div>${percent ? `<div class="bvh-multi-track"><span style="width:${progress}%"></span></div>` : ''}<time>${esc(record.savedAt || '暂无记录时间')}</time></div>`;
+                const row = nodes.get(key) || document.createElement('div');
+                row.className = 'bvh-multi-row'; row.dataset.key = key; row.dataset.complete = String(complete);
+                if (row._bvhMarkup !== markup) { row.innerHTML = markup; row._bvhMarkup = markup; }
+                if (list.children[index] !== row) list.insertBefore(row, list.children[index] || null);
+                nodes.delete(key);
+            });
+            for (const row of nodes.values()) row.remove();
+            // 保留正在阅读的分 P 及其相对位置，标题换行或记录增删也不把列表重置到顶部。
+            if (visible?.isConnected) list.scrollTop += visible.getBoundingClientRect().top - list.getBoundingClientRect().top - visibleOffset;
+            else list.scrollTop = oldScrollTop;
+            this.syncTitleControls();
+            this.place();
+        },
+        syncTitleControls() {
+            const button = this.panel?.querySelector('[data-refresh-titles]');
+            if (!button) return;
+            const base = this.anchor?.dataset.bvhMultiBase, busy = !!this.titleRequest;
+            button.disabled = busy; button.setAttribute('aria-busy', String(busy));
+            button.textContent = busy ? (this.titleRequest.base === base ? '刷新中…' : '请稍候') : '刷新标题';
+            const feedback = this.titleFeedback?.base === base ? this.titleFeedback : null;
+            const note = this.panel.querySelector('.bvh-multi-note'), message = feedback?.message || '仅显示本地已记录的分 P';
+            if (note.textContent !== message) note.textContent = message;
+            note.dataset.state = feedback?.state || '';
+        },
+        refreshTitles() {
+            if (this.titleRequest) return this.titleRequest.promise;
+            const base = this.anchor?.dataset.bvhMultiBase;
+            if (!base) return Promise.resolve();
+            clearTimeout(this.hideTimer);
+            const request = { base, promise: null };
+            this.titleRequest = request;
+            this.titleFeedback = { base, state: '', message: '正在从 B 站获取最新分 P 标题…' }; this.syncTitleControls();
+            request.promise = (async () => {
+                try {
+                    const info = await EpisodeResolver.fetchTitleInfo(base);
+                    await StorageManager.initializeForKeys([base]); await StorageManager._syncIfStale();
+                    const fixes = []; let matched = 0;
+                    for (const key of StorageManager.getRelatedKeys(base)) {
+                        const record = StorageManager.getRecord(key), title = info.parts.get(key);
+                        if (!record || !title) continue;
+                        matched++;
+                        if (record.title !== title) fixes.push({ key, record: { title }, expectedTitle: record.title });
+                    }
+                    if (!matched) throw new Error('未找到已有记录对应的分 P，已保留原标题');
+                    const count = fixes.length ? await StorageManager.saveRecords(fixes, true, { source: 'part-title' }) : 0;
+                    const message = !fixes.length ? '标题已是最新' : count ? `已更新 ${count} 条分 P 标题` : '记录已变化，请再次刷新标题';
+                    this.titleFeedback = { base, state: 'success', message };
+                    if (this.anchor?.dataset.bvhMultiBase === base) this.show();
+                    else UIComponent.toast(message, 'success');
+                } catch (error) {
+                    this.titleFeedback = { base, state: 'error', message: `刷新失败：${error.message}` };
+                    if (this.anchor?.dataset.bvhMultiBase !== base) UIComponent.toast(this.titleFeedback.message, 'error');
+                } finally {
+                    if (this.titleRequest === request) this.titleRequest = null;
+                    this.syncTitleControls();
+                }
+            })();
+            return request.promise;
+        },
+        showInline() {
+            this.panel.removeAttribute('popover'); this.panel.removeAttribute('data-side');
+            this.panel.style.removeProperty('left'); this.panel.style.removeProperty('top'); this.panel.style.removeProperty('width');
+            this.panel.style.maxHeight = `${Math.max(100, Math.min(430, this.menu.clientHeight - 16, window.innerHeight - 16))}px`;
+            this.panel.dataset.inline = 'true'; this.anchor.after(this.panel);
+        },
+        place() {
+            if (!this.anchor || !this.panel) return;
+            const rect = this.anchor.getBoundingClientRect(), panel = this.panel;
+            const width = document.documentElement.clientWidth, height = window.innerHeight;
+            if (panel.dataset.inline === 'true') return;
+            if (this.menu) {
+                const menu = this.menu.getBoundingClientRect();
+                const leftSpace = Math.max(0, menu.left - 16), rightSpace = Math.max(0, width - menu.right - 16);
+                const side = rightSpace >= 340 || rightSpace >= leftSpace ? 'right' : 'left';
+                const available = side === 'right' ? rightSpace : leftSpace;
+                if (available < 240) { this.showInline(); return; }
+                panel.style.width = `${Math.min(340, available)}px`; panel.dataset.side = side;
+                const bounds = panel.getBoundingClientRect();
+                panel.style.left = `${side === 'right' ? menu.right + 8 : menu.left - bounds.width - 8}px`;
+                panel.style.top = `${Math.max(8, Math.min(rect.top, height - bounds.height - 8))}px`;
+                return;
+            }
+            const bounds = panel.getBoundingClientRect();
+            let top = rect.bottom + 8;
+            if (top + bounds.height > height - 8) top = rect.top - bounds.height - 8;
+            panel.style.left = `${Math.max(8, Math.min(rect.left, width - bounds.width - 8))}px`;
+            panel.style.top = `${Math.max(8, Math.min(top, height - bounds.height - 8))}px`;
+        },
+        hide() {
+            clearTimeout(this.showTimer); clearTimeout(this.hideTimer);
+            clearTimeout(this.removeTimer); this.closingPanel?.remove(); this.closingPanel = null;
+            if (this.anchor && this.panel) {
+                const ids = (this.anchor.getAttribute('aria-describedby') || '').split(/\s+/).filter(id => id && id !== this.panel.id);
+                if (ids.length) this.anchor.setAttribute('aria-describedby', ids.join(' '));
+                else this.anchor.removeAttribute('aria-describedby');
+            }
+            const panel = this.panel;
+            if (panel && CONFIG.showMultiPageHistory && !window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                panel.style.setProperty('--bvh-multi-exit-opacity', getComputedStyle(panel).opacity);
+                panel.removeAttribute('id'); panel.setAttribute('aria-hidden', 'true'); panel.classList.add('bvh-multi-leaving');
+                this.closingPanel = panel;
+                this.removeTimer = setTimeout(() => { panel.remove(); if (this.closingPanel === panel) this.closingPanel = null; }, 140);
+            } else panel?.remove();
+            this.panel = null; this.anchor = null; this.menu = null;
+        }
+    };
+
     class DOMWatcher {
         constructor() {
             this.intersectionObserver = null;
@@ -5458,6 +5857,7 @@
             this.scheduleFullRescan = Utils.debounce(() => this.flushRescanRoots(), DOM_RESCAN_DELAY);
             this.initIntersectionObserver();
             this.initMutationObserver();
+            MultiPageHistoryPreview.init();
             document.addEventListener('pointerover', (e) => {
                 if (e.target?.closest?.(HEADER_POPOVER_SELECTOR)) {
                     this.scheduleHeaderPopoverRefresh();
@@ -5539,6 +5939,7 @@
         }
 
         refreshForRoute() {
+            MultiPageHistoryPreview.hide();
             this.pruneDisconnected();
             const nextMode = this.getPageMode();
             if (nextMode !== this.pageMode) {
@@ -5554,6 +5955,7 @@
 
         initMutationObserver() {
             this.rootObserver = new MutationObserver((mutations) => {
+                if (MultiPageHistoryPreview.anchor && !MultiPageHistoryPreview.anchor.isConnected) MultiPageHistoryPreview.hide();
                 const start = performance.now();
                 let shouldRefreshRoots = false;
                 let shouldRefreshHeaderPopoverCards = false;
@@ -5948,6 +6350,8 @@
         }
 
         removeExistingMark(el) {
+            if (MultiPageHistoryPreview.anchor === el) MultiPageHistoryPreview.hide();
+            if (el.dataset) delete el.dataset.bvhMultiBase;
             el._bvhTag?.remove(); el._bvhBar?.remove();
             el._bvhTag = null; el._bvhBar = null; el._bvhMarkParent = null; el._bvhSignature = null;
             const existingTags = el.querySelectorAll('.bvh-tag, .bvh-tag-small, .bvh-tag-big');
@@ -6204,22 +6608,19 @@
             let bvBase = VideoKey.base(bv);
             const isHeaderPopoverLink = this.isHeaderPopoverVideoLink(el);
             const headerPopoverCover = this.getHeaderPopoverCover(el);
-            const isHistoryCard = !!el.closest('.history-card, .header-history-card');
             const existingVideoKey = el._bvhLastVideoKey;
             const isSameVideoKey = existingVideoKey === bv;
 
             let record = StorageManager.getRecord(bv);
-            let multiRecords = [];
-            const shouldFindRelated = isHistoryCard || /\?p=[0-9]+/.test(bv) || el.closest('.action-list-item-wrap, .video-pod, .playlist-container, .list-box');
+            const multiRecords = this.getRelatedKeysCached(bvBase);
 
-            if (!record) {
-                const relatedKeys = shouldFindRelated ? this.getRelatedKeysCached(bvBase) : [];
-                if (relatedKeys.length > 0) {
-                    record = StorageManager.getRecord(relatedKeys[0]);
-                    multiRecords = relatedKeys;
+            if (!record || (record.status === RECORD_STATUS.VISITED && !CONFIG.showVisitedTag)) {
+                for (const key of multiRecords) {
+                    const candidate = StorageManager.getRecord(key);
+                    if (candidate && (CONFIG.showVisitedTag || candidate.status !== RECORD_STATUS.VISITED)) {
+                        record = candidate; break;
+                    }
                 }
-            } else {
-                multiRecords = this.getRelatedKeysCached(bvBase);
             }
 
             if (!record) {
@@ -6237,7 +6638,8 @@
                 return;
             }
 
-            const isMulti = multiRecords.length > 1;
+            const isMulti = multiRecords.length > 1 || multiRecords.some(key => VideoKey.page(key) > 1);
+            if (!isMulti && el.dataset) delete el.dataset.bvhMultiBase;
             const tagText = isMulti ? "已记录 多P" : TagStyle.text(record);
 
             let tagTitle = record.savedAt || "";
@@ -6327,11 +6729,11 @@
             }
 
             if (el._bvhSignature === signature && el._bvhMarkParent === markParent && el._bvhTag?.isConnected) return;
-            const template = UIComponent.createTag(tagText, tagTitle, `bvh-tag ${tagColorClass} ${isSmall ? 'bvh-tag-small' : ''}`);
+            const template = UIComponent.createTag(tagText, isMulti ? '' : tagTitle, `bvh-tag ${tagColorClass} ${isSmall ? 'bvh-tag-small' : ''}`);
             let tagEl = el._bvhTag;
             if (tagEl?.parentNode === markParent) {
                 tagEl.className = template.className; tagEl.style.cssText = template.style.cssText;
-                tagEl.replaceChildren(...template.childNodes); tagEl.title = tagTitle;
+                tagEl.replaceChildren(...template.childNodes); tagEl.title = isMulti ? '' : tagTitle;
             } else {
                 this.removeExistingMark(el); tagEl?.remove(); tagEl = template;
                 markParent.insertBefore(tagEl, markBeforeNode);
@@ -6339,6 +6741,7 @@
             el._bvhTag = tagEl; el._bvhMarkParent = markParent; el._bvhSignature = signature;
             el._bvhBar?.remove(); el._bvhBar = null;
             el._bvhLastVideoKey = bv;
+            if (isMulti && el.dataset) el.dataset.bvhMultiBase = bvBase;
 
             if (CONFIG.showProgressBar && record.percent && !isMulti && !tagEl.classList.contains('bvh-tag-ring')) {
                 const barEl = UIComponent.createProgressBar(record.percent);
