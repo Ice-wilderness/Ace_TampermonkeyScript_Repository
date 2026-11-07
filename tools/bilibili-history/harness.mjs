@@ -13,6 +13,7 @@ export function instrument(text = source) {
         EpisodeResolver, HistoryPageSync, SettingsManager, CONFIG, DEFAULT_CONFIG, Utils, injectStyles, AppController,
         ...(typeof FloatingEntry === 'undefined' ? {} : { FloatingEntry }),
         ...(typeof HistoryCommitStore === 'undefined' ? {} : { HistoryCommitStore, HistoryStoreIO }),
+        ...(typeof HistoryMaintenance === 'undefined' ? {} : { HistoryMaintenance }),
         ...(typeof ImportDiagnostics === 'undefined' ? {} : { ImportDiagnostics }),
         ...(typeof HistoryQueries === 'undefined' ? {} : { HistoryQueries, HistoryManagerPanel, WorkbenchLayers }),
         ...(typeof WebDavFormat === 'undefined' ? {} : { WebDavFormat, WebDavCodec, WebDavWorker,

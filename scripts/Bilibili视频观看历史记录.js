@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.6.1
+// @version      4.6.2
 // @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出与失败诊断、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -907,6 +907,7 @@
                         queuedWrites: StorageManager._queuedWrites || 0,
                         syncRetries: StorageManager._store?.scanRetries || 0,
                         backgroundRunning: !!StorageManager._maintenance,
+                        maintenance: StorageManager._maintenanceStats || null,
                         playback: typeof VideoPlayerObserver === 'undefined' ? null : VideoPlayerObserver.metrics
                     }, null, 2),
                 '',
@@ -1419,34 +1420,43 @@
             // 无前缀的旧提交继续按原序列化方式校验，不改写已有数据。
             return typeof checksum === 'string' && HistoryCommitStore.checksum(value, checksum.startsWith('sorted:')) === checksum;
         }
-        async readCommit(key, knownManifest, diagnostic) {
+        async readCommit(key, knownManifest, diagnostic, visit = null, collect = true) {
             const reject = reason => { if (diagnostic) diagnostic.storage = { ...diagnostic.storage, confirmationError: reason }; return null; };
             const manifest = knownManifest || await this.io.get(key);
             if (!manifest || manifest.protocol !== 1 || !Array.isArray(manifest.blocks)
                 || (!manifest.blocks.length && !(['epoch', 'prune'].includes(manifest.kind) && manifest.count === 0))) return reject('提交清单缺失或格式无效');
-            const entries = [];
-            const blocks = await readHistoryBatch(manifest.blocks, ref => this.io.get(ref.key));
-            for (let index = 0; index < manifest.blocks.length; index++) {
-                const ref = manifest.blocks[index];
-                if (typeof ref.key !== 'string' || !ref.key.startsWith(manifest.kind === 'checkpoint' ? 'bvh_checkpoint_' : 'bvh_tx_')) return reject('数据块引用无效');
-                const block = blocks[index];
-                const segmentStart = performance.now();
-                if (diagnostic) diagnostic.storage = { ...diagnostic.storage, block: ref.key,
-                    expectedChecksum: ref.checksum, actualChecksum: block ? HistoryCommitStore.checksum(block, typeof ref.checksum === 'string' && ref.checksum.startsWith('sorted:')) : null,
-                    expectedCount: ref.count, actualCount: Array.isArray(block?.entries) ? block.entries.length : null };
-                if (!block || block.id !== manifest.id || !Array.isArray(block.entries)
-                    || block.entries.length !== ref.count || !HistoryCommitStore.verifyChecksum(block, ref.checksum)) return reject('数据块缺失、身份、条数或校验和不匹配');
-                for (const entry of block.entries) {
-                    if (!entry || !VideoKey.isValid(entry.key) || !Array.isArray(entry.version)
-                        || !Number.isFinite(entry.version[0]) || typeof entry.version[1] !== 'string'
-                        || !Number.isFinite(entry.version[2]) || (!entry.deleted && !entry.record)) return reject('数据块中的记录或版本无效');
-                    entries.push(entry);
+            const entries = [], width = collect ? 4 : 1; let total = 0;
+            // 限制同时留存的数据块；后台扫描只提取版本及位置，不收集记录正文。
+            for (let offset = 0; offset < manifest.blocks.length; offset += width) {
+                const refs = manifest.blocks.slice(offset, offset + width);
+                for (const ref of refs) if (typeof ref.key !== 'string'
+                    || !ref.key.startsWith(manifest.kind === 'checkpoint' ? 'bvh_checkpoint_' : 'bvh_tx_')) return reject('数据块引用无效');
+                const blocks = await readHistoryBatch(refs, ref => this.io.get(ref.key));
+                for (let index = 0; index < refs.length; index++) {
+                    const ref = refs[index];
+                    const block = blocks[index];
+                    const segmentStart = performance.now();
+                    if (diagnostic) diagnostic.storage = { ...diagnostic.storage, block: ref.key,
+                        expectedChecksum: ref.checksum, actualChecksum: block ? HistoryCommitStore.checksum(block, typeof ref.checksum === 'string' && ref.checksum.startsWith('sorted:')) : null,
+                        expectedCount: ref.count, actualCount: Array.isArray(block?.entries) ? block.entries.length : null };
+                    if (!block || block.id !== manifest.id || !Array.isArray(block.entries)
+                        || block.entries.length !== ref.count || !HistoryCommitStore.verifyChecksum(block, ref.checksum)) return reject('数据块缺失、身份、条数或校验和不匹配');
+                    for (let position = 0; position < block.entries.length; position++) {
+                        const entry = block.entries[position];
+                        if (!entry || !VideoKey.isValid(entry.key) || !Array.isArray(entry.version)
+                            || !Number.isFinite(entry.version[0]) || typeof entry.version[1] !== 'string'
+                            || !Number.isFinite(entry.version[2]) || (!entry.deleted && !entry.record)) return reject('数据块中的记录或版本无效');
+                        total++;
+                        if (collect) entries.push(entry);
+                        if (visit) visit(entry, ref, position);
+                        if (position && position % 256 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+                    }
+                    HistoryQueries.recordSegment(performance.now() - segmentStart);
+                    await new Promise(resolve => setTimeout(resolve, 0));
                 }
-                HistoryQueries.recordSegment(performance.now() - segmentStart);
-                await new Promise(resolve => setTimeout(resolve, 0));
             }
-            if (diagnostic) Object.assign(diagnostic.storage, { manifestCount: manifest.count, actualEntryCount: entries.length });
-            return entries.length === manifest.count ? { manifest, entries } : reject('提交清单总条数不匹配');
+            if (diagnostic) Object.assign(diagnostic.storage, { manifestCount: manifest.count, actualEntryCount: total });
+            return total === manifest.count ? { manifest, entries } : reject('提交清单总条数不匹配');
         }
         async sync() {
             if (this.syncing) return this.syncing;
@@ -1493,7 +1503,8 @@
             const commits = new Map();
             this._incomplete = false;
             const skippedLegacy = new Map();
-            const intersectsShards = header => header.blocks.some(ref => {
+            const intersectsShards = header => Number.isInteger(header.baseGroup)
+                ? [...this.scope].some(base => StorageManager._getShardId(base) === header.baseGroup) : header.blocks.some(ref => {
                 const shard = header.kind === 'checkpoint' ? Number(ref.key.split('_')[2]) : Number(ref.key.split('_').at(-1));
                 return targetShards.has(shard);
             });
@@ -1608,11 +1619,11 @@
             if (!old || HistoryCommitStore.compare(entry.version, old.version) > 0) this.baseline.set(key, entry);
         }
         transactionId() { return `${String(Date.now()).padStart(16, '0')}_${this.writer}_${String(++this.sequence).padStart(12, '0')}`; }
-        async prepare(entries, kind = 'tx', identity, createdAt = Date.now(), epoch = this.epoch, sampledAt = performance.timeOrigin + performance.now(), cutoverAt = null) {
+        async prepare(entries, kind = 'tx', identity, createdAt = Date.now(), epoch = this.epoch, sampledAt = performance.timeOrigin + performance.now(), cutoverAt = null, baseGroup = null) {
             const id = identity || this.transactionId();
             const grouped = new Map();
             await HistoryQueries.each(entries, entry => {
-                const shard = StorageManager._getShardId(entry.key);
+                const shard = baseGroup === null ? StorageManager._getShardId(entry.key) : baseGroup;
                 if (!grouped.has(shard)) grouped.set(shard, []);
                 // 深拷贝后重试沿用原采样版本，外部修改不会改变不可变块。
                 const copy = JSON.parse(JSON.stringify(entry)); delete copy.container;
@@ -1626,6 +1637,7 @@
                 bases: [...new Set(entries.map(entry => VideoKey.base(entry.key)))].sort(),
                 blocks: blocks.map(block => ({ key: block.key, count: block.value.entries.length, checksum: HistoryCommitStore.checksum(block.value) })) };
             if (kind === 'prune') manifest.cutoverAt = cutoverAt;
+            if (baseGroup !== null) manifest.baseGroup = baseGroup;
             return { key: `bvh_commit_${id}`, blocks, manifest };
         }
         async publish(transaction, guard, deferSync = false, diagnostic) {
@@ -1784,6 +1796,218 @@
                 await this.io.delete(key); removed++;
             }
             return removed;
+        }
+    }
+
+    // 后台整理仅保留版本和数据位置；正文按块读取，检查点按条数和字节预算分批发布。
+    class HistoryMaintenance {
+        static maxEntries = 256;
+        static maxBytes = 256 * 1024;
+        static bufferEntries = 2048;
+        static bufferBytes = 2 * 1024 * 1024;
+        constructor(io, stats) {
+            this.io = io; this.stats = stats; this.store = new HistoryCommitStore(io);
+            this.encoder = new TextEncoder();
+            this.startedAt = performance.timeOrigin + performance.now();
+            this.sources = new Map(); this.winners = new Map(); this.retained = new Set();
+        }
+        group(key) { return StorageManager._getShardId(VideoKey.base(key)); }
+        changed() {
+            const error = new Error('其他页面已整理来源，重新读取当前清单'); error.code = 'BVH_MAINTENANCE_RETRY'; return error;
+        }
+        legacy(rawKey, value) {
+            this.store.addBaseline(rawKey, value);
+            const entry = this.store.baseline.values().next().value;
+            this.store.baseline.clear(); return entry;
+        }
+        add(source, entry, ref, position) {
+            const member = { key: entry.key, version: entry.version, deleted: !!entry.deleted, source, ref, position };
+            source.members.push(member); this.stats.scannedEntries++;
+            const old = this.winners.get(entry.key), order = old ? HistoryCommitStore.compare(member.version, old.version) : 1;
+            if (order > 0 || order === 0 && source.key > old.source.key) this.winners.set(entry.key, member);
+        }
+        reusable(source) {
+            return source.manifest?.kind === 'checkpoint' && source.groups.size === 1
+                && source.manifest.blocks.every(ref => ref.count <= HistoryMaintenance.maxEntries
+                    // 新布局已经按实际 UTF-8 字节限量；旧块仅能按校验文本长度保守估算。
+                    && (Number.isInteger(source.manifest.baseGroup) || ref.count === 1
+                        || Number(String(ref.checksum).split(':').at(-2)) * 3 <= HistoryMaintenance.maxBytes));
+        }
+        async run(keys, done, prunePending) {
+            const stats = this.stats, headers = new Map(); stats.phase = '读取清单';
+            const snapshotKeys = (await this.io.list()), commits = snapshotKeys.filter(key => key.startsWith('bvh_commit_'));
+            const index = await this.io.get(StorageManager._BASE_INDEX_KEY);
+            for (const key of commits) {
+                const manifest = StorageManager._store.commits.get(key)?.manifest || StorageManager._store.headers.get(key) || await this.io.get(key);
+                if (!manifest) throw this.changed();
+                if (manifest.protocol !== 1 || key !== `bvh_commit_${manifest.id}` || !Array.isArray(manifest.blocks)
+                    || manifest.blocks.some(ref => typeof ref.key !== 'string' || !(manifest.kind === 'checkpoint'
+                        ? /^bvh_checkpoint_\d+_/.test(ref.key) && ref.key.endsWith('_' + manifest.id)
+                        : ref.key.startsWith(`bvh_tx_${manifest.id}_`) && /^\d+$/.test(ref.key.slice(`bvh_tx_${manifest.id}_`.length)))))
+                    throw new Error('后台整理遇到无效提交清单');
+                headers.set(key, manifest);
+            }
+            const controls = [...headers].filter(([, manifest]) => ['epoch', 'prune'].includes(manifest.kind)).sort(([a], [b]) => b.localeCompare(a));
+            const epoch = controls[0]?.[1].epoch || 'initial';
+            if (epoch !== 'initial' && !WebDavFormat.uuid.test(epoch)) throw new Error('本地回滚批次无效');
+            const prune = controls.find(([, manifest]) => manifest.kind === 'prune' && (manifest.epoch || 'initial') === epoch);
+            const pruneKey = prune?.[0] || null, cutoff = prune?.[1].cutoverAt || 0;
+            const protectedKeys = new Set(prune?.[1].checkpoints || []);
+            if (prune && (!Array.isArray(prune[1].checkpoints) || [...protectedKeys].some(key => !headers.has(key))))
+                throw new Error('本地回收检查点不完整');
+            if (cutoff >= this.startedAt) throw new Error('整理期间发生回滚或回收，稍后重新整理');
+            const legacyKeys = epoch === 'initial' && !pruneKey ? snapshotKeys.filter(key => /^bvh_shard_\d+$/.test(key)
+                || /^(?:BV[a-zA-Z0-9]{10}|av\d+)(?:\?p=\d+)?$/.test(key)) : [];
+            const compatible = !!index?.complete && index.routeVersion === 2 && !!done
+                && (done.epoch || 'initial') === epoch && (done.pruneKey || null) === pruneKey && !prunePending && !legacyKeys.length;
+            const covered = new Set(done?.coverage || []), dirty = new Set();
+            let all = !compatible;
+            for (const [key, manifest] of headers) {
+                const groups = new Set((manifest.bases || []).map(base => this.group(base)));
+                const active = (manifest.epoch || 'initial') === epoch && (!pruneKey || key === pruneKey
+                    || protectedKeys.has(key) || manifest.kind !== 'prune' && (manifest.sampledAt || 0) > cutoff);
+                const source = { key, manifest, groups, active, members: [], refs: new Map() };
+                this.sources.set(key, source);
+                // 已完整复制过的全局批次只参与批次判断，不再反复加载其正文。
+                source.copiedControl = compatible && covered.has(key) && (['epoch', 'prune'].includes(manifest.kind) || protectedKeys.has(key));
+                if (active && !source.copiedControl && !covered.has(key)) {
+                    if (!Array.isArray(manifest.bases)) all = true;
+                    for (const group of groups) dirty.add(group);
+                }
+            }
+            if (all) for (let group = 0; group < SHARD_COUNT; group++) dirty.add(group);
+            // 跨组旧事务必须整体替换，不能只回收其中一部分。
+            for (let expanded = true; expanded;) {
+                expanded = false;
+                for (const source of this.sources.values()) if (source.active && !source.copiedControl) {
+                    if (!Array.isArray(source.manifest.bases)) {
+                        for (let group = 0; group < SHARD_COUNT; group++) if (!dirty.has(group)) { dirty.add(group); expanded = true; }
+                    } else if ([...source.groups].some(group => dirty.has(group))) {
+                        for (const group of source.groups) if (!dirty.has(group)) { dirty.add(group); expanded = true; }
+                    }
+                }
+            }
+            stats.groupsTotal = dirty.size; stats.phase = '校验来源';
+            for (const source of this.sources.values()) {
+                source.selected = source.active && !source.copiedControl && (!source.groups.size || [...source.groups].some(group => dirty.has(group)));
+                if (!source.selected) continue;
+                const valid = await this.store.readCommit(source.key, source.manifest, null, (entry, ref, position) => {
+                    if (Array.isArray(source.manifest.bases) && !source.groups.has(this.group(entry.key))) throw new Error('提交路由与记录不匹配');
+                    if (!source.refs.has(ref.key)) {
+                        source.refs.set(ref.key, { key: ref.key, checksum: ref.checksum, type: 'block' }); stats.sourceBlockReads++;
+                        stats.maxInputEntries = Math.max(stats.maxInputEntries, ref.count);
+                    }
+                    source.groups.add(this.group(entry.key));
+                    this.add(source, entry, source.refs.get(ref.key), position);
+                }, false);
+                if (!valid) {
+                    if (!await this.io.get(source.key)) throw this.changed();
+                    throw new Error('存在未通过完整性校验的提交');
+                }
+            }
+            // 旧基线只读兼容；一次只持有一个旧分片，不将正文并入全量缓存。
+            for (const key of legacyKeys) {
+                const value = await this.io.get(key), shard = key.startsWith('bvh_shard_');
+                if (!value) continue;
+                const ref = { key, checksum: HistoryCommitStore.checksum(value), type: shard ? 'legacy-shard' : 'legacy-key' };
+                const source = { key: '', groups: new Set(), members: [], refs: new Map([[key, ref]]) };
+                let count = 0;
+                for (const [rawKey, raw] of shard ? Object.entries(value) : [[key, value]]) {
+                    const entry = this.legacy(rawKey, raw); if (!entry) continue;
+                    this.add(source, entry, ref, rawKey); source.groups.add(this.group(entry.key));
+                    if (++count % 256 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+                }
+                stats.sourceBlockReads++; stats.maxInputEntries = Math.max(stats.maxInputEntries, count);
+            }
+            stats.versionEntries = this.winners.size;
+            const baseIndex = compatible ? { ...index.index } : {};
+            for (const base of Object.keys(baseIndex)) if (dirty.has(this.group(base))) delete baseIndex[base];
+            const jobs = new Map();
+            for (const member of this.winners.values()) {
+                if (!member.deleted) {
+                    const base = VideoKey.base(member.key), shard = StorageManager._getShardId(member.key);
+                    const shards = baseIndex[base] ||= []; if (!shards.includes(shard)) shards.push(shard);
+                }
+                if (this.reusable(member.source)) { member.replacement = member.source.key; this.retained.add(member.source.key); continue; }
+                if (!jobs.has(member.ref)) jobs.set(member.ref, []);
+                jobs.get(member.ref).push(member);
+            }
+            const checkpointTime = [...headers.values()].reduce((time, manifest) => Math.max(time, Number(manifest.id?.split('_')[0]) || 0), Date.now()) + 1;
+            const routes = Object.fromEntries([...this.sources].map(([key, source]) => [key,
+                ['epoch', 'prune'].includes(source.manifest.kind) ? null : Array.isArray(source.manifest.bases)
+                    ? source.manifest.bases : [...new Set(source.members.map(member => VideoKey.base(member.key)))]]));
+            stats.phase = '分批写入';
+            const buffers = new Map(); let buffered = 0, bytes = 0;
+            const remaining = new Map();
+            for (const members of jobs.values()) for (const member of members) {
+                const group = this.group(member.key); remaining.set(group, (remaining.get(group) || 0) + 1);
+            }
+            stats.groupsDone = dirty.size - remaining.size;
+            const flush = async group => {
+                const batch = buffers.get(group); if (!batch?.entries.length) return;
+                buffers.delete(group); buffered -= batch.entries.length; bytes -= batch.bytes;
+                const identity = `${String(checkpointTime).padStart(16, '0')}_${this.store.writer}_${String(++this.store.sequence).padStart(12, '0')}`;
+                const transaction = await this.store.prepare(batch.entries, 'checkpoint', identity, Date.now(), epoch, this.startedAt, null, group);
+                await this.store.publish(transaction, null, true);
+                this.retained.add(transaction.key); routes[transaction.key] = transaction.manifest.bases;
+                for (const member of batch.members) member.replacement = transaction.key;
+                stats.rewrittenEntries += batch.entries.length;
+                stats.publishedBatches++;
+                remaining.set(group, remaining.get(group) - batch.entries.length);
+                if (!remaining.get(group)) stats.groupsDone++;
+            };
+            // 每个来源块只回读一次；跨分 P 的记录在全局预算内按基础视频组缓冲。
+            for (const [ref, members] of jobs) {
+                const value = await this.io.get(ref.key); stats.sourceBlockReads++;
+                if (!value || !HistoryCommitStore.verifyChecksum(value, ref.checksum)) {
+                    if (ref.type === 'block' && !await this.io.get(members[0].source.key)) throw this.changed();
+                    throw new Error('整理来源已变化，保留原提交并稍后重试');
+                }
+                for (const member of members) {
+                    const entry = ref.type === 'block' ? value.entries[member.position]
+                        : this.legacy(member.position, ref.type === 'legacy-shard' ? value[member.position] : value);
+                    if (!entry || entry.key !== member.key || HistoryCommitStore.compare(entry.version, member.version) !== 0)
+                        throw new Error('整理来源记录已变化');
+                    const group = this.group(entry.key), size = this.encoder.encode(JSON.stringify(entry)).length + 1;
+                    const current = buffers.get(group);
+                    if (current?.entries.length && (current.entries.length >= HistoryMaintenance.maxEntries
+                        || current.bytes + size > HistoryMaintenance.maxBytes - 1024)) await flush(group);
+                    while (buffered && (buffered >= HistoryMaintenance.bufferEntries || bytes + size > HistoryMaintenance.bufferBytes)) {
+                        const largest = [...buffers].sort((a, b) => b[1].bytes - a[1].bytes)[0]; await flush(largest[0]);
+                    }
+                    if (!buffers.has(group)) buffers.set(group, { entries: [], members: [], bytes: 0 });
+                    const batch = buffers.get(group); batch.entries.push(entry); batch.members.push(member); batch.bytes += size;
+                    // 单条超大记录不能拆字段或截断，允许其独占一个检查点。
+                    buffered++; bytes += size;
+                    stats.maxBufferedEntries = Math.max(stats.maxBufferedEntries, buffered);
+                    stats.maxBufferedBytes = Math.max(stats.maxBufferedBytes, bytes);
+                }
+            }
+            for (const group of [...buffers.keys()]) await flush(group);
+            stats.phase = '回收旧提交';
+            for (const [key, source] of this.sources) {
+                if (this.retained.has(key) || ['epoch', 'prune'].includes(source.manifest.kind) || protectedKeys.has(key)) continue;
+                const covered = source.selected && source.members.every(member => {
+                    const winner = this.winners.get(member.key), replacement = winner?.replacement;
+                    if (!replacement) return false;
+                    const order = HistoryCommitStore.compare(winner.version, member.version);
+                    return order > 0 || order === 0 && replacement > key;
+                });
+                if (source.active && !covered) continue;
+                await this.io.delete(key); delete routes[key];
+                for (const ref of source.manifest.blocks) await this.io.delete(ref.key);
+            }
+            stats.phase = '更新索引';
+            const coverage = Object.keys(routes).sort();
+            await this.io.set(StorageManager._BASE_INDEX_KEY, { version: 2, complete: true, routeVersion: 2,
+                coverage, index: baseIndex, routes });
+            if (prunePending && epoch === prunePending.epoch) {
+                const pending = await this.io.get('bvh_prune_pending');
+                if (pending && HistoryCommitStore.checksum(pending) === HistoryCommitStore.checksum(prunePending)) await this.io.delete('bvh_prune_pending');
+            }
+            await this.io.set('bvh_grouping_complete_v1', { coverage, epoch, pruneKey });
+            stats.phase = '完成'; stats.groupsDone = stats.groupsTotal;
+            return { before: keys.length, after: coverage.length, writer: this.store.writer };
         }
     }
 
@@ -2395,22 +2619,25 @@
                 for (const key of pending) {
                     // 已校验的清单不可变，避免每次播放保存后重新读取全部待整理清单。
                     const manifest = s._store.commits.get(key)?.manifest || s._store.headers.get(key) || await io.get(key);
-                    if (!Array.isArray(manifest?.bases) || new Set(manifest.bases.map(s._getShardId)).size > 1) { wide = true; break; }
+                    if (['epoch', 'prune'].includes(manifest?.kind) || !Array.isArray(manifest?.bases)
+                        || new Set(manifest.bases.map(s._getShardId)).size > 1) { wide = true; break; }
                 }
                 if (!wide) return;
             }
-            const worker = new HistoryCommitStore(io);
-            await worker.sync();
-            if (worker._incomplete) throw new Error('存在未通过完整性校验的提交');
-            const result = await worker.compact({ resume: true });
-            if (prunePending && worker.epoch === prunePending.epoch) await io.delete('bvh_prune_pending');
-            if (worker._incomplete) throw new Error('整理期间存在未通过完整性校验的提交');
-            await s._persistBaseIndex(worker);
-            // 只覆盖实际整理过的清单，并发产生的新提交仍会在后续检查中被识别。
-            const coverage = [...worker.commits].filter(([, commit]) => commit.manifest.kind === 'checkpoint'
-                && new Set(commit.entries.map(entry => s._getShardId(VideoKey.base(entry.key)))).size <= 1).map(([key]) => key);
-            await io.set('bvh_grouping_complete_v1', { coverage });
-            await io.set('bvh_change_signal', { writer: worker.writer, time: Date.now() });
+            const stats = s._maintenanceStats = { phase: '准备', groupsTotal: 0, groupsDone: 0, scannedEntries: 0,
+                versionEntries: 0, sourceBlockReads: 0, maxInputEntries: 0, maxBufferedEntries: 0, maxBufferedBytes: 0, rewrittenEntries: 0, publishedBatches: 0 };
+            let result;
+            try {
+                for (let attempt = 0; ; attempt++) {
+                    stats.scanPasses = attempt + 1;
+                    try { result = await new HistoryMaintenance(io, stats).run(keys,
+                        attempt ? await io.get('bvh_grouping_complete_v1') : done,
+                        attempt ? await io.get('bvh_prune_pending') : prunePending); break; }
+                    catch (error) { if (error.code !== 'BVH_MAINTENANCE_RETRY' || attempt >= 2) throw error; }
+                }
+            }
+            catch (error) { stats.phase = '中断'; stats.error = Utils._truncate(error.message, 200); throw error; }
+            await io.set('bvh_change_signal', { writer: result.writer, time: Date.now() });
             await s._syncIfStale();
             Utils.log('历史后台分组整理完成', `提交数=${result.before}→${result.after}`);
         },
