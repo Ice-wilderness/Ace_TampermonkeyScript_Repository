@@ -706,15 +706,22 @@ try {
     const signHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', '<div class="ddpc_sign_btna"><a id="signin-btn">今日未签到</a></div>');
     await signHt.evaluate(records => {
         window.__storage = new Map(records); window.__closes = 0; window.__clicks = 0; window.close = () => __closes++;
-        document.querySelector('#signin-btn').onclick = event => { __clicks++; event.currentTarget.classList.add('ddpc_sign_btn_grey'); event.currentTarget.textContent = '今日已签到'; };
+        document.querySelector('#signin-btn').onclick = () => { __clicks++; document.body.insertAdjacentHTML('beforeend', '<button id="captcha-confirm">完成验证码</button>'); };
     }, oldHtStorage);
     await signHt.evaluate(engine);
     assert.equal(await result(signHt, 'sehuatang'), 'needs-foreground');
     assert.equal(await evaluate(signHt, "getRawTargetStatus('sehuatang').stage"), 'captcha');
     assert.equal(await evaluate(signHt, "getRawTargetStatus('sehuatang').taskId"), '', '人工结果检测不绑定其他标签的任务');
-    assert.equal(await signHt.evaluate(() => __clicks), 0, '点选验证码和签到由用户完成');
+    assert.equal(await signHt.evaluate(() => __clicks), 1, '进入签到页后自动点击一次签到入口');
+    assert.equal(await signHt.locator('#captcha-confirm').count(), 1, '自动进入验证码环节后等待用户处理');
     assert.equal(await signHt.locator('#bbs-sign-page-toast').innerText().then(text => text.includes('其他页面处理')), false);
-    await signHt.locator('#signin-btn').click();
+    await signHt.evaluate(() => {
+        document.querySelector('#captcha-confirm').onclick = () => {
+            const control = document.querySelector('#signin-btn');
+            control.classList.add('ddpc_sign_btn_grey'); control.textContent = '今日已签到';
+        };
+    });
+    await signHt.locator('#captcha-confirm').click();
     await signHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
     await signHt.waitForTimeout(850);
     assert.equal(await signHt.evaluate(() => __clicks), 1);
@@ -730,13 +737,53 @@ try {
     await manualHt.close();
 
     const htUnsigned = '<div class="ddpc_sign_btna"><a class="ddpc_sign_btn_red" id="signin-btn">今日未签到，点击签到</a></div><div id="toast" class="toast"><span class="toast-text"></span></div>';
+    for (const blocked of ['hidden', 'disabled', 'aria-disabled']) {
+        const waitingHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
+        await waitingHt.evaluate(blocked => {
+            window.__clicks = 0;
+            const control = document.querySelector('#signin-btn');
+            control.onclick = () => __clicks++;
+            if (blocked === 'hidden') control.style.display = 'none';
+            else if (blocked === 'disabled') control.setAttribute('disabled', '');
+            else control.setAttribute('aria-disabled', 'true');
+        }, blocked);
+        await runSite(waitingHt, 'sehuatang');
+        assert.equal(await waitingHt.evaluate(() => __clicks), 0, '隐藏或禁用的入口不点击');
+        await waitingHt.evaluate(() => {
+            const control = document.querySelector('#signin-btn');
+            control.removeAttribute('disabled'); control.removeAttribute('aria-disabled'); control.style.display = '';
+        });
+        await waitingHt.waitForFunction(() => __clicks === 1);
+        await runSite(waitingHt, 'sehuatang');
+        assert.equal(await waitingHt.evaluate(() => __clicks), 1, '控件恢复可用后只打开一次验证码入口');
+        await waitingHt.close();
+    }
+    const readonlyHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
+    await readonlyHt.evaluate(() => { window.__clicks = 0; document.querySelector('#signin-btn').onclick = () => __clicks++; });
+    await seedLegacyPageTask(readonlyHt, 'sehuatang', 'opened');
+    await evaluate(readonlyHt, "GM_setValue(getScopedStorageKey(STORAGE_KEYS.task,'sehuatang'),{...getTaskLease('sehuatang'),checkOnlySource:'explicit'})");
+    await readonlyHt.evaluate(engine);
+    assert.equal(await readonlyHt.evaluate(() => __clicks), 0, '显式只读检查不点击签到入口');
+    await readonlyHt.close();
+    const expiredHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
+    await expiredHt.evaluate(() => { window.__clicks = 0; document.querySelector('#signin-btn').style.display = 'none'; document.querySelector('#signin-btn').onclick = () => __clicks++; });
+    await runSite(expiredHt, 'sehuatang');
+    await evaluate(expiredHt, "invalidateTargetOperation('sehuatang')");
+    await expiredHt.locator('#signin-btn').evaluate(node => { node.style.display = ''; });
+    await expiredHt.waitForTimeout(50);
+    assert.equal(await expiredHt.evaluate(() => __clicks), 0, '操作失效后控件出现也不再点击');
+    assert.equal(await evaluate(expiredHt, 'pageObserverStops.size'), 0, '失效后清理监听');
+    await expiredHt.close();
     const popupHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
     await evaluate(popupHt, 'updateDashboardPreference({autoClosePageAfterSign:true})');
-    await popupHt.evaluate(() => { window.__closes = 0; window.close = () => __closes++; });
+    await popupHt.evaluate(() => {
+        window.__closes = 0; window.__clicks = 0; window.close = () => __closes++;
+        document.querySelector('#signin-btn').onclick = () => { __clicks++; document.body.insertAdjacentHTML('beforeend', '<div class="captcha">请完成验证码</div>'); };
+    });
     await runSite(popupHt, 'sehuatang');
     await runSite(popupHt, 'sehuatang');
     assert.equal(await evaluate(popupHt, 'pageObserverStops.size'), 1, '重复执行不叠加成功监听');
-    await popupHt.locator('#signin-btn').click();
+    assert.equal(await popupHt.evaluate(() => __clicks), 1, '重复执行和验证码 DOM 更新均不会重复点击签到');
     await popupHt.evaluate(() => { const toast = document.querySelector('#toast'); toast.querySelector('.toast-text').textContent = '签到成功，获得奖励！'; toast.className = 'toast show success'; });
     await popupHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
     assert.equal(await evaluate(popupHt, 'getSehuatangSignControlState().isSigned'), false, '按钮尚未更新时，已由独立成功浮层确认');
@@ -756,10 +803,10 @@ try {
 
     for (const [autoClose, click] of [[false, true], [true, false]]) {
         const gatedHt = await pageFor('https://www.sehuatang.org/plugin.php?id=dd_sign', htUnsigned);
+        if (!click) await gatedHt.locator('#signin-btn').evaluate(node => { node.style.display = 'none'; });
         await evaluate(gatedHt, `updateDashboardPreference({autoClosePageAfterSign:${autoClose}})`);
         await gatedHt.evaluate(() => { window.__closes = 0; window.close = () => __closes++; });
         await gatedHt.evaluate(engine);
-        if (click) await gatedHt.locator('#signin-btn').click();
         await gatedHt.evaluate(() => { const dialog = document.createElement('div'); dialog.className = 'alert_right'; dialog.textContent = '签到成功'; document.body.append(dialog); });
         await gatedHt.waitForFunction(() => GM_getValue('BBSSignHelperDashboardStatus:2026-10-09:sehuatang')?.status === 'success');
         await gatedHt.waitForTimeout(850);

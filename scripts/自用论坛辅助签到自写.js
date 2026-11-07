@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.24.0
+// @version      2.25.0
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -2719,6 +2719,7 @@
             document.querySelector('.ddpc_sign_btna #signin-btn, .ddpc_sign_btna > a');
         const text = (control?.innerText || control?.textContent || '').trim();
         return {
+            control,
             isSigned: control?.classList.contains('ddpc_sign_btn_grey') || text === '今日已签到',
             canSign: control?.id === 'signin-btn' || text.includes('今日未签到')
         };
@@ -2756,21 +2757,33 @@
             if (!isOperationCurrent(operation) || !isSehuatangSignPage() || !getSehuatangSignControlState().canSign) return;
             const control = event.target.closest?.('.ddpc_sign_btna #signin-btn, .ddpc_sign_btna > a');
             if (!control || control.classList.contains('ddpc_sign_btn_grey')) return;
+            container.dataset.bbsSignStarted = '1';
             if (markPendingAutoCloseAfterSignAction('sehuatang', 'sehuatang-manual-sign')) {
                 sessionStorage.setItem('BBSSignHelperPageAction:sehuatang', JSON.stringify({ ...operation, source: 'sehuatang-manual-sign', createdAt: Date.now() }));
             }
         };
         const stop = () => { observer.disconnect(); container.removeEventListener('click', onClick, true); clearTimeout(timeout); delete container.dataset.bbsSignMonitor; pageObserverStops.delete(stop); };
-        const observer = new MutationObserver(() => {
-            if (!isOperationCurrent(operation)) { stop(); return; }
+        const check = () => {
+            if (!isOperationCurrent(operation) || !isSehuatangSignPage()) { stop(); return; }
             const message = getSehuatangSignSuccessMessage();
-            if (!message) return;
-            stop(); actions.completeSign('sehuatang', message);
-        });
+            if (message) {
+                stop(); actions.completeSign('sehuatang', message);
+                return;
+            }
+            const { control, canSign, isSigned } = getSehuatangSignControlState();
+            if (operation.checkOnly || container.dataset.bbsSignStarted === '1' || !canSign || isSigned || !control ||
+                control.disabled || control.hasAttribute('disabled') || control.getAttribute('aria-disabled') === 'true' || !control.getClientRects().length ||
+                getComputedStyle(control).visibility === 'hidden') return;
+            // 只打开验证码入口；先标记，避免点击产生的 DOM 更新再次触发。
+            container.dataset.bbsSignStarted = '1';
+            control.click();
+        };
+        const observer = new MutationObserver(check);
         container.addEventListener('click', onClick, true);
-        observer.observe(container, { attributes: true, attributeFilter: ['class', 'id', 'style', 'hidden'], childList: true, characterData: true, subtree: true });
+        observer.observe(container, { attributes: true, attributeFilter: ['class', 'id', 'style', 'hidden', 'disabled', 'aria-disabled'], childList: true, characterData: true, subtree: true });
         timeout = setTimeout(stop, AUTO_CLOSE_PENDING_TTL_MS);
         pageObserverStops.add(stop);
+        check();
     }
 
     async function runSehuatangPageSign(debugContext) {
@@ -2778,7 +2791,7 @@
         if (!isSehuatangSignPage()) {
             recordTargetStatus('sehuatang', 'needs-foreground', {
                 stage: 'navigate',
-                message: '请直接进入 98堂 签到页，点击签到并完成验证码',
+                message: '请直接进入 98堂 签到页，脚本会自动点击签到，请手动完成验证码',
                 url: location.href
             });
             return false;
@@ -2791,12 +2804,12 @@
             return completeSign('sehuatang', successMessage);
         }
         if (signState.canSign) {
-            monitorSehuatangManualSign(debugContext);
             recordTargetStatus('sehuatang', 'needs-foreground', {
                 stage: 'captcha',
-                message: '请手动点击签到并完成验证码，成功后脚本会自动识别',
+                message: '脚本会自动点击签到，请手动完成验证码，成功后脚本会自动识别',
                 url: location.href
             });
+            monitorSehuatangManualSign(debugContext);
             return false;
         }
 
@@ -3425,7 +3438,7 @@
                 url: "https://www.sehuatang.org/plugin.php?id=dd_sign",
                 openMode: "foreground",
                 resultMode: "script",
-                note: "直接进入签到页，手动点击签到并完成点选验证码；脚本自动检测结果"
+                note: "直接进入签到页后自动点击签到，手动完成点选验证码；脚本自动检测结果"
             },
             async run(debugContext) {
                 const { completeSign, recordTargetStatus } = taskActions(debugContext);
