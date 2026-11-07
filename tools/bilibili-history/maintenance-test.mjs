@@ -146,6 +146,102 @@ test('非初始批次、删除标记及发布信息经后台整理仍完整', as
     assert.equal(fresh.StorageManager.getRecord(key(1)), null);
 });
 
+test('本地删除满 30 天自动回收，保留较新的删除和正常历史，旧基线不会复活', async () => {
+    const shared = sharedStorage(), page = instance(shared, 'local'), day = 86400000;
+    shared.data.set(key(1), record(50, epoch - 40 * day, '旧版原始记录'));
+    const entries = [
+        { key: key(1), deleted: true, version: [epoch - 30 * day, 'delete', 1] },
+        { key: key(2), deleted: true, version: [epoch - 30 * day + 1, 'delete', 2] },
+        { key: key(3), deleted: true, version: [epoch + day, 'delete', 3] },
+        { key: key(4), deleted: false, version: [epoch - 60 * day, 'save', 4], record: page.StorageManager._compact(record(70)) }
+    ];
+    const old = await page.StorageManager._store.prepare([{ key: key(1), deleted: false,
+        version: [epoch - 40 * day, 'save', 1], record: page.StorageManager._compact(record(40, epoch, '旧正文'.repeat(10000))) }]);
+    await page.StorageManager._store.publish(old);
+    await page.StorageManager._store.publish(await page.StorageManager._store.prepare(entries));
+    const bytes = () => JSON.stringify([...shared.data]).length, before = bytes();
+    await page.StorageManager.initializeForKeys([key(4)]);
+    await page.StorageManager._maintainHistory();
+    const fresh = await full(shared), remaining = await fresh.StorageManager.getCloudEntries();
+    assert.equal(remaining.length, 3);
+    assert(!remaining.some(entry => entry.key === key(1)));
+    assert(remaining.find(entry => entry.key === key(2)).deleted);
+    assert(remaining.find(entry => entry.key === key(3)).deleted);
+    assert.equal(fresh.StorageManager.getRecord(key(4)).percent, '70%');
+    assert(bytes() < before, '过期删除对应的提交正文应实际释放空间');
+    assert(![...shared.data.values()].some(value => value?.entries?.some(entry => entry.key === key(1))));
+    assert.equal(shared.data.get('bvh_grouping_complete_v1').localPruneAt, epoch);
+    await fresh.StorageManager._maintainHistory();
+    assert.equal(fresh.StorageManager._maintenanceStats.phase, '无需整理');
+    assert.equal(fresh.StorageManager.getRecord(key(1)), null);
+    assert(page.StorageManager._localPruneTimer, '长期开启页面也应安排下一次检查');
+    page.StorageManager.dispose();
+    assert.equal(page.StorageManager._localPruneTimer, null);
+});
+
+test('配置了仅手动 WebDAV 同步时，本地不提前回收未传播的删除标记', async () => {
+    const shared = sharedStorage(), page = instance(shared);
+    shared.data.set('bvh_webdav_config', { url: 'https://dav.example/history/', frequency: 'off' });
+    await page.StorageManager.mergeCloudEntries([{ key: key(1), deleted: true, version: [epoch - 31 * 86400000, 'delete', 1] }]);
+    await page.StorageManager._maintainHistory();
+    assert.equal((await (await full(shared)).StorageManager.getCloudEntries()).length, 1);
+});
+
+test('本地回收前重新核对删除时间，并在其他页面仍活跃时延后回收', async () => {
+    const shared = sharedStorage(), page = instance(shared);
+    await page.StorageManager.mergeCloudEntries([{ key: key(1), deleted: true, version: [epoch - 31 * 86400000, 'delete', 1] }]);
+    shared.data.set('bvh_active_tab_other', { time: epoch });
+    await page.StorageManager._maintainHistory();
+    assert.equal((await page.StorageManager.getCloudEntries()).length, 1);
+    shared.data.delete('bvh_active_tab_other');
+    await page.StorageManager.mergeCloudEntries([{ key: key(1), deleted: true, version: [epoch, 'delete', 2] }]);
+    assert.equal(await page.StorageManager._pruneDeleted([key(1)], { local: true }), 0);
+    assert.equal((await (await full(shared)).StorageManager.getCloudEntries()).length, 1);
+});
+
+test('本地回收标记发布失败时删除仍有效，重试可完成物理回收', async () => {
+    const shared = sharedStorage(), page = instance(shared);
+    const epochId = '123e4567-e89b-42d3-a456-426614174000';
+    await page.StorageManager.replaceCloudEntries([
+        { key: key(1), deleted: true, version: [epoch - 31 * 86400000, 'delete', 1] }
+    ], epochId);
+    shared.before = ({ name, args }) => {
+        if (name === 'setValue' && args[1]?.kind === 'prune') throw new Error('合成本地回收中断');
+    };
+    await assert.rejects(page.StorageManager._maintainHistory(), /合成本地回收中断/);
+    assert.equal((await (await full(shared)).StorageManager.getCloudEntries()).length, 1);
+    shared.before = null;
+    await page.StorageManager._maintainHistory();
+    assert.equal((await (await full(shared)).StorageManager.getCloudEntries()).length, 0);
+    assert(![...shared.data.values()].some(value => value?.entries?.some(entry => entry.key === key(1))), '旧批次正文也应回收');
+});
+
+test('本地回收已发布后正文删除失败，重启及重试均不恢复旧记录', async () => {
+    const shared = sharedStorage(), page = instance(shared);
+    await page.StorageManager.mergeCloudEntries([{ key: key(1), deleted: true, version: [epoch - 31 * 86400000, 'delete', 1] }]);
+    shared.before = ({ name }) => {
+        if (name === 'deleteValue' && [...shared.data.values()].some(value => value?.kind === 'prune'))
+            throw new Error('合成正文回收中断');
+    };
+    await assert.rejects(page.StorageManager._maintainHistory(), /合成正文回收中断/);
+    assert.equal((await (await full(shared)).StorageManager.getCloudEntries()).length, 0);
+    shared.before = null;
+    await page.StorageManager._maintainHistory();
+    assert(![...shared.data.values()].some(value => value?.entries?.some(entry => entry.key === key(1))));
+});
+
+test('页面持续打开时每日定时检查可回收刚满保留期的标记', async () => {
+    const shared = sharedStorage(), page = instance(shared), s = page.StorageManager;
+    await s.mergeCloudEntries([{ key: key(1), deleted: true, version: [epoch - 29 * 86400000, 'delete', 1] }]);
+    await s._maintainHistory();
+    assert.equal((await s.getCloudEntries()).length, 1);
+    page.context.Date.now = () => epoch + 86400000;
+    page.timers.get(s._localPruneTimer)();
+    page.timers.get(s._compactionTimer)();
+    await s._maintenance;
+    assert.equal((await (await full(shared)).StorageManager.getCloudEntries()).length, 0);
+});
+
 let failed = 0;
 for (const { name, run } of tests) {
     try { await run(); console.log(`通过：${name}`); }

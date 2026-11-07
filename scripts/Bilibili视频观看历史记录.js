@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.6.4
+// @version      4.6.5
 // @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出与失败诊断、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -1990,7 +1990,7 @@
                     && (Number.isInteger(source.manifest.baseGroup) || ref.count === 1
                         || Number(String(ref.checksum).split(':').at(-2)) * 3 <= HistoryMaintenance.maxBytes));
         }
-        async run(keys, done, prunePending) {
+        async run(keys, done, prunePending, checkLocalDeleted = false) {
             const stats = this.stats, headers = new Map(); stats.phase = '读取清单';
             const snapshotKeys = (await this.io.list()), commits = snapshotKeys.filter(key => key.startsWith('bvh_commit_'));
             const index = await this.io.get(StorageManager._BASE_INDEX_KEY);
@@ -2015,7 +2015,7 @@
             if (cutoff >= this.startedAt) throw new Error('整理期间发生回滚或回收，稍后重新整理');
             const legacyKeys = epoch === 'initial' && !pruneKey ? snapshotKeys.filter(key => /^bvh_shard_\d+$/.test(key)
                 || /^(?:BV[a-zA-Z0-9]{10}|av\d+)(?:\?p=\d+)?$/.test(key)) : [];
-            const compatible = !!index?.complete && index.routeVersion === 2 && !!done
+            const compatible = !checkLocalDeleted && !!index?.complete && index.routeVersion === 2 && !!done
                 && (done.epoch || 'initial') === epoch && (done.pruneKey || null) === pruneKey && !prunePending && !legacyKeys.length;
             const covered = new Set(done?.coverage || []), dirty = new Set();
             let all = !compatible;
@@ -2160,7 +2160,7 @@
             stats.phase = '回收旧提交';
             const retired = [], retiredBlocks = [];
             for (const [key, source] of this.sources) {
-                if (this.retained.has(key) || ['epoch', 'prune'].includes(source.manifest.kind) || protectedKeys.has(key)) continue;
+                if (this.retained.has(key) || source.active && ['epoch', 'prune'].includes(source.manifest.kind) || protectedKeys.has(key)) continue;
                 const covered = source.selected && source.members.every(member => {
                     const winner = this.winners.get(member.key), replacement = winner?.replacement;
                     if (!replacement) return false;
@@ -2188,9 +2188,13 @@
                 const pending = await this.io.get('bvh_prune_pending');
                 if (pending && HistoryCommitStore.checksum(pending) === HistoryCommitStore.checksum(prunePending)) await this.io.delete('bvh_prune_pending');
             }
-            await this.io.set('bvh_grouping_complete_v1', { coverage, epoch, pruneKey });
+            const expiredDeleted = checkLocalDeleted ? [...this.winners.values()].filter(member => member.deleted
+                && Date.now() - member.version[0] >= 30 * 86400000).map(member => member.key) : [];
+            await this.io.set('bvh_grouping_complete_v1', { coverage, epoch, pruneKey,
+                localPruneAt: checkLocalDeleted && !expiredDeleted.length ? Date.now() : done?.localPruneAt || 0 });
             stats.phase = '完成'; stats.groupsDone = stats.groupsTotal;
-            return { before: keys.length, after: coverage.length, writer: this.store.writer };
+            return { before: keys.length, after: coverage.length, writer: this.store.writer,
+                expiredDeleted };
         }
     }
 
@@ -2562,10 +2566,16 @@
                 return entries.length;
             });
         },
-        async pruneCloudDeleted(keys, minSyncRevision, epoch) {
+        pruneCloudDeleted(keys, minSyncRevision, epoch) {
+            return StorageManager._pruneDeleted(keys, { minSyncRevision, epoch });
+        },
+        async _pruneDeleted(keys, { minSyncRevision, epoch, local = false } = {}) {
             const s = StorageManager;
             return s._enqueue(async () => {
+                // 配置了 WebDAV（包括仅手动同步）时仍由云端确认删除传播后回收。
+                if (local && (await WebDavSync.config()).url) return 0;
                 await s.initialize(); await s._syncIfStale();
+                if (local) epoch = s._store.epoch;
                 if (s._store._incomplete || s._store.epoch !== epoch) throw new Error('清理前本地同步基线已变化');
                 const now = Date.now(), tabKeys = (await HistoryStoreIO.list()).filter(key => key.startsWith('bvh_active_tab_'));
                 for (const key of tabKeys) {
@@ -2573,10 +2583,13 @@
                     const heartbeat = await HistoryStoreIO.get(key);
                     if (heartbeat && now - heartbeat.time < 120000) return 0;
                 }
-                const dropped = new Set(keys);
+                const dropped = new Set(local ? keys.filter(key => {
+                    const entry = s._store.entries.get(key);
+                    return entry?.deleted && now - entry.version[0] >= 30 * 86400000;
+                }) : keys);
                 for (const key of dropped) {
                     const entry = s._store.entries.get(key);
-                    if (!entry?.deleted || !entry.publishedRevision || entry.publishedRevision > minSyncRevision)
+                    if (!local && (!entry?.deleted || !entry.publishedRevision || entry.publishedRevision > minSyncRevision))
                         throw new Error('删除尚未确认传播，拒绝本地回收');
                 }
                 if (!dropped.size) return 0;
@@ -2596,6 +2609,7 @@
                 }
                 const marker = await s._store.prepare([], 'prune', undefined, Date.now(), epoch, cutoverAt, cutoverAt);
                 marker.manifest.checkpoints = checkpoints;
+                if (local && (await WebDavSync.config()).url) return 0;
                 const changed = await s._store.publish(marker);
                 s._accept(new Set([...changed, ...dropped]));
                 await HistoryStoreIO.set('bvh_prune_pending', { epoch, cutoverAt });
@@ -2644,6 +2658,7 @@
             clearInterval(StorageManager._presenceTimer); StorageManager._presenceTimer = null;
             HistoryStoreIO.delete(`bvh_active_tab_${StorageManager._tabId}`).catch(() => {});
             clearTimeout(StorageManager._compactionTimer); StorageManager._compactionTimer = null;
+            clearTimeout(StorageManager._localPruneTimer); StorageManager._localPruneTimer = null;
             if (StorageManager._listener !== undefined && typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(StorageManager._listener);
             StorageManager._listener = undefined;
             clearTimeout(StorageManager._baseTimer); StorageManager._baseTimer = null; StorageManager._pendingBases?.clear();
@@ -2810,8 +2825,15 @@
             const keys = (await io.list()).filter(key => key.startsWith('bvh_commit_'));
             const done = await io.get('bvh_grouping_complete_v1');
             const prunePending = await io.get('bvh_prune_pending');
+            // 每天检查一次完整删除版本，避免局部视频缓存遗漏过期标记。
+            const localOnly = !(await WebDavSync.config()).url;
+            if (localOnly && !s._localPruneTimer && !s._disposed) s._localPruneTimer = setTimeout(() => {
+                s._localPruneTimer = null; s._scheduleCompaction();
+            }, 86400000);
+            const checkLocalDeleted = localOnly
+                && Date.now() - (done?.localPruneAt || 0) >= 86400000;
             const covered = new Set(done?.coverage || []), pending = keys.filter(key => !covered.has(key));
-            if (done && pending.length < 128 && !prunePending) {
+            if (done && pending.length < 128 && !prunePending && !checkLocalDeleted) {
                 let wide = false;
                 for (const key of pending) {
                     // 已校验的清单不可变，避免每次播放保存后重新读取全部待整理清单。
@@ -2828,13 +2850,21 @@
                     stats.scanPasses = attempt + 1;
                     try { result = await new HistoryMaintenance(io, stats).run(keys,
                         attempt ? await io.get('bvh_grouping_complete_v1') : done,
-                        attempt ? await io.get('bvh_prune_pending') : prunePending); break; }
+                        attempt ? await io.get('bvh_prune_pending') : prunePending, checkLocalDeleted); break; }
                     catch (error) { if (error.code !== 'BVH_MAINTENANCE_RETRY' || attempt >= 2) throw error; }
                 }
             }
             catch (error) { stats.phase = '中断'; stats.error = Utils._truncate(error.message, 200); throw error; }
             await io.set('bvh_change_signal', { writer: result.writer, time: Date.now() });
             await s._syncIfStale();
+            if (result.expiredDeleted.length) {
+                // 沿用回收检查点与多页面保护；真正回收时才加载完整视图。
+                if (await s._pruneDeleted(result.expiredDeleted, { local: true })) {
+                    await new HistoryMaintenance(io, stats).run(await io.list(), await io.get('bvh_grouping_complete_v1'),
+                        await io.get('bvh_prune_pending'), true);
+                    await s._syncIfStale();
+                }
+            }
             Utils.log('历史后台分组整理完成', `提交数=${result.before}→${result.after}`);
         },
         async createLegacySnapshot({ writersStopped = false } = {}) {
