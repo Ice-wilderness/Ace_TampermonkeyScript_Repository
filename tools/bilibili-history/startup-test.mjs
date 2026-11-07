@@ -69,3 +69,38 @@ assert.equal(status, '正在保存访问记录…', '访问提交仍阻塞进度
 assert.equal(visit.StorageManager.getRecord(observer.bvId), null, '等待状态污染正式记录');
 observer.destroy(); releaseWrite();
 console.log('通过：访问提交挂起时进度框立即显示，正式记录不暴露未提交数据');
+
+// 复现站点在初始化期间追加 vd_source：URL 改变不代表媒体身份改变。
+for (const [url, changed] of [
+    ['?p=9&vd_source=synthetic', false],
+    ['?p=9&spm_id_from=synthetic#reply', false],
+    ['?p=10', true],
+    ['/video/BV0000000002/?p=9', true],
+    ['/', true]
+]) {
+    const route = instance(), initial = 'https://www.bilibili.com/video/BV0000000001/?p=9';
+    route.context.location.href = initial;
+    const listeners = new Map();
+    route.context.Event = class { constructor(type) { this.type = type; } };
+    route.context.window.addEventListener = (type, fn) => {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(fn);
+    };
+    route.context.window.dispatchEvent = event => { for (const fn of listeners.get(event.type) || []) fn(event); };
+    route.context.history = { pushState(_state, _title, url) { route.context.location.href = new URL(url, initial).href; },
+        replaceState(_state, _title, url) { route.context.location.href = new URL(url, initial).href; } };
+    let destroyed = 0, refreshed = 0;
+    const observer = { bvId: 'BV0000000001?p=9', destroy() { destroyed++; } };
+    const controller = new route.AppController(); controller.playerObserver = observer;
+    controller.checkAndInitVideoPage = () => { refreshed++; };
+    route.UIComponent.showQuickEntry = () => {};
+    route.HistoryPageSync.refreshControl = () => {};
+    controller.hijackRouter();
+    route.context.history.replaceState({}, '', url);
+    assert.equal(destroyed, changed ? 1 : 0, `路由 ${url} 的播放器监听清理不正确`);
+    if (!changed) assert.equal(controller.playerObserver, observer, '附加参数丢失原媒体监听会话');
+    route.flushTimers(); assert.equal(refreshed, 1);
+    route.context.window.dispatchEvent(new route.context.Event('locationchange'));
+    assert.equal(route.timers.size, 0, '相同 URL 不应重复安排刷新');
+}
+console.log('通过：追踪参数保留播放器监听；切换分 P、BV 或离开视频页仍清理旧会话');

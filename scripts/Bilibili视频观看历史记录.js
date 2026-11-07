@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.6.3
+// @version      4.6.4
 // @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出与失败诊断、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -6599,7 +6599,11 @@
 
             window.addEventListener('locationchange', () => {
                 if (this.currentUrl !== location.href) {
-                    this.playerObserver?.destroy(); this.playerObserver = null;
+                    // 追加追踪参数不改变视频身份，保留媒体绑定和正在进行的保存。
+                    const routeKey = this.getRouteVideoKey();
+                    if (!isVideoPageRoute() || !routeKey || VideoKey.normalize(this.playerObserver?.bvId) !== VideoKey.normalize(routeKey)) {
+                        this.playerObserver?.destroy(); this.playerObserver = null;
+                    }
                     this.currentUrl = location.href;
                     Utils.log('Route changed:', this.currentUrl);
                     setTimeout(() => {
