@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.6.2
+// @version      4.6.3
 // @description  记录并提示 Bilibili 视频观看进度，支持历史管理、统计、JSON/CSV 导入导出与失败诊断、官方历史页同步及可选 WebDAV 云同步与日期备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -24,6 +24,9 @@
 // @grant        GM.setValue
 // @grant        GM.deleteValue
 // @grant        GM.listValues
+// @grant        GM.getValues
+// @grant        GM.setValues
+// @grant        GM.deleteValues
 // @grant        GM_addValueChangeListener
 // @grant        GM_removeValueChangeListener
 // @grant        GM_addStyle
@@ -908,6 +911,9 @@
                         syncRetries: StorageManager._store?.scanRetries || 0,
                         backgroundRunning: !!StorageManager._maintenance,
                         maintenance: StorageManager._maintenanceStats || null,
+                        storageIO: HistoryStoreIO.metrics,
+                        foregroundPriority: { playing: HistoryWorkPriority.players.size, remoteBusy: HistoryWorkPriority.peers.size,
+                            channelAvailable: !!HistoryWorkPriority.channel, unavailable: !!HistoryWorkPriority.unavailable },
                         playback: typeof VideoPlayerObserver === 'undefined' ? null : VideoPlayerObserver.metrics
                     }, null, 2),
                 '',
@@ -1212,22 +1218,112 @@
         }
     };
 
+    // 播放期间暂停后台存储；同源标签页只交换短租约，不额外写入 GM 存储。
+    const HistoryWorkPriority = {
+        players: new Set(), peers: new Map(), waiters: new Set(), channel: null, lastSent: 0, lastBusy: null,
+        now() { return performance.timeOrigin + performance.now(); },
+        localBusy() { return this.players.size > 0 || (StorageManager._queuedWrites || 0) > 0; },
+        start() {
+            if (this.channel || this.unavailable || StorageManager._disposed || typeof BroadcastChannel !== 'function') return;
+            try {
+                this.channel = new BroadcastChannel('bvh_foreground_priority_v1');
+                this.channel.onmessage = ({ data }) => {
+                    if (!data || typeof data.writer !== 'string' || data.writer.length > 80 || data.writer === StorageManager._tabId) return;
+                    if (data.kind === 'probe') { this.refresh(true); return; }
+                    if (data.kind !== 'status' || typeof data.busy !== 'boolean') return;
+                    if (data.busy) {
+                        if (this.peers.size >= 64) this.peers.delete(this.peers.keys().next().value);
+                        this.peers.set(data.writer, this.now() + 30000);
+                    } else this.peers.delete(data.writer);
+                    this.wake();
+                };
+                this.channel.postMessage({ kind: 'probe', writer: StorageManager._tabId });
+            } catch (e) { try { this.channel?.close(); } catch (_) { } this.channel = null; this.unavailable = true; }
+        },
+        refresh(force = false) {
+            const busy = this.localBusy(), now = this.now();
+            this.start(); this.wake();
+            if (this.channel && busy && !this.leaseTimer) this.leaseTimer = setInterval(() => this.refresh(), 5000);
+            if ((!busy || !this.channel) && this.leaseTimer) { clearInterval(this.leaseTimer); this.leaseTimer = null; }
+            if (!this.channel || StorageManager._disposed || !force && busy === this.lastBusy && (!busy || now - this.lastSent < 5000)) return;
+            this.lastBusy = busy; this.lastSent = now;
+            try { this.channel.postMessage({ kind: 'status', writer: StorageManager._tabId, busy }); }
+            catch (e) {
+                try { this.channel.close(); } catch (_) { } this.channel = null; this.unavailable = true;
+                clearInterval(this.leaseTimer); this.leaseTimer = null;
+            }
+        },
+        playing(token, active) {
+            if (active) this.players.add(token); else this.players.delete(token);
+            this.refresh();
+        },
+        busy() {
+            const now = this.now();
+            for (const [writer, expires] of this.peers) if (expires <= now) this.peers.delete(writer);
+            return this.localBusy() || this.peers.size > 0;
+        },
+        wake() { for (const resume of [...this.waiters]) resume(); },
+        async background() {
+            this.start();
+            const stats = StorageManager._maintenanceStats; let since = null;
+            while (!StorageManager._disposed && this.busy()) {
+                if (since === null) { since = this.now(); if (stats) stats.foregroundWaits = (stats.foregroundWaits || 0) + 1; }
+                if (stats) stats.waitingForForeground = true;
+                await new Promise(resolve => {
+                    const resume = () => { clearTimeout(timer); this.waiters.delete(resume); resolve(); };
+                    const timer = setTimeout(resume, 250); this.waiters.add(resume);
+                });
+            }
+            if (stats) {
+                stats.waitingForForeground = false;
+                if (since !== null) stats.foregroundWaitMs = (stats.foregroundWaitMs || 0) + Math.round(this.now() - since);
+            }
+            if (StorageManager._disposed) throw new Error('页面已关闭');
+        },
+        dispose() {
+            clearInterval(this.leaseTimer); this.leaseTimer = null;
+            try { this.channel?.postMessage({ kind: 'status', writer: StorageManager._tabId, busy: false }); } catch (e) { }
+            try { this.channel?.close(); } catch (e) { }
+            this.channel = null; this.players.clear(); this.peers.clear(); this.wake();
+        }
+    };
+
     // --- 不可变提交协议；旧分片仅作为兼容读取基线 ---
     const HistoryStoreIO = {
+        metrics: {},
+        canBatch(name) { return typeof GM !== 'undefined' && typeof GM[name] === 'function'; },
         async call(name, ...args) {
-            const modern = typeof GM !== 'undefined' && GM[name];
-            if (typeof modern === 'function') return await modern.apply(GM, args);
-            const legacy = { getValue: typeof GM_getValue === 'function' && GM_getValue,
-                setValue: typeof GM_setValue === 'function' && GM_setValue,
-                deleteValue: typeof GM_deleteValue === 'function' && GM_deleteValue,
-                listValues: typeof GM_listValues === 'function' && GM_listValues }[name];
-            if (!legacy) throw new Error(`当前脚本环境缺少存储能力：${name}`);
-            return await legacy(...args);
+            const metric = this.metrics[name] ||= { calls: 0, failed: 0, totalMs: 0, maxMs: 0 };
+            const started = performance.now(); metric.calls++;
+            try {
+                const modern = typeof GM !== 'undefined' && GM[name];
+                if (typeof modern === 'function') return await modern.apply(GM, args);
+                const legacy = { getValue: typeof GM_getValue === 'function' && GM_getValue,
+                    setValue: typeof GM_setValue === 'function' && GM_setValue,
+                    deleteValue: typeof GM_deleteValue === 'function' && GM_deleteValue,
+                    listValues: typeof GM_listValues === 'function' && GM_listValues }[name];
+                if (!legacy) throw new Error(`当前脚本环境缺少存储能力：${name}`);
+                return await legacy(...args);
+            } catch (error) { metric.failed++; throw error; }
+            finally { const elapsed = performance.now() - started; metric.totalMs += Math.round(elapsed); metric.maxMs = Math.max(metric.maxMs, Math.round(elapsed)); }
         },
         get(key, fallback) { return this.call('getValue', key, fallback); },
         set(key, value) { return this.call('setValue', key, value); },
         list() { return this.call('listValues'); },
-        delete(key) { return this.call('deleteValue', key); }
+        delete(key) { return this.call('deleteValue', key); },
+        async getMany(keys) {
+            if (keys.length > 1 && this.canBatch('getValues')) return this.call('getValues', keys);
+            const values = await readHistoryBatch(keys, key => this.get(key));
+            return Object.fromEntries(keys.map((key, index) => [key, values[index]]));
+        },
+        async setMany(values) {
+            if (Object.keys(values).length > 1 && this.canBatch('setValues')) return this.call('setValues', values);
+            for (const [key, value] of Object.entries(values)) await this.set(key, value);
+        },
+        async deleteMany(keys) {
+            if (keys.length > 1 && this.canBatch('deleteValues')) return this.call('deleteValues', keys);
+            for (const key of keys) await this.delete(key);
+        }
     };
 
     // 导入失败独立留存，不依赖调试开关；不保存文件正文或视频标题。
@@ -1386,6 +1482,8 @@
     }
 
     class HistoryCommitStore {
+        static batchKeys = 8;
+        static batchBytes = 4 * 1024 * 1024;
         constructor(io = HistoryStoreIO) {
             this.io = io;
             this.writer = crypto.randomUUID();
@@ -1413,7 +1511,11 @@
             const text = JSON.stringify(value, canonical ? (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
                 ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item : undefined);
             let hash = 2166136261;
-            for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+            // FNV-1a 的乘数为 1+2+16+128+256+16777216；保留低 32 位，避免逐字符跨沙箱访问 Math。
+            for (let i = 0; i < text.length; i++) {
+                hash ^= text.charCodeAt(i);
+                hash = (hash + (hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24)) | 0;
+            }
             return `${canonical ? 'sorted:' : ''}${text.length}:${hash >>> 0}`;
         }
         static verifyChecksum(value, checksum) {
@@ -1431,16 +1533,20 @@
                 const refs = manifest.blocks.slice(offset, offset + width);
                 for (const ref of refs) if (typeof ref.key !== 'string'
                     || !ref.key.startsWith(manifest.kind === 'checkpoint' ? 'bvh_checkpoint_' : 'bvh_tx_')) return reject('数据块引用无效');
-                const blocks = await readHistoryBatch(refs, ref => this.io.get(ref.key));
+                const values = this.io.getMany ? await this.io.getMany(refs.map(ref => ref.key)) : null;
+                const blocks = values ? refs.map(ref => values[ref.key]) : await readHistoryBatch(refs, ref => this.io.get(ref.key));
                 for (let index = 0; index < refs.length; index++) {
                     const ref = refs[index];
                     const block = blocks[index];
                     const segmentStart = performance.now();
                     if (diagnostic) diagnostic.storage = { ...diagnostic.storage, block: ref.key,
-                        expectedChecksum: ref.checksum, actualChecksum: block ? HistoryCommitStore.checksum(block, typeof ref.checksum === 'string' && ref.checksum.startsWith('sorted:')) : null,
+                        expectedChecksum: ref.checksum, actualChecksum: null,
                         expectedCount: ref.count, actualCount: Array.isArray(block?.entries) ? block.entries.length : null };
                     if (!block || block.id !== manifest.id || !Array.isArray(block.entries)
-                        || block.entries.length !== ref.count || !HistoryCommitStore.verifyChecksum(block, ref.checksum)) return reject('数据块缺失、身份、条数或校验和不匹配');
+                        || block.entries.length !== ref.count || typeof ref.checksum !== 'string') return reject('数据块缺失、身份、条数或校验和不匹配');
+                    const actualChecksum = HistoryCommitStore.checksum(block, ref.checksum.startsWith('sorted:'));
+                    if (diagnostic) diagnostic.storage.actualChecksum = actualChecksum;
+                    if (actualChecksum !== ref.checksum) return reject('数据块缺失、身份、条数或校验和不匹配');
                     for (let position = 0; position < block.entries.length; position++) {
                         const entry = block.entries[position];
                         if (!entry || !VideoKey.isValid(entry.key) || !Array.isArray(entry.version)
@@ -1475,8 +1581,9 @@
             const targetShards = new Set();
             if (this.scope) for (const base of this.scope) {
                 for (const shard of index?.index?.[base] || []) targetShards.add(shard);
-                for (const key of this.requestedKeys || []) if (VideoKey.base(key) === base) targetShards.add(StorageManager._getShardId(key));
             }
+            // 大批量菜单导入也可能先建立局部视图；请求 key 只遍历一次。
+            if (this.scope) for (const key of this.requestedKeys || []) if (this.scope.has(VideoKey.base(key))) targetShards.add(StorageManager._getShardId(key));
             let segmentStart = performance.now();
             const yieldIfNeeded = async () => {
                 if (performance.now() - segmentStart < 8) return;
@@ -1640,51 +1747,101 @@
             if (baseGroup !== null) manifest.baseGroup = baseGroup;
             return { key: `bvh_commit_${id}`, blocks, manifest };
         }
-        async publish(transaction, guard, deferSync = false, diagnostic) {
-            if (!transaction.blocks.length && !['epoch', 'prune'].includes(transaction.manifest.kind)) return new Set();
-            // 重试前检查并补齐块，沿用原事务身份。
-            for (const block of transaction.blocks) {
-                const expectedChecksum = HistoryCommitStore.checksum(block.value);
-                if (diagnostic) {
-                    diagnostic.stage = '读取待写数据块'; diagnostic.storage = { transaction: transaction.key, block: block.key,
-                        blockCount: transaction.blocks.length, expectedCount: block.value.entries.length,
-                        expectedChecksum };
+        async readValues(keys) {
+            if (this.io.getMany) return this.io.getMany(keys);
+            const values = await readHistoryBatch(keys, key => this.io.get(key));
+            return Object.fromEntries(keys.map((key, index) => [key, values[index]]));
+        }
+        async writeValues(values) {
+            if (this.io.setMany) return this.io.setMany(values);
+            for (const [key, value] of Object.entries(values)) await this.io.set(key, value);
+        }
+        async writeBlocks(blocks, diagnostic, transactionKey = '', references = []) {
+            const expected = new Map(references.map(ref => [ref.key, ref.checksum]));
+            // 批量补齐不可变块，清单仍须等所有块回读确认后才可发布。
+            for (let offset = 0; offset < blocks.length;) {
+                const batch = []; let bytes = 0;
+                while (offset < blocks.length && batch.length < HistoryCommitStore.batchKeys) {
+                    const block = blocks[offset], known = expected.get(block.key);
+                    const checksum = typeof known === 'string' ? known : HistoryCommitStore.checksum(block.value);
+                    const size = Number(checksum.split(':').at(-2)) * 3;
+                    if (batch.length && bytes + size > HistoryCommitStore.batchBytes) break;
+                    batch.push({ block, expectedChecksum: checksum }); bytes += size; offset++;
                 }
-                const current = await this.io.get(block.key);
-                if (!current) {
+                if (diagnostic) {
+                    const { block, expectedChecksum } = batch[0];
+                    diagnostic.stage = '读取待写数据块'; diagnostic.storage = { transaction: transactionKey, block: block.key,
+                        blockCount: blocks.length, batchCount: batch.length, expectedCount: block.value.entries.length, expectedChecksum };
+                }
+                const current = await this.readValues(batch.map(({ block }) => block.key)), missing = {};
+                for (const { block, expectedChecksum } of batch) {
+                    if (!current[block.key]) missing[block.key] = block.value;
+                    else {
+                        const actualChecksum = HistoryCommitStore.checksum(current[block.key], expectedChecksum.startsWith('sorted:'));
+                        if (diagnostic) { diagnostic.stage = '检查提交身份'; Object.assign(diagnostic.storage, { block: block.key, expectedChecksum,
+                            actualChecksum }); }
+                        if (actualChecksum !== expectedChecksum) throw new Error('提交身份冲突，已保留原数据');
+                    }
+                }
+                if (Object.keys(missing).length) {
                     if (diagnostic) diagnostic.stage = '写入数据块';
-                    await this.io.set(block.key, block.value);
-                } else {
-                    if (diagnostic) { diagnostic.stage = '检查提交身份'; diagnostic.storage.actualChecksum = HistoryCommitStore.checksum(current); }
-                    if (HistoryCommitStore.checksum(current) !== expectedChecksum) throw new Error('提交身份冲突，已保留原数据');
+                    await this.writeValues(missing);
                 }
                 if (diagnostic) diagnostic.stage = '回读数据块';
-                const confirmed = await this.io.get(block.key);
+                const confirmed = await this.readValues(batch.map(({ block }) => block.key));
                 const segmentStart = performance.now();
-                const actualChecksum = confirmed ? HistoryCommitStore.checksum(confirmed) : null;
-                if (diagnostic) { diagnostic.stage = '校验数据块'; diagnostic.storage.actualChecksum = actualChecksum;
-                    diagnostic.storage.actualCount = Array.isArray(confirmed?.entries) ? confirmed.entries.length : null; }
-                if (actualChecksum !== expectedChecksum) throw new Error('历史数据块写入未确认，请重试');
+                for (const { block, expectedChecksum } of batch) {
+                    const value = confirmed[block.key], actualChecksum = value ? HistoryCommitStore.checksum(value, expectedChecksum.startsWith('sorted:')) : null;
+                    if (diagnostic) { diagnostic.stage = '校验数据块'; Object.assign(diagnostic.storage, { block: block.key, expectedChecksum,
+                        actualChecksum, expectedCount: block.value.entries.length, actualCount: Array.isArray(value?.entries) ? value.entries.length : null }); }
+                    if (actualChecksum !== expectedChecksum) throw new Error('历史数据块写入未确认，请重试');
+                }
                 HistoryQueries.recordSegment(performance.now() - segmentStart);
                 await new Promise(resolve => setTimeout(resolve, 0));
             }
+        }
+        async publishCheckpoints(transactions) {
+            await this.writeBlocks(transactions.flatMap(transaction => transaction.blocks), undefined, '',
+                transactions.flatMap(transaction => transaction.manifest.blocks));
+            const prior = await this.readValues(transactions.map(transaction => transaction.key)), missing = {};
+            for (const transaction of transactions) {
+                if (!prior[transaction.key]) missing[transaction.key] = transaction.manifest;
+                else if (!HistoryCommitStore.verifyChecksum(prior[transaction.key], HistoryCommitStore.checksum(transaction.manifest))) throw new Error('提交清单身份冲突');
+            }
+            await this.writeValues(missing);
+            for (const transaction of transactions) if (!await this.readCommit(transaction.key, undefined, null, null, false))
+                throw new Error('历史提交未确认，请保留备份并重试');
+        }
+        async publish(transaction, guard, deferSync = false, diagnostic) {
+            if (!transaction.blocks.length && !['epoch', 'prune'].includes(transaction.manifest.kind)) return new Set();
+            await this.writeBlocks(transaction.blocks, diagnostic, transaction.key, transaction.manifest.blocks);
             if (diagnostic) diagnostic.stage = '检查并发变更';
             if (guard && !await guard()) { const error = new Error('准备期间记录发生变化，重新评估'); error.code = 'BVH_RETRY'; throw error; }
             if (diagnostic) { diagnostic.stage = '读取提交清单'; diagnostic.storage = { transaction: transaction.key, blockCount: transaction.blocks.length }; }
             const prior = await this.io.get(transaction.key);
             const comparable = prior && !prior.bases ? { ...transaction.manifest, bases: undefined } : transaction.manifest;
-            if (diagnostic) Object.assign(diagnostic.storage, { expectedChecksum: HistoryCommitStore.checksum(comparable),
-                actualChecksum: prior ? HistoryCommitStore.checksum(prior) : null });
-            if (prior && HistoryCommitStore.checksum(prior) !== HistoryCommitStore.checksum(comparable)) throw new Error('提交清单身份冲突');
+            const expectedChecksum = prior || diagnostic ? HistoryCommitStore.checksum(comparable) : null;
+            const actualChecksum = prior ? HistoryCommitStore.checksum(prior) : null;
+            if (diagnostic) Object.assign(diagnostic.storage, { expectedChecksum, actualChecksum });
+            if (prior && actualChecksum !== expectedChecksum) throw new Error('提交清单身份冲突');
             if (diagnostic) diagnostic.stage = '写入提交清单';
-            if (!prior) await this.io.set(transaction.key, transaction.manifest);
+            let signalled = false;
+            if (!prior && !deferSync && this.io.canBatch?.('setValues')) {
+                try {
+                    await this.writeValues({ [transaction.key]: transaction.manifest, bvh_change_signal: { id: transaction.manifest.id } });
+                    signalled = true;
+                } catch (error) {
+                    if (!await this.readCommit(transaction.key)) throw error;
+                    Utils.warn('历史已提交，跨页提示稍后通过枚举补齐', error); signalled = true;
+                }
+            } else if (!prior) await this.io.set(transaction.key, transaction.manifest);
             if (diagnostic) diagnostic.stage = '确认提交';
             if (!await this.readCommit(transaction.key, undefined, diagnostic)) throw new Error('历史提交未确认，请保留备份并重试');
             if (deferSync) return new Set();
             if (diagnostic) diagnostic.stage = '同步已提交历史';
             const changed = await this.sync();
             // 提示失败不把已经完整发布的事务伪报为失败；枚举会补齐丢失信号。
-            try { await this.io.set('bvh_change_signal', { id: transaction.manifest.id, keys: [...changed] }); }
+            try { if (!signalled) await this.io.set('bvh_change_signal', { id: transaction.manifest.id }); }
             catch (error) { Utils.warn('历史已提交，跨页提示稍后通过枚举补齐', error); }
             return changed;
         }
@@ -1938,23 +2095,33 @@
                     ? source.manifest.bases : [...new Set(source.members.map(member => VideoKey.base(member.key)))]]));
             stats.phase = '分批写入';
             const buffers = new Map(); let buffered = 0, bytes = 0;
+            const staged = []; let stagedEntries = 0, stagedBytes = 0;
             const remaining = new Map();
             for (const members of jobs.values()) for (const member of members) {
                 const group = this.group(member.key); remaining.set(group, (remaining.get(group) || 0) + 1);
             }
             stats.groupsDone = dirty.size - remaining.size;
+            const publishStaged = async () => {
+                if (!staged.length) return;
+                await this.store.publishCheckpoints(staged.map(item => item.transaction));
+                for (const { transaction, members, group } of staged) {
+                    this.retained.add(transaction.key); routes[transaction.key] = transaction.manifest.bases;
+                    for (const member of members) member.replacement = transaction.key;
+                    stats.rewrittenEntries += members.length; stats.publishedBatches++;
+                    remaining.set(group, remaining.get(group) - members.length);
+                    if (!remaining.get(group)) stats.groupsDone++;
+                }
+                stats.publishRounds = (stats.publishRounds || 0) + 1;
+                staged.length = 0; stagedEntries = 0; stagedBytes = 0;
+            };
             const flush = async group => {
                 const batch = buffers.get(group); if (!batch?.entries.length) return;
+                if (staged.length && stagedBytes + batch.bytes > HistoryCommitStore.batchBytes) await publishStaged();
                 buffers.delete(group); buffered -= batch.entries.length; bytes -= batch.bytes;
                 const identity = `${String(checkpointTime).padStart(16, '0')}_${this.store.writer}_${String(++this.store.sequence).padStart(12, '0')}`;
                 const transaction = await this.store.prepare(batch.entries, 'checkpoint', identity, Date.now(), epoch, this.startedAt, null, group);
-                await this.store.publish(transaction, null, true);
-                this.retained.add(transaction.key); routes[transaction.key] = transaction.manifest.bases;
-                for (const member of batch.members) member.replacement = transaction.key;
-                stats.rewrittenEntries += batch.entries.length;
-                stats.publishedBatches++;
-                remaining.set(group, remaining.get(group) - batch.entries.length);
-                if (!remaining.get(group)) stats.groupsDone++;
+                staged.push({ transaction, members: batch.members, group }); stagedEntries += batch.entries.length; stagedBytes += batch.bytes;
+                if (staged.length >= HistoryCommitStore.batchKeys || stagedBytes >= HistoryCommitStore.batchBytes) await publishStaged();
             };
             // 每个来源块只回读一次；跨分 P 的记录在全局预算内按基础视频组缓冲。
             for (const [ref, members] of jobs) {
@@ -1972,19 +2139,26 @@
                     const current = buffers.get(group);
                     if (current?.entries.length && (current.entries.length >= HistoryMaintenance.maxEntries
                         || current.bytes + size > HistoryMaintenance.maxBytes - 1024)) await flush(group);
-                    while (buffered && (buffered >= HistoryMaintenance.bufferEntries || bytes + size > HistoryMaintenance.bufferBytes)) {
-                        const largest = [...buffers].sort((a, b) => b[1].bytes - a[1].bytes)[0]; await flush(largest[0]);
+                    while (buffered + stagedEntries && (buffered + stagedEntries >= HistoryMaintenance.bufferEntries
+                        || bytes + stagedBytes + size > HistoryMaintenance.bufferBytes)) {
+                        const published = stats.publishedBatches;
+                        while (buffers.size && stats.publishedBatches === published) {
+                            const largest = [...buffers].sort((a, b) => b[1].bytes - a[1].bytes)[0]; await flush(largest[0]);
+                        }
+                        await publishStaged();
                     }
                     if (!buffers.has(group)) buffers.set(group, { entries: [], members: [], bytes: 0 });
                     const batch = buffers.get(group); batch.entries.push(entry); batch.members.push(member); batch.bytes += size;
                     // 单条超大记录不能拆字段或截断，允许其独占一个检查点。
                     buffered++; bytes += size;
-                    stats.maxBufferedEntries = Math.max(stats.maxBufferedEntries, buffered);
-                    stats.maxBufferedBytes = Math.max(stats.maxBufferedBytes, bytes);
+                    stats.maxBufferedEntries = Math.max(stats.maxBufferedEntries, buffered + stagedEntries);
+                    stats.maxBufferedBytes = Math.max(stats.maxBufferedBytes, bytes + stagedBytes);
                 }
             }
             for (const group of [...buffers.keys()]) await flush(group);
+            await publishStaged();
             stats.phase = '回收旧提交';
+            const retired = [], retiredBlocks = [];
             for (const [key, source] of this.sources) {
                 if (this.retained.has(key) || ['epoch', 'prune'].includes(source.manifest.kind) || protectedKeys.has(key)) continue;
                 const covered = source.selected && source.members.every(member => {
@@ -1994,8 +2168,17 @@
                     return order > 0 || order === 0 && replacement > key;
                 });
                 if (source.active && !covered) continue;
-                await this.io.delete(key); delete routes[key];
-                for (const ref of source.manifest.blocks) await this.io.delete(ref.key);
+                retired.push(key); retiredBlocks.push(...source.manifest.blocks.map(ref => ref.key));
+            }
+            // 先移除已被完整替代的清单，再批量回收正文；任一步中断都保留有效副本。
+            for (let offset = 0; offset < retired.length; offset += 64) {
+                const keys = retired.slice(offset, offset + 64);
+                if (this.io.deleteMany) await this.io.deleteMany(keys); else for (const key of keys) await this.io.delete(key);
+                for (const key of keys) delete routes[key];
+            }
+            for (let offset = 0; offset < retiredBlocks.length; offset += 64) {
+                const keys = retiredBlocks.slice(offset, offset + 64);
+                if (this.io.deleteMany) await this.io.deleteMany(keys); else for (const key of keys) await this.io.delete(key);
             }
             stats.phase = '更新索引';
             const coverage = Object.keys(routes).sort();
@@ -2457,6 +2640,7 @@
         },
         dispose() {
             StorageManager._disposed = true;
+            HistoryWorkPriority.dispose();
             clearInterval(StorageManager._presenceTimer); StorageManager._presenceTimer = null;
             HistoryStoreIO.delete(`bvh_active_tab_${StorageManager._tabId}`).catch(() => {});
             clearTimeout(StorageManager._compactionTimer); StorageManager._compactionTimer = null;
@@ -2467,7 +2651,8 @@
         _enqueue(operation) {
             const s = StorageManager;
             s._queuedWrites = (s._queuedWrites || 0) + 1;
-            const promise = s._queue.then(operation), settled = () => { s._queuedWrites--; };
+            HistoryWorkPriority.refresh();
+            const promise = s._queue.then(operation), settled = () => { s._queuedWrites--; HistoryWorkPriority.refresh(); };
             promise.then(settled, settled);
             s._queue = promise.catch(() => {}); return promise;
         },
@@ -2604,10 +2789,22 @@
         },
         async _maintainHistory() {
             const s = StorageManager;
+            const stats = s._maintenanceStats = { phase: '检查', groupsTotal: 0, groupsDone: 0, scannedEntries: 0,
+                versionEntries: 0, sourceBlockReads: 0, maxInputEntries: 0, maxBufferedEntries: 0, maxBufferedBytes: 0,
+                rewrittenEntries: 0, publishedBatches: 0, foregroundWaits: 0, foregroundWaitMs: 0, waitingForForeground: false };
             // 独立实例且每次存储操作让出事件循环，不占用前台保存队列或升级局部缓存。
-            const io = Object.fromEntries(['get', 'set', 'list', 'delete'].map(name => [name, async (...args) => {
+            const io = Object.fromEntries(['get', 'set', 'list', 'delete', 'getMany', 'setMany', 'deleteMany'].map(name => [name, async (...args) => {
                 await new Promise(resolve => setTimeout(resolve, 0));
-                if (s._disposed) throw new Error('页面已关闭');
+                await HistoryWorkPriority.background();
+                const api = { getMany: 'getValues', setMany: 'setValues', deleteMany: 'deleteValues' }[name];
+                if (api && !HistoryStoreIO.canBatch(api)) {
+                    if (name === 'getMany') {
+                        const values = await readHistoryBatch(args[0], key => io.get(key));
+                        return Object.fromEntries(args[0].map((key, index) => [key, values[index]]));
+                    }
+                    if (name === 'setMany') { for (const [key, value] of Object.entries(args[0])) await io.set(key, value); return; }
+                    for (const key of args[0]) await io.delete(key); return;
+                }
                 return HistoryStoreIO[name](...args);
             }]));
             const keys = (await io.list()).filter(key => key.startsWith('bvh_commit_'));
@@ -2622,10 +2819,9 @@
                     if (['epoch', 'prune'].includes(manifest?.kind) || !Array.isArray(manifest?.bases)
                         || new Set(manifest.bases.map(s._getShardId)).size > 1) { wide = true; break; }
                 }
-                if (!wide) return;
+                if (!wide) { stats.phase = '无需整理'; return; }
             }
-            const stats = s._maintenanceStats = { phase: '准备', groupsTotal: 0, groupsDone: 0, scannedEntries: 0,
-                versionEntries: 0, sourceBlockReads: 0, maxInputEntries: 0, maxBufferedEntries: 0, maxBufferedBytes: 0, rewrittenEntries: 0, publishedBatches: 0 };
+            stats.phase = '准备';
             let result;
             try {
                 for (let attempt = 0; ; attempt++) {
@@ -4977,11 +5173,11 @@
             this.onIdentityChange = onIdentityChange; this.cid = null;
             this.bvId = null; this.title = ''; this.videoEl = null; this.hasPlayed = false;
             this._lastKnownState = null; this._source = ''; this._metadataSeen = false; this._mediaGeneration = 0;
-            this._onPlay = () => { this.hasPlayed = true; this.saveProgressDebounced(); };
-            this._onTimeUpdate = () => { if (this.videoEl?.currentTime > 0) this.hasPlayed = true; this.capture(); this.saveProgressDebounced(); };
-            this._onPause = () => { this.capture(); this.persistSnapshot(); };
-            this._onBeforeUnload = () => { this.capture(); this.persistSnapshot(); };
-            this._onLoadStart = () => { this.state = 'switching'; this._mediaGeneration++; this._metadataSeen = false; this._cancelSeek?.(); };
+            this._onPlay = () => { HistoryWorkPriority.playing(this.generation, !this.destroyed); this.hasPlayed = true; this.saveProgressDebounced(); };
+            this._onTimeUpdate = () => { HistoryWorkPriority.playing(this.generation, !this.destroyed && this.videoEl?.paused === false); if (this.videoEl?.currentTime > 0) this.hasPlayed = true; this.capture(); this.saveProgressDebounced(); };
+            this._onPause = () => { HistoryWorkPriority.playing(this.generation, false); this.capture(); this.persistSnapshot(); };
+            this._onBeforeUnload = () => { HistoryWorkPriority.playing(this.generation, false); this.capture(); this.persistSnapshot(); };
+            this._onLoadStart = () => { HistoryWorkPriority.playing(this.generation, false); this.state = 'switching'; this._mediaGeneration++; this._metadataSeen = false; this._cancelSeek?.(); };
             this._onMetadata = () => {
                 this._metadataSeen = true;
                 if (this._metadataTimer) clearTimeout(this._metadataTimer);
@@ -5034,6 +5230,7 @@
             this.ensureVisitedRecord();
             this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
             this.videoEl = video; this._mediaGeneration++; this._metadataSeen = false; this.state = 'waiting';
+            HistoryWorkPriority.playing(this.generation, video.paused === false);
             this.bindEvents();
             const retired = VideoPlayerObserver.retired.get(video);
             if (!retired || (retired.key === this.bvId && retired.source === (video.currentSrc || video.src || ''))) this.confirmMedia();
@@ -5184,6 +5381,7 @@
                 if (!this.bvId) { this.bvId = EpisodeResolver.getCurrentKey(); if (this.bvId) this.setupRecord(); }
                 this.completeMissingTitle();
                 const video = this.getCurrentVideo();
+                HistoryWorkPriority.playing(this.generation, video?.paused === false);
                 if (video !== this.videoEl) this.bindVideo(video);
                 if (this.state === 'waiting') this.confirmMedia();
                 if (video && !video.paused) { this.hasPlayed = true; this.saveProgress(); }
@@ -5198,6 +5396,7 @@
         destroy() {
             if (this.destroyed) return;
             this.destroyed = true; this.state = 'destroyed';
+            HistoryWorkPriority.playing(this.generation, false);
             if (this.videoEl) VideoPlayerObserver.retired.set(this.videoEl, { key: this.bvId, source: this._source });
             this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
             window.removeEventListener('beforeunload', this._onBeforeUnload);

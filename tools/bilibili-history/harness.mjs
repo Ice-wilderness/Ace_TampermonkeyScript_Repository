@@ -14,6 +14,7 @@ export function instrument(text = source) {
         ...(typeof FloatingEntry === 'undefined' ? {} : { FloatingEntry }),
         ...(typeof HistoryCommitStore === 'undefined' ? {} : { HistoryCommitStore, HistoryStoreIO }),
         ...(typeof HistoryMaintenance === 'undefined' ? {} : { HistoryMaintenance }),
+        ...(typeof HistoryWorkPriority === 'undefined' ? {} : { HistoryWorkPriority }),
         ...(typeof ImportDiagnostics === 'undefined' ? {} : { ImportDiagnostics }),
         ...(typeof HistoryQueries === 'undefined' ? {} : { HistoryQueries, HistoryManagerPanel, WorkbenchLayers }),
         ...(typeof WebDavFormat === 'undefined' ? {} : { WebDavFormat, WebDavCodec, WebDavWorker,
@@ -25,7 +26,7 @@ export function memoryLocalStorage() {
     return { get length() { return data.size; }, key: i => [...data.keys()][i] ?? null,
         getItem: k => data.get(k) ?? null, setItem: (k, v) => data.set(k, String(v)), removeItem: k => data.delete(k) };
 }
-export function sharedStorage() {
+export function sharedStorage(options = {}) {
     const data = new Map(), calls = [], listeners = new Map();
     let serial = 0;
     const shared = { data, calls, before: null, dropSignals: false,
@@ -45,6 +46,23 @@ export function sharedStorage() {
             for (const [name, fn] of Object.entries(sync)) async[name] = async (...args) => {
                 await shared.before?.({ owner, name, args }); return fn(...args);
             };
+            if (options.batch) {
+                async.getValues = async keys => {
+                    await shared.before?.({ owner, name: 'getValues', args: [keys] });
+                    calls.push({ owner, type: 'getMany', keys: [...keys] });
+                    return Object.fromEntries(keys.map(key => [key, run('get', key)]));
+                };
+                async.setValues = async values => {
+                    await shared.before?.({ owner, name: 'setValues', args: [values] });
+                    calls.push({ owner, type: 'setMany', keys: Object.keys(values) });
+                    for (const [key, value] of Object.entries(values)) run('set', key, value);
+                };
+                async.deleteValues = async keys => {
+                    await shared.before?.({ owner, name: 'deleteValues', args: [keys] });
+                    calls.push({ owner, type: 'deleteMany', keys: [...keys] });
+                    for (const key of keys) run('delete', key);
+                };
+            }
             return { GM: async, GM_getValue: sync.getValue, GM_setValue: sync.setValue,
                 GM_deleteValue: sync.deleteValue, GM_listValues: sync.listValues,
                 GM_addValueChangeListener: (key, fn) => { const id = ++serial; listeners.set(id, { owner, key, fn }); return id; },

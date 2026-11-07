@@ -49,7 +49,8 @@ const cases = [
         const after = w.StorageManager.getRecord(key(1));
         assert.equal(after.title, '迟到的正确标题');
         for (const field of ['status', 'currentTime', 'percent', 'savedAt']) assert.equal(after[field], before[field]);
-        const writes = w.shared.calls.length; await p.completeMissingTitle(); assert.equal(w.shared.calls.length, writes);
+        const writes = w.shared.calls.filter(call => call.type === 'set').length;
+        await p.completeMissingTitle(); assert.equal(w.shared.calls.filter(call => call.type === 'set').length, writes);
         p.destroy();
     }],
     ['标题补全保留最新进度、已有标题且不复活已删除记录', async () => {

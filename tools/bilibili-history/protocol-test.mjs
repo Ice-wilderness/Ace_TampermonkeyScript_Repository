@@ -6,6 +6,51 @@ const test = (name, run) => tests.push([name, run]);
 const fresh = async shared => { const w = instance(shared); await w.StorageManager.initialize(); return w; };
 const entry = (w, n, percent = 50, version = w.StorageManager.sampleVersion()) => ({ key: key(n), record: w.StorageManager._compact(record(percent)), source: 'playback', version, deleted: false });
 
+test('整数哈希与旧乘法逐字一致，兼容嵌套字段、Unicode、长文本和旧校验格式', () => {
+    const { HistoryCommitStore: Store } = instance();
+    const previous = (value, canonical) => {
+        const text = JSON.stringify(value, canonical ? (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+            ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item : undefined);
+        let hash = 2166136261;
+        for (let i = 0; i < text.length; i++) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+        return `${canonical ? 'sorted:' : ''}${text.length}:${hash >>> 0}`;
+    };
+    const values = [null, false, 0, -0, NaN, '中文😀\ud800', { 10: '十', 2: '二', z: undefined, a: [null, undefined, , 3] },
+        { z: '长文本😀'.repeat(20000), a: [{ p: 100, title: '引号"及\\换行\n' }] }];
+    let state = 123456;
+    for (let i = 0; i < 200; i++) {
+        state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+        values.push({ z: [state, String.fromCharCode(state & 65535)], a: { p: i % 101, t: `${i}:00`, n: '标题' + state } });
+    }
+    for (const value of values) for (const canonical of [false, true])
+        assert.equal(Store.checksum(value, canonical), previous(value, canonical));
+});
+
+test('新提交复用预期校验和，诊断与验证共用回读结果，实际正文仍独立校验四遍', async () => {
+    const w = await fresh(), Store = w.HistoryCommitStore, store = w.StorageManager._store;
+    const checksum = Store.checksum; let bodyChecks = 0;
+    Store.checksum = (value, ...args) => { if (Array.isArray(value?.entries)) bodyChecks++; return checksum(value, ...args); };
+    const tx = await store.prepare([entry(w, 1), entry(w, 2)]);
+    assert.equal(bodyChecks, tx.blocks.length, '准备阶段每块只计算一次预期值');
+    await store.publish(tx, null, false, { stage: '', storage: {} });
+    assert.equal(bodyChecks, tx.blocks.length * 4, '准备、写后回读、提交确认与同步各校验一次');
+    const ref = tx.manifest.blocks[0];
+    w.shared.data.get(ref.key).entries[0].record.p++;
+    await assert.rejects(store.publish(tx, null, false, { stage: '', storage: {} }), /提交身份冲突/);
+});
+
+test('准备后的正文被修改时不能靠复用的预期值发布，提交确认也拒绝晚到的损坏', async () => {
+    for (const late of [false, true]) {
+        const w = await fresh(), store = w.StorageManager._store, tx = await store.prepare([entry(w, 1)]);
+        if (!late) tx.blocks[0].value.entries[0].record.p++;
+        else w.shared.before = ({ name, args }) => {
+            if (name === 'setValue' && args[0] === tx.key) w.shared.data.get(tx.blocks[0].key).entries[0].record.p++;
+        };
+        await assert.rejects(store.publish(tx, null, false, { stage: '', storage: {} }), /写入未确认|历史提交未确认/);
+        assert.equal((await fresh(w.shared)).StorageManager.getAllKeys().length, 0);
+    }
+});
+
 test('不同子域并行保存及遗漏信号', async () => {
     const shared = sharedStorage(); shared.dropSignals = true;
     const a = await fresh(shared), b = await fresh(shared);

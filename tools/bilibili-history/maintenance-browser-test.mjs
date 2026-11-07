@@ -16,7 +16,7 @@ try {
             await page.goto('https://www.bilibili.com/video/BV0000000001');
             await page.evaluate(() => {
                 const values = new Map(), bytes = new Map();
-                window.ioStats = { reads: 0, writes: 0, readBytes: 0, writeBytes: 0 };
+                window.ioStats = { reads: 0, writes: 0, readBytes: 0, writeBytes: 0, storageMutations: 0 };
                 const dataKey = key => /^bvh_(tx|checkpoint)_/.test(key);
                 window.GM_getValue = (key, fallback) => {
                     if (dataKey(key)) { ioStats.reads++; ioStats.readBytes += bytes.get(key) || 0; }
@@ -29,8 +29,11 @@ try {
                 };
                 window.GM_deleteValue = key => { values.delete(key); bytes.delete(key); };
                 window.GM_listValues = () => [...values.keys()];
-                window.GM = { getValue: async (...args) => GM_getValue(...args), setValue: async (...args) => GM_setValue(...args),
-                    listValues: async () => GM_listValues(), deleteValue: async key => GM_deleteValue(key) };
+                window.GM = { getValue: async (...args) => GM_getValue(...args), setValue: async (...args) => { ioStats.storageMutations++; GM_setValue(...args); },
+                    listValues: async () => GM_listValues(), deleteValue: async key => { ioStats.storageMutations++; GM_deleteValue(key); },
+                    getValues: async keys => Object.fromEntries(keys.map(key => [key, GM_getValue(key)])),
+                    setValues: async values => { ioStats.storageMutations++; for (const [key, value] of Object.entries(values)) GM_setValue(key, value); },
+                    deleteValues: async keys => { ioStats.storageMutations++; for (const key of keys) GM_deleteValue(key); } };
                 window.GM_addStyle = css => { const el = document.createElement('style'); el.textContent = css; document.head.append(el); };
                 window.GM_info = { script: { version: 'test' }, scriptHandler: '结构化复制存储夹具' };
                 window.unsafeWindow = window; window.maintenanceCompleted = 0; window.warnings = [];
@@ -55,7 +58,7 @@ try {
                 player.bindVideo(media); player.hasPlayed = true; player.startVideoWatch();
                 window.mediaClock = setInterval(() => { media.currentTime++; media.dispatchEvent(new Event('timeupdate')); }, 100);
                 window.heartbeats = 0; window.uiClock = setInterval(() => heartbeats++, 50);
-                Object.assign(ioStats, { reads: 0, writes: 0, readBytes: 0, writeBytes: 0 });
+                Object.assign(ioStats, { reads: 0, writes: 0, readBytes: 0, writeBytes: 0, storageMutations: 0 });
             }, count);
             const cdp = await context.newCDPSession(page);
             await cdp.send('HeapProfiler.collectGarbage');
@@ -65,6 +68,15 @@ try {
             const foreground = page.evaluate(async () => {
                 media.currentTime++; const started = performance.now(); await player.saveProgress(); return performance.now() - started;
             });
+            if (mode === '优化版') {
+                await page.waitForFunction(() => testAPI.StorageManager._maintenanceStats?.waitingForForeground);
+                await foreground;
+                const paused = await page.evaluate(() => ({ rewritten: testAPI.StorageManager._maintenanceStats.rewrittenEntries,
+                    saves: testAPI.VideoPlayerObserver.metrics.completed }));
+                assert.equal(paused.rewritten, 0, '播放期间后台仍在重写历史'); assert(paused.saves > 0, '前台保存被后台阻塞');
+                await page.evaluate(async () => { clearInterval(mediaClock); media.paused = true; media.dispatchEvent(new Event('pause'));
+                    await player._saveTask; await testAPI.StorageManager._queue; });
+            }
             for (;;) {
                 peak = Math.max(peak, (await cdp.send('Runtime.getHeapUsage')).usedSize);
                 const running = await page.evaluate(() => !!testAPI.StorageManager._maintenance);
@@ -104,7 +116,7 @@ try {
                         for (const block of tx.blocks) GM_setValue(block.key, block.value);
                         GM_setValue(tx.key, tx.manifest);
                     }
-                    Object.assign(ioStats, { reads: 0, writes: 0, readBytes: 0, writeBytes: 0 });
+                    Object.assign(ioStats, { reads: 0, writes: 0, readBytes: 0, writeBytes: 0, storageMutations: 0 });
                     s._scheduleCompaction();
                 });
                 await cdp.send('HeapProfiler.collectGarbage');
