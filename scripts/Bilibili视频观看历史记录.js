@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.7.0
-// @description  记录并提示 Bilibili 视频观看进度，支持分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
+// @version      4.8.0
+// @description  记录并提示 Bilibili 视频观看进度，支持原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -140,7 +140,7 @@
     const PENDING_SEEK_KEY = 'bvh_pending_seek';
     const BACKUP_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
     const BACKUP_MAX_COUNT = 200;
-    const HEADER_SELECTOR = '#biliMainHeader, .bili-header, .bili-header__bar, .mini-header, .international-header';
+    const HEADER_SELECTOR = '#biliMainHeader, .bili-header, .bili-header__bar, .mini-header, .international-header, .custom-navbar';
     const HEADER_SETTLE_DELAY = 900;
     const DOM_START_FALLBACK_DELAY = 4500;
     const DOM_IDLE_TIMEOUT = 800;
@@ -151,16 +151,22 @@
     const ENDING_RECOMMEND_ROOT_SELECTOR = '.bpx-player-ending-related';
     const ENDING_RECOMMEND_ITEM_SELECTOR = 'a.bpx-player-ending-related-item';
     const VIDEO_LINK_SELECTOR = `a[href*="/video/"], a[href*="/v/"], a[href*="bvid="], ${ENDING_RECOMMEND_ITEM_SELECTOR}`;
-    const HEADER_POPOVER_SELECTOR = '.dynamic-panel-popover, .history-panel-popover, .favorite-panel-popover, #biliHeaderDynScrollCon, #favorite-content-scroll, .header-favorite-popover';
+    // 仅识别 Evolved 自定义顶栏中的视频菜单，避免其通用 class 命中原生页面。
+    const EVOLVED_HEADER_POPOVER_SELECTOR = '.custom-navbar .custom-navbar-item:is([data-name="feeds"], [data-name="watchlater"], [data-name="favorites"], [data-name="history"]) .popup-container';
+    const EVOLVED_HEADER_VIDEO_LINK_SELECTOR = `${EVOLVED_HEADER_POPOVER_SELECTOR} :is(a.video-card, a.watchlater-cover-container, a.favorites-cover-container, a.history-cover-container):is([href*="/video/"], [href*="/v/"], [href*="bvid="])`;
+    const EVOLVED_HEADER_COVER_SELECTOR = `${EVOLVED_HEADER_POPOVER_SELECTOR} :is(.video-card .cover-container, a.watchlater-cover-container, a.favorites-cover-container, a.history-cover-container)`;
+    const EVOLVED_HEADER_CARD_SELECTOR = `${EVOLVED_HEADER_POPOVER_SELECTOR} :is(a.video-card, .watchlater-card, .favorite-card, .time-group-item)`;
+    const HEADER_POPOVER_SELECTOR = `.dynamic-panel-popover, .history-panel-popover, .favorite-panel-popover, #biliHeaderDynScrollCon, #favorite-content-scroll, .header-favorite-popover, ${EVOLVED_HEADER_POPOVER_SELECTOR}`;
     const HEADER_POPOVER_VIDEO_LINK_SELECTOR = [
         '.dynamic-panel-popover .header-dynamic__box--right[href*="/video/"]',
         '.history-panel-popover .header-history-card[href*="/video/"]',
         '.favorite-panel-popover .header-fav-card[href*="/video/"]',
         '.favorite-panel-popover .header-fav-card[href*="bvid="]',
         '#favorite-content-scroll .header-fav-card[href*="/video/"]',
-        '#favorite-content-scroll .header-fav-card[href*="bvid="]'
+        '#favorite-content-scroll .header-fav-card[href*="bvid="]',
+        EVOLVED_HEADER_VIDEO_LINK_SELECTOR
     ].join(', ');
-    const HEADER_POPOVER_COVER_SELECTOR = '.header-dynamic__box--right .cover, .header-history-video__image, .header-fav-card__image';
+    const HEADER_POPOVER_COVER_SELECTOR = `.header-dynamic__box--right .cover, .header-history-video__image, .header-fav-card__image, ${EVOLVED_HEADER_COVER_SELECTOR}`;
     const MUTATION_RELEVANT_SELECTOR = `${VIDEO_LINK_SELECTOR}, ${PLAYLIST_ITEM_SELECTOR}, ${HEADER_POPOVER_SELECTOR}, ${HEADER_POPOVER_VIDEO_LINK_SELECTOR}`;
     const VIDEO_OBSERVER_ROOT_SELECTOR = [
         ENDING_RECOMMEND_ROOT_SELECTOR,
@@ -401,6 +407,10 @@
         ${multi}[data-side=left]::before { right: -8px; }
         ${multi}[data-side=right]::before { left: -8px; }
         ${multi}[data-inline=true] { position: relative; inset: auto; width: auto; max-width: 100%; margin: 8px 0; }
+        .custom-navbar ${multi}, .custom-navbar ${multi} * { transition: none; }
+        .custom-navbar ${multi} { pointer-events: auto; }
+        .custom-navbar .custom-navbar-item:not(.disabled)[data-bvh-multi-open=true] > .popup-container { top: 100%; }
+        .custom-navbar .custom-navbar-item:not(.disabled)[data-bvh-multi-open=true] > .popup-container > .popup { opacity: 1; pointer-events: auto; }
         ${multi}.bvh-multi-leaving { pointer-events: none; animation: bvh-multi-exit .12s ease-in both; }
         @keyframes bvh-multi-enter { from { opacity: 0; } to { opacity: 1; } }
         @keyframes bvh-multi-exit { from { opacity: var(--bvh-multi-exit-opacity, 1); } to { opacity: 0; } }
@@ -5617,9 +5627,9 @@
 
     // --- DOM监控与渲染层 ---
     const MultiPageHistoryPreview = {
-        anchor: null, panel: null, menu: null, showTimer: null, hideTimer: null, closingPanel: null, removeTimer: null, initialized: false,
+        anchor: null, panel: null, menu: null, evolvedMenuHost: null, showTimer: null, hideTimer: null, closingPanel: null, removeTimer: null, initialized: false,
         titleRequest: null, titleFeedback: null,
-        cardSelector: '.bili-video-card, .video-card, .video-page-card-small, .video-page-card, .card-box, .history-card, .header-history-card',
+        cardSelector: `.bili-video-card, .video-card, .video-page-card-small, .video-page-card, .card-box, .history-card, .header-history-card, ${EVOLVED_HEADER_CARD_SELECTOR}`,
         init() {
             if (this.initialized) return;
             this.initialized = true;
@@ -5682,11 +5692,17 @@
                     if (!event.target.closest('[data-refresh-titles]')) return;
                     event.preventDefault(); event.stopPropagation(); this.refreshTitles();
                 });
-                this.menu = anchor.closest(HEADER_POPOVER_SELECTOR);
-                for (let parent = this.menu?.parentElement?.closest(HEADER_POPOVER_SELECTOR); parent; parent = parent.parentElement?.closest(HEADER_POPOVER_SELECTOR)) this.menu = parent;
+                const evolvedMenu = anchor.closest(EVOLVED_HEADER_POPOVER_SELECTOR);
+                this.evolvedMenuHost = evolvedMenu?.closest('.custom-navbar-item') || null;
+                if (this.evolvedMenuHost) this.evolvedMenuHost.dataset.bvhMultiOpen = 'true';
+                // Evolved 的 popup-container 宽高为零，定位与内嵌高度取实际 popup。
+                this.menu = evolvedMenu ? (anchor.closest('.popup') || evolvedMenu) : anchor.closest(HEADER_POPOVER_SELECTOR);
+                if (!evolvedMenu) {
+                    for (let parent = this.menu?.parentElement?.closest(HEADER_POPOVER_SELECTOR); parent; parent = parent.parentElement?.closest(HEADER_POPOVER_SELECTOR)) this.menu = parent;
+                }
                 // 保留在原菜单的 DOM 内，移入详情仍属于菜单的悬停范围。
                 // 顶层展示避免被菜单的滚动裁切或 transform 限制，也不触发其他菜单关闭。
-                (this.menu ? anchor.parentElement : document.body).append(this.panel);
+                (evolvedMenu ? this.menu : this.menu ? anchor.parentElement : document.body).append(this.panel);
                 if (this.menu) {
                     if (typeof this.panel.showPopover === 'function') {
                         this.panel.setAttribute('popover', 'manual');
@@ -5791,7 +5807,9 @@
             this.panel.removeAttribute('popover'); this.panel.removeAttribute('data-side');
             this.panel.style.removeProperty('left'); this.panel.style.removeProperty('top'); this.panel.style.removeProperty('width');
             this.panel.style.maxHeight = `${Math.max(100, Math.min(430, this.menu.clientHeight - 16, window.innerHeight - 16))}px`;
-            this.panel.dataset.inline = 'true'; this.anchor.after(this.panel);
+            // Evolved 卡片内部使用固定网格；详情放到整张卡片之后，避免挤乱标题和 UP 信息。
+            this.panel.dataset.inline = 'true';
+            (this.anchor.closest(EVOLVED_HEADER_CARD_SELECTOR) || this.anchor).after(this.panel);
         },
         place() {
             if (!this.anchor || !this.panel) return;
@@ -5818,6 +5836,8 @@
         },
         hide() {
             clearTimeout(this.showTimer); clearTimeout(this.hideTimer);
+            if (this.evolvedMenuHost) delete this.evolvedMenuHost.dataset.bvhMultiOpen;
+            this.evolvedMenuHost = null;
             clearTimeout(this.removeTimer); this.closingPanel?.remove(); this.closingPanel = null;
             if (this.anchor && this.panel) {
                 const ids = (this.anchor.getAttribute('aria-describedby') || '').split(/\s+/).filter(id => id && id !== this.panel.id);
@@ -5929,6 +5949,9 @@
 
         getHeaderPopoverCover(el) {
             if (!this.isHeaderPopoverVideoLink(el)) return null;
+            if (el.matches(EVOLVED_HEADER_VIDEO_LINK_SELECTOR)) {
+                return el.matches('a.video-card') ? el.querySelector('.cover-container') : el;
+            }
             return el.querySelector('.cover, .header-history-video__image, .header-fav-card__image');
         }
 
@@ -6050,9 +6073,10 @@
 
             const observer = new MutationObserver(mutations => this.handleContentMutations(mutations, root));
             const endingRoot = root.matches(ENDING_RECOMMEND_ROOT_SELECTOR);
+            const headerPopoverRoot = this.isHeaderPopoverNode(root);
             observer.observe(root, { childList: true, subtree: true, ...(endingRoot
                 ? { attributes: true, attributeFilter: ['href', 'data-bvid', 'data-aid', 'style'], characterData: true }
-                : {}) });
+                : headerPopoverRoot ? { attributes: true, attributeFilter: ['href'] } : {}) });
             this.contentObservers.set(root, observer);
             if (!this._initialScanInProgress) {
                 this.rescanContentRoot(root, 'observe root');
@@ -6075,6 +6099,11 @@
                 if (target?.closest?.('[class*="bvh-"]')) return;
                 if (m.type === 'attributes' && m.attributeName === 'style'
                     && !target?.matches?.(`${ENDING_RECOMMEND_ITEM_SELECTOR}, .bpx-player-ending-related-item-img`)) return;
+                // 菜单搜索/切换时会复用链接，也可能仅替换封面子节点。
+                if (this.isHeaderPopoverNode(target)) {
+                    const card = target?.closest?.('a');
+                    if (this.isHeaderPopoverVideoLink(card) || card?._bvhLastVideoKey) links.add(card);
+                }
                 const endingItem = target?.closest?.(ENDING_RECOMMEND_ITEM_SELECTOR);
                 if (endingItem) links.add(endingItem);
                 if (m.type !== 'childList') return;
@@ -6593,6 +6622,10 @@
         processLink(el) {
             const start = performance.now();
             if (this.isSkippedHeaderNode(el)) return;
+            if (this.isHeaderPopoverNode(el) && !this.isHeaderPopoverVideoLink(el)) {
+                if (el._bvhLastVideoKey) this.removeExistingMark(el);
+                return;
+            }
 
             // 合集播放列表项走专用处理（它们是 div 而非 a）
             if (el.matches && el.matches(PLAYLIST_ITEM_SELECTOR)) {
@@ -6610,6 +6643,7 @@
             const headerPopoverCover = this.getHeaderPopoverCover(el);
             const existingVideoKey = el._bvhLastVideoKey;
             const isSameVideoKey = existingVideoKey === bv;
+            if (!isSameVideoKey && MultiPageHistoryPreview.anchor === el) MultiPageHistoryPreview.hide();
 
             let record = StorageManager.getRecord(bv);
             const multiRecords = this.getRelatedKeysCached(bvBase);
