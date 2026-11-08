@@ -55,6 +55,12 @@ try {
     assert.equal((await entry.boundingBox()).x, 15);
     await page.evaluate(() => { testAPI.CONFIG.floatingEdgeHide = true; testAPI.FloatingEntry.place(); });
     let rect = await entryBox(); assert.equal(rect.x + rect.width, 12);
+    for (const width of [8, 24, 64]) {
+        await page.evaluate(width => { testAPI.CONFIG.floatingEdgeWidth = width; testAPI.FloatingEntry.place(); }, width);
+        rect = await entryBox(); assert.equal(rect.x + rect.width, Math.min(width, rect.width));
+    }
+    await page.evaluate(() => { testAPI.CONFIG.floatingEdgeWidth = 12; testAPI.FloatingEntry.place(); });
+    rect = await entryBox();
     await page.screenshot({ path: path.join(artifactDir, 'edge-left.png') });
     await page.mouse.move(5, rect.y + rect.height / 2);
     assert.equal(await entry.getAttribute('data-collapsed'), 'false');
@@ -80,6 +86,22 @@ try {
     assert.equal(await page.evaluate(() => gmData.get('bvh_panel_position').dock), 'right');
     assert.equal(await page.evaluate(() => openCalls), 1, '拖拽不应打开管理面板');
     await page.screenshot({ path: path.join(artifactDir, 'edge-right.png') });
+    await page.evaluate(() => {
+        const overlay = document.createElement('div'); overlay.id = 'scrollbar-overlay';
+        overlay.style.cssText = 'position:fixed;top:0;right:0;bottom:0;width:20px;z-index:20000;background:#c9cdd1';
+        document.body.append(overlay);
+    });
+    rect = await entryBox();
+    assert.equal(await page.evaluate(y => document.elementFromPoint(1275, y)?.id, rect.y + rect.height / 2), 'scrollbar-overlay', '覆盖式滚动条应能复现原来的遮挡');
+    await page.evaluate(() => { testAPI.CONFIG.floatingEdgeWidth = 32; testAPI.FloatingEntry.place(); });
+    rect = await entryBox(); assert.equal(rect.x, 1248);
+    const hoverY = rect.y + rect.height / 2;
+    assert.equal(await page.evaluate(y => document.elementFromPoint(1254, y)?.closest('.bvh-floating-entry')?.id, hoverY), 'bvh-quick-entry');
+    await page.mouse.move(1254, hoverY);
+    assert.equal(await entry.getAttribute('data-collapsed'), 'false', '调宽后应能从滚动条左侧正常唤出入口');
+    await entryBox(); await page.mouse.move(600, 600); await entryBox();
+    await page.evaluate(() => { document.querySelector('#scrollbar-overlay').remove(); testAPI.CONFIG.floatingEdgeWidth = 12; testAPI.FloatingEntry.place(); });
+    await entryBox();
     await page.mouse.move(1275, 350);
     assert.equal(await entry.getAttribute('data-collapsed'), 'false');
     rect = await entryBox(); assert.equal(rect.x + rect.width, 1280);

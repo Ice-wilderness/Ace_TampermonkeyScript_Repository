@@ -11,6 +11,7 @@ shared.data.set('bvh_panel_position', { left: '52px', top: '81px' });
 const legacy = instance(shared);
 for (const key of ['floatingTheme', 'floatingAccentColor', 'floatingSize', 'floatingOpacity', 'floatingMode']) assert.equal(legacy.CONFIG[key], legacy.DEFAULT_CONFIG[key]);
 assert.equal(legacy.CONFIG.tagOpacity, 70);
+assert.equal(legacy.CONFIG.floatingEdgeWidth, 12);
 await legacy.SettingsManager.save({ floatingTheme: 'dark', floatingAccentColor: '#123456', floatingSize: 'large', floatingOpacity: 60, floatingMode: 'compact' });
 const reloaded = instance(shared);
 assert.equal(reloaded.CONFIG.floatingTheme, 'dark');
@@ -34,6 +35,12 @@ for (const [value, expected] of [['small', 92], ['medium', 100], ['large', 108],
     shared.data.set('bvh_settings', { floatingSize: value });
     assert.equal(instance(shared).CONFIG.floatingSize, expected);
 }
+for (const [value, expected] of [[8, 8], [64, 64], ['32', 32], [7, 12], [65, 12], [12.5, 12], ['', 12], [null, 12], [true, 12]]) {
+    shared.data.set('bvh_settings', { floatingEdgeWidth: value });
+    assert.equal(instance(shared).CONFIG.floatingEdgeWidth, expected);
+}
+await legacy.SettingsManager.save({ floatingEdgeWidth: '32' });
+assert.equal(instance(shared).CONFIG.floatingEdgeWidth, 32);
 console.log('通过：旧设置补齐、异常字段独立回退、外观持久化且保留原设置和位置');
 
 const browser = await chromium.launch({ headless: true });
@@ -206,6 +213,14 @@ try {
     const field = key => page.locator(`[data-setting="${key}"]`);
     const actualStyle = () => entry.evaluate(el => ({ bg: getComputedStyle(el).backgroundColor, mode: el.dataset.mode, theme: el.dataset.theme }));
     const originalStyle = await actualStyle();
+    assert.equal(await page.locator('#bvh-floatingEdgeWidth').inputValue(), '12');
+    for (const invalid of ['', '7', '65', '12.5']) {
+        await page.locator('#bvh-floatingEdgeWidth').fill(invalid); await page.locator('[data-action=save]').click();
+        assert.equal(await page.locator('#bvh-error-floatingEdgeWidth').textContent(), '请输入 8–64 的整数');
+    }
+    await page.locator('#bvh-floatingEdgeWidth').fill('32');
+    assert.equal(await field('floatingEdgeWidth').first().inputValue(), '32');
+    assert.equal(await page.evaluate(() => testAPI.CONFIG.floatingEdgeWidth), 12, '露出宽度草稿提前生效');
     assert.equal(await field('floatingEdgeHide').isChecked(), false);
     await field('floatingEdgeHide').check();
     assert.equal(await page.evaluate(() => testAPI.CONFIG.floatingEdgeHide), false, '贴边隐藏草稿提前生效');
@@ -267,6 +282,7 @@ try {
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingOpacity), 75);
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingSize), 123);
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingEdgeHide), true);
+    assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingEdgeWidth), 32);
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').showMultiPageHistory), true);
 
     await field('floatingTheme').selectOption('light');
@@ -297,6 +313,7 @@ try {
     assert.equal(await field('floatingTheme').inputValue(), 'light');
     assert.equal(await field('floatingMode').inputValue(), 'detailed');
     assert.equal(await field('floatingEdgeHide').isChecked(), false);
+    assert.equal(await page.locator('#bvh-floatingEdgeWidth').inputValue(), '12');
     assert.deepEqual(await page.evaluate(() => ({ tagOpacity: panel.draft.tagOpacity, visibility: panel.draft.floatingButtonVisibility })), otherSettings);
     assert.deepEqual(await page.evaluate(() => gmData.get('bvh_panel_position')), { left: '70px', top: '100px' });
     assert.equal(await page.evaluate(() => gmData.get('bvh_settings').floatingMode), 'compact', '局部恢复提前写入');

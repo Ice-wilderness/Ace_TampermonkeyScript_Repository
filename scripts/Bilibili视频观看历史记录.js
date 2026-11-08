@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.8.0
+// @version      4.9.0
 // @description  记录并提示 Bilibili 视频观看进度，支持原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -54,10 +54,11 @@
 
     const FLOATING_STYLE_DEFAULTS = {
         floatingTheme: 'light', floatingAccentColor: '#00aeec', floatingSize: 100,
-        floatingOpacity: 100, floatingMode: 'detailed', floatingEdgeHide: false
+        floatingOpacity: 100, floatingMode: 'detailed', floatingEdgeHide: false, floatingEdgeWidth: 12
     };
     const isFloatingStyleValid = (key, value) => {
         if (key === 'floatingEdgeHide') return typeof value === 'boolean';
+        if (key === 'floatingEdgeWidth') return /^\d+$/.test(String(value ?? '')) && Number(value) >= 8 && Number(value) <= 64;
         if (key === 'floatingSize') return /^\d+$/.test(String(value ?? '')) && Number(value) >= 80 && Number(value) <= 160;
         if (key === 'floatingOpacity') return /^(?:\d+)$/.test(String(value ?? '')) && Number(value) >= 60 && Number(value) <= 100;
         if (key === 'floatingAccentColor') return /^#[0-9a-f]{6}$/i.test(value);
@@ -65,7 +66,7 @@
     };
     const normalizeFloatingStyle = settings => Object.fromEntries(Object.entries(FLOATING_STYLE_DEFAULTS).map(([key, fallback]) => {
         const value = key === 'floatingSize' ? ({ small: 92, medium: 100, large: 108 }[settings[key]] ?? settings[key]) : settings[key];
-        return [key, isFloatingStyleValid(key, value) ? (['floatingOpacity', 'floatingSize'].includes(key) ? Number(value) : value) : fallback];
+        return [key, isFloatingStyleValid(key, value) ? (['floatingOpacity', 'floatingSize', 'floatingEdgeWidth'].includes(key) ? Number(value) : value) : fallback];
     }));
 
     const TAG_STYLE_DEFAULTS = {
@@ -3847,8 +3848,9 @@
             const side = CONFIG.floatingEdgeHide ? (left <= 24 ? 'left' : right <= 24 ? 'right' : '') : '';
             if (side) { left = side === 'left' ? 0 : width - rect.width; el.style.left = `${left}px`; }
             const collapsed = !!side && !state.hovered && !state.focused && !state.dragging;
+            const edgeWidth = Math.min(rect.width, isFloatingStyleValid('floatingEdgeWidth', CONFIG.floatingEdgeWidth) ? Number(CONFIG.floatingEdgeWidth) : FLOATING_STYLE_DEFAULTS.floatingEdgeWidth);
             el.dataset.dock = side; el.dataset.collapsed = String(collapsed);
-            el.style.transform = collapsed ? `translateX(${side === 'left' ? 12 - left - rect.width : width - left - 12}px)` : '';
+            el.style.transform = collapsed ? `translateX(${side === 'left' ? edgeWidth - left - rect.width : width - left - edgeWidth}px)` : '';
         },
         resetPosition() {
             GM_deleteValue('bvh_panel_position');
@@ -4463,6 +4465,7 @@
                 <div class="bvh-setting-row"><label for="bvh-floatingOpacity">背景不透明度<small>文字始终保持清晰。</small></label><div><div class="bvh-opacity"><input type="range" data-setting="floatingOpacity" min="60" max="100" value="${esc(d.floatingOpacity)}" aria-label="悬浮背景不透明度滑块"><input id="bvh-floatingOpacity" type="number" data-setting="floatingOpacity" min="60" max="100" step="1" value="${esc(d.floatingOpacity)}" aria-describedby="bvh-error-floatingOpacity"><span>%</span></div><small class="bvh-field-error" id="bvh-error-floatingOpacity"></small></div></div>
                 ${field('floatingMode', '信息模式', [['compact', '简洁 · 胶囊'], ['detailed', '详细 · 小卡片']])}
                 <div class="bvh-setting-row"><label for="bvh-floatingEdgeHide">贴边隐藏<small>默认关闭。拖到左侧或右侧边缘后收起，鼠标移入或键盘聚焦时展开。</small></label><input class="bvh-switch" id="bvh-floatingEdgeHide" data-setting="floatingEdgeHide" type="checkbox" ${d.floatingEdgeHide ? 'checked' : ''}></div>
+                <div class="bvh-setting-row"><label for="bvh-floatingEdgeWidth">收起后露出宽度<small>默认 12px，左右贴边均生效。被浏览器滚动条遮挡时可调大，最多露出入口本身的宽度。</small></label><div><div class="bvh-opacity"><input type="range" data-setting="floatingEdgeWidth" min="8" max="64" step="1" value="${esc(d.floatingEdgeWidth)}" aria-label="收起后露出宽度滑块"><input id="bvh-floatingEdgeWidth" type="number" data-setting="floatingEdgeWidth" min="8" max="64" step="1" value="${esc(d.floatingEdgeWidth)}" aria-describedby="bvh-error-floatingEdgeWidth"><span>px</span></div><small class="bvh-field-error" id="bvh-error-floatingEdgeWidth"></small></div></div>
                 <div class="bvh-floating-samples" aria-label="悬浮入口外观预览"><div><span class="bvh-help">视频页 · 示例</span><div class="bvh-floating-preview" data-floating-preview="video"></div></div><div><span class="bvh-help">其他页面</span><div class="bvh-floating-preview" data-floating-preview="quick"></div></div></div>
                 <p class="bvh-help">预览不会改变页面入口，保存后生效。实际入口可拖拽移动。</p><button data-action="floating-defaults">恢复悬浮外观默认</button></details>`;
         }
@@ -4678,7 +4681,7 @@
                 // input 已更新草稿时，失焦触发的 change 不再重建页脚，避免吞掉保存点击。
                 if (this.draft[key] === value) return;
                 this.draft[key] = value;
-                if (['tagOpacity', 'floatingOpacity', 'floatingSize', 'floatingAccentColor'].includes(key)) this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(other => { if (other !== el) other.value = el.value; });
+                if (['tagOpacity', 'floatingOpacity', 'floatingSize', 'floatingAccentColor', 'floatingEdgeWidth'].includes(key)) this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(other => { if (other !== el) other.value = el.value; });
                 this.renderPreview(); this.renderFooter();
             }
         }
@@ -4838,8 +4841,8 @@
             }
             if (!errors.lowThreshold && !errors.highThreshold && next.lowThreshold >= next.highThreshold) errors.highThreshold = '高分界必须大于低分界';
             for (const key of Object.keys(FLOATING_STYLE_DEFAULTS)) {
-                if (!isFloatingStyleValid(key, next[key])) errors[key] = key === 'floatingSize' ? '请输入 80–160 的整数' : key === 'floatingOpacity' ? '请输入 60–100 的整数' : key === 'floatingAccentColor' ? '请输入 #RRGGBB 格式的颜色' : '请选择有效的悬浮外观';
-                else if (['floatingOpacity', 'floatingSize'].includes(key)) next[key] = Number(next[key]);
+                if (!isFloatingStyleValid(key, next[key])) errors[key] = key === 'floatingSize' ? '请输入 80–160 的整数' : key === 'floatingOpacity' ? '请输入 60–100 的整数' : key === 'floatingEdgeWidth' ? '请输入 8–64 的整数' : key === 'floatingAccentColor' ? '请输入 #RRGGBB 格式的颜色' : '请选择有效的悬浮外观';
+                else if (['floatingOpacity', 'floatingSize', 'floatingEdgeWidth'].includes(key)) next[key] = Number(next[key]);
             }
             for (const key of Object.keys(TAG_STYLE_DEFAULTS).filter(key => !TAG_STYLE_RANGES[key])) {
                 if (key.endsWith('Style') ? !['label', 'ring'].includes(next[key]) : key.endsWith('Mode') ? !['full', 'compact'].includes(next[key]) : !/^#[0-9a-f]{6}$/i.test(next[key])) errors[key] = '请选择有效的标签样式';
