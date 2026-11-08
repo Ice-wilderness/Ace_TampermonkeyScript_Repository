@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.9.0
+// @version      4.9.1
 // @description  记录并提示 Bilibili 视频观看进度，支持原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -419,6 +419,7 @@
         ${multi} .bvh-multi-heading { flex-shrink: 0; padding: 14px 16px 12px; border-bottom: 1px solid var(--bvh-multi-line); }
         ${multi} .bvh-multi-heading { flex-wrap: wrap; }
         ${multi} .bvh-multi-tools { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+        ${multi}[data-history-compact=true] .bvh-multi-tools small { display: none; }
         ${multi} .bvh-multi-refresh { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-width: 62px; min-height: 26px; padding: 3px 7px; border: 1px solid var(--bvh-multi-line); border-radius: 6px; background: var(--bvh-multi-paper); color: var(--bvh-multi-ink); font: inherit; font-size: 10px; line-height: 1.5; white-space: nowrap; cursor: pointer; }
         ${multi} .bvh-multi-refresh:hover:not(:disabled) { background: var(--bvh-multi-soft); border-color: var(--bvh-multi-accent); }
         ${multi} .bvh-multi-refresh:focus-visible { outline: 2px solid var(--bvh-multi-accent); outline-offset: 2px; }
@@ -5633,17 +5634,39 @@
         anchor: null, panel: null, menu: null, evolvedMenuHost: null, showTimer: null, hideTimer: null, closingPanel: null, removeTimer: null, initialized: false,
         titleRequest: null, titleFeedback: null,
         cardSelector: `.bili-video-card, .video-card, .video-page-card-small, .video-page-card, .card-box, .history-card, .header-history-card, ${EVOLVED_HEADER_CARD_SELECTOR}`,
+        historyCover(anchor) {
+            const card = anchor?.closest?.('.history-card');
+            return card ? anchor.querySelector('picture, img') || card.querySelector('.bili-video-card__cover picture, .bili-video-card__cover img, .bili-cover-card picture, .bili-cover-card img') : null;
+        },
         init() {
             if (this.initialized) return;
             this.initialized = true;
-            const find = node => node?.closest?.('[data-bvh-multi-base]')
-                || node?.closest?.(this.cardSelector)?.querySelector('[data-bvh-multi-base]');
+            const actions = 'button, [role="button"], input, [class*="delete"]';
+            const find = (node, event) => {
+                const anchor = node?.closest?.('[data-bvh-multi-base]')
+                    || node?.closest?.(this.cardSelector)?.querySelector('[data-bvh-multi-base]');
+                if (!anchor?.closest('.history-card')) return anchor;
+                if (node.closest(actions)) return null;
+                const cover = this.historyCover(anchor);
+                if (!cover) return null;
+                if (!event?.type.startsWith('pointer')) return anchor.contains(node) ? anchor : null;
+                const rect = cover.getBoundingClientRect();
+                return event.clientX >= rect.left && event.clientX < rect.right && event.clientY >= rect.top && event.clientY < rect.bottom ? anchor : null;
+            };
             const inside = node => !!node && !!this.panel?.contains(node);
             const enter = event => {
                 if (!CONFIG.showMultiPageHistory) return;
                 if (inside(event.target)) { clearTimeout(this.hideTimer); return; }
-                const anchor = find(event.target);
-                if (!anchor) return;
+                const anchor = find(event.target, event);
+                if (!anchor) {
+                    const card = this.anchor?.closest('.history-card');
+                    if (card && card.contains(event.target)) {
+                        const cover = this.historyCover(this.anchor)?.getBoundingClientRect();
+                        const action = event.target.closest(actions);
+                        if (action || (this.panel?.dataset.historyBelow !== 'true' && (!event.type.startsWith('pointer') || !cover || event.clientY >= cover.bottom))) this.hide();
+                    }
+                    return;
+                }
                 clearTimeout(this.hideTimer);
                 if (anchor === this.anchor) return;
                 this.hide(); this.anchor = anchor;
@@ -5651,7 +5674,10 @@
             };
             const leave = event => {
                 if (!CONFIG.showMultiPageHistory) return;
-                if (inside(event.relatedTarget) || (this.anchor && find(event.relatedTarget) === this.anchor)) return;
+                if (inside(event.relatedTarget) || (this.anchor && find(event.relatedTarget, event) === this.anchor)) return;
+                // 下方展示时允许经过标题区域移入详情，但原生删除等操作仍立即让开。
+                if (this.panel?.dataset.historyBelow === 'true' && this.anchor?.closest('.history-card')?.contains(event.relatedTarget)
+                    && !event.relatedTarget.closest(actions)) return;
                 // 禁用正在请求的按钮会触发 focusout，不能把这当作用户移出了详情。
                 if (event.type === 'focusout' && (this.panel?.matches(':hover') || (this.titleRequest && inside(event.target)))) return;
                 clearTimeout(this.hideTimer);
@@ -5829,6 +5855,47 @@
                 const bounds = panel.getBoundingClientRect();
                 panel.style.left = `${side === 'right' ? menu.right + 8 : menu.left - bounds.width - 8}px`;
                 panel.style.top = `${Math.max(8, Math.min(rect.top, height - bounds.height - 8))}px`;
+                return;
+            }
+            const history = this.anchor.closest('.history-card'), cover = this.historyCover(this.anchor)?.getBoundingClientRect();
+            if (history && cover) {
+                // 历史页的标题、元信息和原生删除操作必须保持可达。
+                const bounds = panel.getBoundingClientRect(), card = history.getBoundingClientRect();
+                const left = Math.max(8, Math.min(cover.left, width - bounds.width - 8));
+                const protectedAreas = Array.from(document.querySelectorAll('.history-card'), item => {
+                    const media = item.querySelector('.bili-video-card__cover picture, .bili-video-card__cover img, .bili-cover-card picture, .bili-cover-card img');
+                    const box = item.getBoundingClientRect(), image = media?.getBoundingClientRect();
+                    return image ? { left: box.left, right: box.right, top: image.bottom, bottom: box.bottom } : box;
+                });
+                const candidates = [
+                    { left: card.right + 8, top: Math.max(8, Math.min(cover.top, height - bounds.height - 8)), side: 'right' },
+                    { left: card.left - bounds.width - 8, top: Math.max(8, Math.min(cover.top, height - bounds.height - 8)), side: 'left' },
+                    { left, top: cover.top - bounds.height - 8, side: '' },
+                    { left, top: card.bottom + 8, side: '', below: true }
+                ];
+                let position = candidates.find(pos => pos.left >= 8 && pos.top >= 8 && pos.left + bounds.width <= width - 8 && pos.top + bounds.height <= height - 8
+                    && !protectedAreas.some(area => pos.left < area.right && pos.left + bounds.width > area.left && pos.top < area.bottom && pos.top + bounds.height > area.top));
+                if (!position) {
+                    // 密集网格按操作区边界缩短详情高度，继续使用内部滚动，不覆盖当前封面链接。
+                    for (const candidate of candidates.filter(pos => pos.side || pos.below)) {
+                        const availableWidth = candidate.side === 'right' ? width - card.right - 16 : candidate.side === 'left' ? card.left - 16 : width - 16;
+                        if (availableWidth < 240) continue;
+                        const size = Math.min(bounds.width, availableWidth), top = candidate.below ? card.bottom + 8 : Math.max(8, cover.top);
+                        const left = candidate.side === 'right' ? card.right + 8 : candidate.side === 'left' ? card.left - size - 8 : Math.max(8, Math.min(cover.left, width - size - 8));
+                        let available = height - top - 8;
+                        for (const area of protectedAreas) {
+                            if (left >= area.right || left + size <= area.left || area.bottom <= top) continue;
+                            available = Math.min(available, area.top - top - 8);
+                        }
+                        if (available < 120) continue;
+                        panel.dataset.historyCompact = 'true'; panel.style.width = `${size}px`; panel.style.maxHeight = `${Math.min(430, available)}px`;
+                        position = { ...candidate, left, top }; break;
+                    }
+                }
+                if (!position) { this.hide(); return; }
+                panel.dataset.historyBelow = String(!!position.below);
+                if (position.side) panel.dataset.side = position.side; else panel.removeAttribute('data-side');
+                panel.style.left = `${position.left}px`; panel.style.top = `${position.top}px`;
                 return;
             }
             const bounds = panel.getBoundingClientRect();
