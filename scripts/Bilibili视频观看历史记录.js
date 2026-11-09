@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.9.1
+// @version      4.9.2
 // @description  记录并提示 Bilibili 视频观看进度，支持原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -6917,8 +6917,6 @@
             };
 
             const waitForHeader = () => {
-                // 播放记录和悬浮进度框只依赖 DOM 就绪，不等待头部动画或卡片扫描。
-                this.checkAndInitVideoPage();
                 if (this._domStarted) return;
                 Utils.log('AppController.waitForHeader start', `hasHeader=${!!document.querySelector(HEADER_SELECTOR)}`);
 
@@ -6974,10 +6972,34 @@
                 }, DOM_START_FALLBACK_DELAY);
             };
 
+            const waitForPageReady = () => {
+                // 播放记录和悬浮进度框只依赖 DOM 就绪，不等待页面接管或卡片扫描。
+                this.checkAndInitVideoPage();
+                // SSR 顶栏也会长时间保持静止，不能据此判断 Vue 已完成接管。
+                // 接管前修改选集/卡片会触发 hydration 回退，导致原生顶栏重复挂载。
+                if (!document.querySelector('#app[data-server-rendered]')) { waitForHeader(); return; }
+                Utils.log('AppController.waitForPageReady waiting for SSR hydration');
+                const cleanup = () => {
+                    observer.disconnect();
+                    window.removeEventListener('pagehide', onPageHide);
+                };
+                const onPageHide = event => { if (!event.persisted) cleanup(); };
+                const observer = new MutationObserver(() => {
+                    if (document.querySelector('#app[data-server-rendered]')) return;
+                    cleanup();
+                    Utils.log('AppController.waitForPageReady SSR hydration complete');
+                    waitForHeader();
+                });
+                observer.observe(document.documentElement || document.body, {
+                    childList: true, subtree: true, attributes: true, attributeFilter: ['data-server-rendered']
+                });
+                window.addEventListener('pagehide', onPageHide);
+            };
+
             if (document.readyState === 'loading') {
-                document.addEventListener('DOMContentLoaded', waitForHeader, { once: true });
+                document.addEventListener('DOMContentLoaded', waitForPageReady, { once: true });
             } else {
-                waitForHeader();
+                waitForPageReady();
             }
         }
 
