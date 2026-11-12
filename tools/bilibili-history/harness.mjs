@@ -79,9 +79,10 @@ export function instance(shared = sharedStorage(), owner = 'www', text = source)
         performance, structuredClone, TextEncoder, ReadableStream, CompressionStream, DecompressionStream, Response,
         queueMicrotask, window, unsafeWindow: window,
         location: { href: `https://${owner}.bilibili.com/video/BV0000000001` },
-        document: { title: '合成页面', querySelector: () => null, querySelectorAll: () => [], getElementById: () => null },
+        document: { title: '合成页面', querySelector: () => null, querySelectorAll: () => [], getElementById: () => null,
+            addEventListener() {}, removeEventListener() {} },
         localStorage: memoryLocalStorage(), sessionStorage: memoryLocalStorage(),
-        setTimeout: (fn, ms) => { if (!ms) return setTimeout(fn, 0); const id = ++serial; timers.set(id, fn); return id; }, clearTimeout: id => typeof id === 'number' ? timers.delete(id) : clearTimeout(id),
+        setTimeout: (fn, ms) => { if (!ms || ms <= 100) return setTimeout(fn, ms || 0); const id = ++serial; timers.set(id, fn); return id; }, clearTimeout: id => typeof id === 'number' ? timers.delete(id) : clearTimeout(id),
         setInterval: fn => { const id = ++serial; timers.set(id, fn); return id; }, clearInterval: id => timers.delete(id),
         GM_addStyle() {}, GM_registerMenuCommand() {}, GM_info: { script: { version: 'test' } }
     });

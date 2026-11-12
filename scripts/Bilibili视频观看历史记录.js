@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.9.2
+// @version      4.9.3
 // @description  记录并提示 Bilibili 视频观看进度，支持原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -127,7 +127,7 @@
             || visibility === FLOATING_BUTTON_VISIBILITY.HIDE_ALL;
     };
     const isVideoPageRoute = () => /\/(video|v|medialist\/play|list)\//.test(location.href)
-        || !!window.__INITIAL_STATE__?.bvid
+        || !!((typeof unsafeWindow !== 'undefined' ? unsafeWindow : null)?.__INITIAL_STATE__?.bvid || window.__INITIAL_STATE__?.bvid)
         || /[?&]bvid=/.test(location.href);
 
     const RECORD_STATUS = {
@@ -140,7 +140,6 @@
     const BACKUP_PREFIX = 'BvH_backup_';
     const PENDING_SEEK_KEY = 'bvh_pending_seek';
     const BACKUP_MAX_AGE = 7 * 24 * 60 * 60 * 1000;
-    const BACKUP_MAX_COUNT = 200;
     const HEADER_SELECTOR = '#biliMainHeader, .bili-header, .bili-header__bar, .mini-header, .international-header, .custom-navbar';
     const HEADER_SETTLE_DELAY = 900;
     const DOM_START_FALLBACK_DELAY = 4500;
@@ -970,7 +969,7 @@
                         allKeysCached: !!StorageManager._allKeysCache,
                         allKeysCacheSize: StorageManager._allKeysCache?.length || 0,
                         cachedCommits: StorageManager._store?.commits.size || 0,
-                        cachedCommitEntries: [...(StorageManager._store?.commits.values() || [])].reduce((count, commit) => count + commit.entries.length, 0),
+                        cachedCommitEntries: [...(StorageManager._store?.commits.values() || [])].reduce((count, commit) => count + (commit.entries?.length || 0), 0),
                         cachedHeaders: StorageManager._store?.headers.size || 0,
                         viewEntries: StorageManager._store?.entries.size || 0,
                         queuedWrites: StorageManager._queuedWrites || 0,
@@ -1077,20 +1076,81 @@
     };
 
     const EpisodeResolver = {
-        getBaseKey: () => VideoKey.base(VideoKey.fromUrl(location.href) || window.__INITIAL_STATE__?.bvid || ''),
+        getInitialState: () => Utils._getPageWindow()?.__INITIAL_STATE__ || window.__INITIAL_STATE__ || null,
+        getBaseKey: () => VideoKey.base(VideoKey.fromUrl(location.href) || EpisodeResolver.getInitialState()?.bvid || ''),
+        getVideoPageMeta: (base = EpisodeResolver.getBaseKey()) => {
+            const meta = { confirmed: false, totalPages: 0, pageByCid: new Map(), seasonKeyByCid: new Map(), hasSeason: false };
+            for (const state of [Utils._getPageWindow()?.__INITIAL_STATE__, window.__INITIAL_STATE__]) {
+                if (!state) continue;
+                const data = state.videoData;
+                const id = data?.bvid || state.bvid;
+                if (data?.ugc_season) {
+                    meta.hasSeason = true;
+                    for (const section of data.ugc_season.sections || []) {
+                        for (const ep of section?.episodes || []) {
+                            const epBase = VideoKey.base(ep?.bvid);
+                            if (!epBase) continue;
+                            if (ep?.cid !== undefined && ep?.cid !== null) meta.seasonKeyByCid.set(String(ep.cid), epBase);
+                            if (Array.isArray(ep?.pages) && ep.pages.length > 0) {
+                                if (base && epBase === base) {
+                                    meta.confirmed = true;
+                                    meta.totalPages = Math.max(meta.totalPages, ep.pages.length);
+                                }
+                                ep.pages.forEach((part, idx) => {
+                                    const p = Number.isSafeInteger(part?.page) && part.page > 0 ? part.page : idx + 1;
+                                    if (part?.cid !== undefined && part?.cid !== null) {
+                                        meta.seasonKeyByCid.set(String(part.cid), VideoKey.withPage(epBase, p));
+                                        if (base && epBase === base) meta.pageByCid.set(String(part.cid), p);
+                                    }
+                                });
+                            } else if (base && epBase === base && ep?.cid !== undefined && ep?.cid !== null) {
+                                meta.confirmed = true;
+                                meta.totalPages = Math.max(meta.totalPages, 1);
+                                meta.pageByCid.set(String(ep.cid), 1);
+                            }
+                        }
+                    }
+                }
+                if (!base || !id || VideoKey.base(id) !== base) continue;
+                if (Array.isArray(data?.pages) && data.pages.length > 0) {
+                    meta.confirmed = true;
+                    meta.totalPages = Math.max(meta.totalPages, data.pages.length);
+                    data.pages.forEach((part, index) => {
+                        const page = Number.isSafeInteger(part?.page) && part.page > 0 ? part.page : index + 1;
+                        if (part?.cid !== undefined && part?.cid !== null) meta.pageByCid.set(String(part.cid), page);
+                    });
+                }
+            }
+            if (!meta.confirmed && base) {
+                for (const podEl of document.querySelectorAll('.video-pod__item[data-key]')) {
+                    if (VideoKey.base(VideoKey.fromText(podEl.getAttribute('data-key'))) !== base) continue;
+                    const subPages = podEl.querySelectorAll('.page-list .simple-base-item.page-item');
+                    if (subPages.length > 0) {
+                        meta.confirmed = true;
+                        meta.totalPages = subPages.length;
+                    } else if (podEl.querySelector('.single-p')) {
+                        meta.confirmed = true;
+                        meta.totalPages = 1;
+                    }
+                    break;
+                }
+            }
+            return meta;
+        },
         _collectItems: () => {
             const seen = new Set();
             const items = [];
-            const add = (el, cid, title, key = '') => {
+            const add = (el, cid, title, key = '', guessedPage = false) => {
                 if (!cid || seen.has(cid)) return;
                 seen.add(cid);
                 const directKey = VideoKey.normalize(key);
                 items.push({
                     el,
                     cid,
-                    page: directKey ? VideoKey.page(directKey) : items.length + 1,
+                    page: directKey ? VideoKey.page(directKey) : 1,
                     key: directKey,
                     base: directKey ? VideoKey.base(directKey) : '',
+                    guessedPage: Boolean(directKey && guessedPage),
                     title: (title || '').trim()
                 });
             };
@@ -1098,27 +1158,46 @@
             const sectionBaseByTitle = new Map();
             const keyByTitle = new Map();
             const sectionVideoKeys = [];
+            const actionListVideoKeys = [];
             const sectionMultiBases = new Set();
             const currentBase = EpisodeResolver.getBaseKey();
+            const pageMeta = EpisodeResolver.getVideoPageMeta(currentBase);
+            const isListRoute = /\/(list|medialist\/play)\//.test(location.pathname);
+            const podElements = Array.from(document.querySelectorAll('.video-pod__item[data-key]'));
+            const hasCollectionPod = isListRoute
+                || pageMeta.hasSeason
+                || !!document.querySelector('.video-pod__list.section, .video-pod .single-p, .video-pod .multi-p, .video-pod .page-list, .action-list-item-wrap[data-key]')
+                || podElements.some(el => !!VideoKey.fromText(el.getAttribute('data-key')));
+            let numericPodPage = 0;
 
-            document.querySelectorAll('.video-pod__item[data-key]').forEach(el => {
+            podElements.forEach(el => {
                 const dataKey = el.getAttribute('data-key');
-                const directKey = VideoKey.fromText(dataKey);
+                const cidStr = String(dataKey || '');
+                const hasSubPages = !!el.querySelector('.page-list .simple-base-item.page-item');
+                let guessedPage = false;
+                let directKey = VideoKey.fromText(dataKey)
+                    || pageMeta.seasonKeyByCid.get(cidStr)
+                    || (currentBase && pageMeta.pageByCid.has(cidStr) ? VideoKey.withPage(currentBase, pageMeta.pageByCid.get(cidStr)) : '');
+                if (!directKey && !pageMeta.confirmed && !hasCollectionPod && currentBase && /^\d+$/.test(cidStr)) {
+                    numericPodPage += 1;
+                    directKey = VideoKey.withPage(currentBase, numericPodPage);
+                    guessedPage = true;
+                }
                 const title = el.querySelector('.multi-p > .simple-base-item.head .title-txt')?.textContent ||
                     el.querySelector('.single-p .title-txt')?.textContent ||
                     el.querySelector('.title-txt')?.textContent ||
                     el.querySelector('.title')?.getAttribute('title') ||
                     el.textContent;
                 const normalizedTitle = normalizeTitle(title);
-                if (directKey && normalizedTitle) {
-                    sectionBaseByTitle.set(normalizedTitle, directKey);
+                if (directKey && !guessedPage && normalizedTitle) {
                     keyByTitle.set(normalizedTitle, directKey);
+                    if (hasSubPages) sectionBaseByTitle.set(normalizedTitle, directKey);
                 }
-                if (directKey && !el.querySelector('.page-list .simple-base-item.page-item')) {
+                if (directKey && !guessedPage && !hasSubPages) {
                     sectionVideoKeys.push(directKey);
                 }
-                if (directKey && el.querySelector('.page-list .simple-base-item.page-item')) sectionMultiBases.add(directKey);
-                add(el, dataKey, title, directKey);
+                if (directKey && hasSubPages) sectionMultiBases.add(directKey);
+                add(el, dataKey, title, directKey, guessedPage);
             });
             const sectionPageIndexes = new Map();
             document.querySelectorAll('.video-pod__list.section .video-pod__item[data-key] .page-list .simple-base-item.page-item').forEach(el => {
@@ -1129,6 +1208,15 @@
                 sectionPageIndexes.set(parent, page);
                 const key = VideoKey.withPage(baseKey, page);
                 add(el, `section-page:${baseKey}:${page}`, el.querySelector('.title-txt')?.textContent || el.querySelector('.title')?.getAttribute('title') || el.textContent, key);
+            });
+            document.querySelectorAll('.action-list-item-wrap[data-key]').forEach(el => {
+                const key = VideoKey.fromText(el.getAttribute('data-key'));
+                if (!key) return;
+                const title = (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.textContent || el.textContent || '').trim();
+                const normalizedTitle = normalizeTitle(title);
+                if (normalizedTitle && !keyByTitle.has(normalizedTitle)) keyByTitle.set(normalizedTitle, key);
+                actionListVideoKeys.push(key);
+                add(el, `action-list:${key}`, title, key);
             });
             document.querySelectorAll('.bpx-player-ctrl-eplist-episodes').forEach(group => {
                 const groupTitle = group.querySelector('.bpx-player-ctrl-eplist-episodes-title-text')?.textContent || '';
@@ -1143,29 +1231,18 @@
                     add(el, cid, el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.textContent || el.textContent, key);
                 });
             });
+            const orderedCollectionKeys = sectionVideoKeys.length > 0 ? sectionVideoKeys : actionListVideoKeys;
             const playerMenuItems = Array.from(document.querySelectorAll('.bpx-player-ctrl-eplist-multi-menu-item[data-cid]'));
-            const canMapPlayerByOrder = sectionVideoKeys.length > 1 && sectionVideoKeys.length === playerMenuItems.length;
+            const canMapPlayerByOrder = orderedCollectionKeys.length > 1 && orderedCollectionKeys.length === playerMenuItems.length;
             playerMenuItems.forEach((el, index) => {
+                const cid = el.getAttribute('data-cid');
+                const cidStr = String(cid || '');
                 const title = el.querySelector('.bpx-player-ctrl-eplist-multi-menu-item-text')?.textContent || el.textContent;
-                add(el, el.getAttribute('data-cid'), title, keyByTitle.get(normalizeTitle(title)) || (canMapPlayerByOrder ? sectionVideoKeys[index] : ''));
-            });
-            document.querySelectorAll('.action-list-item-wrap[data-key]').forEach(el => {
-                const key = VideoKey.fromText(el.getAttribute('data-key'));
-                if (key) {
-                    const page = VideoKey.page(key);
-                    const cid = `action-list:${key}`;
-                    if (!seen.has(cid)) {
-                        seen.add(cid);
-                        items.push({
-                            el,
-                            cid,
-                            page,
-                            key,
-                            base: VideoKey.base(key),
-                            title: (el.querySelector('.info .title')?.getAttribute('title') || el.querySelector('.info .title')?.textContent || el.textContent || '').trim()
-                        });
-                    }
-                }
+                const resolvedKey = keyByTitle.get(normalizeTitle(title))
+                    || (canMapPlayerByOrder ? orderedCollectionKeys[index] : '')
+                    || pageMeta.seasonKeyByCid.get(cidStr)
+                    || (currentBase && pageMeta.pageByCid.has(cidStr) ? VideoKey.withPage(currentBase, pageMeta.pageByCid.get(cidStr)) : '');
+                add(el, cid, title, resolvedKey);
             });
 
             return items;
@@ -1187,25 +1264,14 @@
         },
         getItems: () => {
             if (EpisodeResolver._itemsCache) return EpisodeResolver._itemsCache;
-            const base = EpisodeResolver.getBaseKey();
             const items = EpisodeResolver._collectItems();
-            if (items.length === 0) {
-                EpisodeResolver._itemsCache = [];
-                EpisodeResolver._scheduleItemsCacheInvalidation();
-                return EpisodeResolver._itemsCache;
-            }
-            const mapped = items.map(item => ({
-                ...item,
-                base: item.base || base,
-                key: item.key || VideoKey.withPage(base, item.page)
-            }));
-            EpisodeResolver._itemsCache = mapped;
+            EpisodeResolver._itemsCache = items;
             EpisodeResolver._scheduleItemsCacheInvalidation();
-            return mapped;
+            return items;
         },
         getActiveItem: () => {
             const currentBase = EpisodeResolver.getBaseKey();
-            const items = EpisodeResolver.getItems().filter(item => !currentBase || item.base === currentBase || VideoKey.base(item.key) === currentBase);
+            const items = EpisodeResolver.getItems().filter(item => currentBase ? (item.base === currentBase || VideoKey.base(item.key) === currentBase) : Boolean(item.key));
             const isVisible = (item) => !item.el.closest('.page-list[style*="display:none"], .page-list[style*="display: none"]');
             return items.find(item =>
                 isVisible(item) &&
@@ -1236,6 +1302,7 @@
             if (fromUrl > 1) return fromUrl;
 
             const active = EpisodeResolver.getActiveItem();
+            if (active?.guessedPage) return fromUrl || 1;
             return active?.page || fromUrl || 1;
         },
         getCurrentKey: () => {
@@ -1244,8 +1311,8 @@
             if (base && currentPage > 1) return VideoKey.withPage(base, currentPage);
 
             const active = EpisodeResolver.getActiveItem();
-            if (active?.key && VideoKey.base(active.key) === base) return active.key;
-            return base ? VideoKey.withPage(base, currentPage) : (active?.key || '');
+            if (!active?.guessedPage && active?.key && VideoKey.base(active.key) === base) return active.key;
+            return base ? VideoKey.withPage(base, currentPage) : (active?.guessedPage ? '' : (active?.key || ''));
         },
         getPageLabel: (keyOrPage) => {
             const page = typeof keyOrPage === 'number' ? keyOrPage : VideoKey.page(keyOrPage);
@@ -1312,9 +1379,11 @@
                 done('skip: empty base');
                 return null;
             }
+            const pageMeta = EpisodeResolver.getVideoPageMeta(bvBase);
             const keys = StorageManager.getRelatedKeys(bvBase, { loadAll: true });
             let best = null;
             keys.forEach(key => {
+                if (pageMeta.confirmed && pageMeta.totalPages >= 1 && VideoKey.page(key) > pageMeta.totalPages) return;
                 const record = StorageManager.getRecord(key);
                 if (!record || record.status !== RECORD_STATUS.WATCHED || !record.currentTime) return;
                 if (Utils.timeToSeconds(record.currentTime) < MIN_RESUME_SECONDS) return;
@@ -1393,7 +1462,7 @@
                 if (stats) stats.waitingForForeground = true;
                 await new Promise(resolve => {
                     const resume = () => { clearTimeout(timer); this.waiters.delete(resume); resolve(); };
-                    const timer = setTimeout(resume, 250); this.waiters.add(resume);
+                    const timer = setTimeout(resume, 5000); this.waiters.add(resume);
                 });
             }
             if (stats) {
@@ -1617,9 +1686,63 @@
             this.initialized = false;
             this.syncing = null;
             this.scope = null;
+            this.loadedBases = new Set();
+            this.loadedShards = new Set();
+            this.fullLegacyLoaded = false;
+            this._scopeExpanded = false;
+            this._recheckCommits = new Set();
             this.headers = new Map();
             this.epoch = 'initial';
             this.pruneKey = null;
+            this.pruneAt = 0;
+        }
+        expandScope(nextScope, nextRequested, forceRecheck = false) {
+            if (this.loadedBases === null && nextScope === null) {
+                if (forceRecheck) this._scopeExpanded = true;
+                this.scope = null;
+                this.requestedKeys = null;
+                return;
+            }
+            if (!this._hasView) {
+                if (nextScope && !this.loadedBases) this.loadedBases = new Set();
+                this.scope = nextScope;
+                this.requestedKeys = nextScope ? nextRequested : null;
+                return;
+            }
+            if (nextScope !== null && (this.loadedBases === null || [...this.loadedBases].some(base => !nextScope.has(base)))) {
+                this.initialized = false;
+                this.fullLegacyLoaded = false;
+                this.loadedBases = new Set();
+                this.loadedShards.clear();
+                this.baseline.clear();
+                this.commits.clear();
+                this._recheckCommits.clear();
+                this.seenKeys = null;
+                this._hasView = false;
+                this._scopeExpanded = false;
+                this.scope = nextScope;
+                this.requestedKeys = nextRequested;
+                return;
+            }
+            const toFull = nextScope === null;
+            const loaded = this.loadedBases;
+            const addedBases = toFull ? null : [...nextScope].filter(base => !loaded.has(base));
+            const grewRequested = !toFull && (nextRequested?.size || 0) > (this.requestedKeys?.size || 0);
+            if (toFull || addedBases.length > 0 || grewRequested || forceRecheck) {
+                this._scopeExpanded = true;
+                for (const [key, commit] of [...this.commits]) {
+                    const bases = commit.manifest?.bases || commit.bases;
+                    const needsMore = !Array.isArray(bases) || (toFull
+                        ? bases.some(base => !loaded.has(base))
+                        : bases.some(base => !loaded.has(base) && nextScope.has(base)));
+                    if (needsMore) {
+                        this.commits.delete(key);
+                        this._recheckCommits.add(key);
+                    }
+                }
+            }
+            this.scope = nextScope;
+            this.requestedKeys = toFull ? null : nextRequested;
         }
         version(time = Date.now()) {
             this.clock = Math.max(this.clock + 1, time);
@@ -1697,7 +1820,7 @@
             for (;;) {
             const keys = await this.io.list();
             const commitKeys = keys.filter(key => key.startsWith('bvh_commit_'));
-            if (this._hasView && !this._incomplete && this.seenKeys && commitKeys.length === this.seenKeys.size && commitKeys.every(key => this.seenKeys.has(key))) return new Set();
+            if (this._hasView && !this._incomplete && !this._scopeExpanded && this.seenKeys && commitKeys.length === this.seenKeys.size && commitKeys.every(key => this.seenKeys.has(key))) return new Set();
             const index = this.scope ? await this.io.get(StorageManager._BASE_INDEX_KEY) : null;
             const covered = new Set(index?.complete ? index.coverage || [] : []);
             const targetShards = new Set();
@@ -1711,23 +1834,42 @@
                 if (performance.now() - segmentStart < 8) return;
                 await new Promise(resolve => setTimeout(resolve, 0)); segmentStart = performance.now();
             };
-            if (!this.initialized) {
+            const newlyAddedBaselineKeys = new Set();
+            if (!this.initialized || (this._scopeExpanded && !this.fullLegacyLoaded)) {
+                const pendingBases = this.scope && this.loadedBases ? new Set([...this.scope].filter(base => !this.loadedBases.has(base))) : null;
+                const pendingShards = new Set();
+                if (pendingBases) {
+                    for (const base of pendingBases) for (const shard of index?.index?.[base] || []) pendingShards.add(shard);
+                    for (const key of this.requestedKeys || []) if (pendingBases.has(VideoKey.base(key))) pendingShards.add(StorageManager._getShardId(key));
+                }
                 const shardKeys = Array.from({ length: SHARD_COUNT }, (_, shard) => shard)
-                    .filter(shard => !this.scope || !index?.complete || targetShards.has(shard))
+                    .filter(shard => !this.scope ? !this.loadedShards.has(shard)
+                        : (!index?.complete ? !this.loadedShards.has(shard) || pendingBases?.size : (this.initialized ? pendingShards.has(shard) : targetShards.has(shard))))
                     .map(shard => `bvh_shard_${shard}`).filter(key => keys.includes(key));
-                const shards = await readHistoryBatch(shardKeys, key => this.io.get(key, {}));
-                for (const data of shards) {
-                    for (const [key, record] of Object.entries(data || {})) this.addBaseline(key, record);
-                    await yieldIfNeeded();
+                if (shardKeys.length) {
+                    const shards = await readHistoryBatch(shardKeys, key => this.io.get(key, {}));
+                    if (!this.scope) shardKeys.forEach(key => this.loadedShards.add(Number(key.slice('bvh_shard_'.length))));
+                    for (const data of shards) {
+                        for (const [key, record] of Object.entries(data || {})) {
+                            if (this.addBaseline(key, record)) newlyAddedBaselineKeys.add(VideoKey.normalize(key));
+                        }
+                        await yieldIfNeeded();
+                    }
+                } else if (!this.scope) {
+                    for (let shard = 0; shard < SHARD_COUNT; shard++) this.loadedShards.add(shard);
                 }
                 // 旧版独立 key 直接参与兼容视图，不删除升级前的唯一副本。
-                const legacyKeys = keys.filter(key => /^(?:BV[a-zA-Z0-9]{10}|av\d+)(?:\?p=\d+)?$/.test(key) && (!this.scope || this.scope.has(VideoKey.base(key))));
-                const legacyValues = await readHistoryBatch(legacyKeys, key => this.io.get(key));
-                for (let index = 0; index < legacyKeys.length; index++) {
-                    const key = legacyKeys[index], value = legacyValues[index];
-                    if (value) this.addBaseline(key, value);
+                const legacyKeys = keys.filter(key => /^(?:BV[a-zA-Z0-9]{10}|av\d+)(?:\?p=\d+)?$/.test(key)
+                    && (!this.scope || (this.initialized && pendingBases ? pendingBases.has(VideoKey.base(key)) : this.scope.has(VideoKey.base(key)))));
+                if (legacyKeys.length) {
+                    const legacyValues = await readHistoryBatch(legacyKeys, key => this.io.get(key));
+                    for (let index = 0; index < legacyKeys.length; index++) {
+                        const key = legacyKeys[index], value = legacyValues[index];
+                        if (value && this.addBaseline(key, value)) newlyAddedBaselineKeys.add(VideoKey.normalize(key));
+                    }
                 }
                 this.initialized = true;
+                if (!this.scope) this.fullLegacyLoaded = true;
             }
             const commits = new Map();
             this._incomplete = false;
@@ -1764,21 +1906,24 @@
             });
             for (let index = 0; index < commitKeys.length; index++) {
                 const key = commitKeys[index], commit = loadedCommits[index];
-                if (commit) { commits.set(key, commit); verified.set(key, commit); }
+                if (commit) { commits.set(key, commit); if (commit.entries) verified.set(key, commit); }
                 await yieldIfNeeded();
             }
             // 旧索引不包含已删除的 P。批次带出的其他 P 必须追查其分片里的删除标记。
-            if (this.scope) for (;;) {
-                for (const commit of commits.values()) for (const entry of commit.entries) {
-                    if (this.scope.has(VideoKey.base(entry.key))) targetShards.add(StorageManager._getShardId(entry.key));
+            if (this.scope) {
+                for (const key of this.entries.keys()) if (this.scope.has(VideoKey.base(key))) targetShards.add(StorageManager._getShardId(key));
+                for (;;) {
+                    for (const commit of commits.values()) if (commit.entries) for (const entry of commit.entries) {
+                        if (this.scope.has(VideoKey.base(entry.key))) targetShards.add(StorageManager._getShardId(entry.key));
+                    }
+                    const extra = [...skippedLegacy].filter(([, header]) => intersectsShards(header));
+                    if (!extra.length) break;
+                    const loaded = await readHistoryBatch(extra, ([key, header]) => this.readCommit(key, header));
+                    extra.forEach(([key], index) => {
+                        skippedLegacy.delete(key);
+                        if (loaded[index]) { commits.set(key, loaded[index]); verified.set(key, loaded[index]); } else this._incomplete = true;
+                    });
                 }
-                const extra = [...skippedLegacy].filter(([, header]) => intersectsShards(header));
-                if (!extra.length) break;
-                const loaded = await readHistoryBatch(extra, ([key, header]) => this.readCommit(key, header));
-                extra.forEach(([key], index) => {
-                    skippedLegacy.delete(key);
-                    if (loaded[index]) { commits.set(key, loaded[index]); verified.set(key, loaded[index]); } else this._incomplete = true;
-                });
             }
             const afterKeys = (await this.io.list()).filter(k => k.startsWith('bvh_commit_')).sort();
             if (JSON.stringify(afterKeys) !== JSON.stringify(commitKeys.sort())) {
@@ -1798,14 +1943,38 @@
             const pruneCheckpoints = new Set(latestPrune?.[1].manifest.checkpoints || []);
             if (latestPrune && (!Array.isArray(latestPrune[1].manifest.checkpoints)
                 || (this.scope === null && [...pruneCheckpoints].some(key => !commits.has(key))))) throw new Error('本地回收检查点不完整');
-            const removed = [...this.commits.keys()].some(key => !commits.has(key));
+            const removed = [...this.commits.keys(), ...this._recheckCommits].some(key => !commits.has(key));
             const rebuild = !this._hasView || removed || activeEpoch !== this.epoch || pruneKey !== this.pruneKey;
+            if (rebuild) {
+                const needReload = [...commits].filter(([container, commit]) => !commit.entries
+                    && (commit.manifest.epoch || 'initial') === activeEpoch
+                    && (!pruneKey || container === pruneKey || pruneCheckpoints.has(container)
+                        || (commit.manifest.kind !== 'prune' && (commit.manifest.sampledAt || 0) > pruneAt)));
+                if (needReload.length) {
+                    const reloaded = await readHistoryBatch(needReload, ([key, commit]) => verified.get(key) || this.readCommit(key, commit.manifest));
+                    let missing = false;
+                    needReload.forEach(([key], index) => {
+                        if (reloaded[index]) { commits.set(key, reloaded[index]); verified.set(key, reloaded[index]); }
+                        else { commits.delete(key); this.commits.delete(key); this._recheckCommits.delete(key); missing = true; }
+                    });
+                    if (missing) { this._incomplete = true; continue; }
+                }
+            }
             const entries = new Map(rebuild ? (activeEpoch === 'initial' && !pruneKey ? this.baseline : []) : this.entries), candidates = new Set(rebuild ? entries.keys() : []);
+            if (!rebuild && newlyAddedBaselineKeys.size && activeEpoch === 'initial' && !pruneKey) {
+                for (const key of newlyAddedBaselineKeys) {
+                    const baseEntry = this.baseline.get(key);
+                    if (!baseEntry || (this.scope && !this.scope.has(VideoKey.base(key)))) continue;
+                    candidates.add(key);
+                    const previous = entries.get(key);
+                    if (!previous || HistoryCommitStore.compare(baseEntry.version, previous.version) > 0) entries.set(key, baseEntry);
+                }
+            }
             let processed = 0;
             for (const [container, commit] of commits) if ((commit.manifest.epoch || 'initial') === activeEpoch
                 && (!pruneKey || container === pruneKey || pruneCheckpoints.has(container)
                     || (commit.manifest.kind !== 'prune' && (commit.manifest.sampledAt || 0) > pruneAt))
-                && (rebuild || !this.commits.has(container))) for (const entry of commit.entries) {
+                && (rebuild || !this.commits.has(container))) for (const entry of commit.entries || []) {
                 if (this.scope && !this.scope.has(VideoKey.base(entry.key))) continue;
                 candidates.add(entry.key);
                 const previous = entries.get(entry.key);
@@ -1826,11 +1995,21 @@
                 if (!entries.has(key)) changed.add(key);
                 if (++compared % 256 === 0) await yieldIfNeeded();
             }
+            const slimmed = new Map();
+            for (const [key, commit] of commits) {
+                const bases = Array.isArray(commit.manifest.bases) ? commit.manifest.bases
+                    : commit.bases || [...new Set((commit.entries || []).map(entry => VideoKey.base(entry.key)))];
+                slimmed.set(key, { manifest: commit.manifest, bases });
+            }
             this.entries = entries;
-            this.commits = commits;
+            this.commits = slimmed;
             this.epoch = activeEpoch;
             this.pruneKey = pruneKey;
+            this.pruneAt = pruneAt;
             this._hasView = true;
+            this.loadedBases = this.scope ? new Set(this.scope) : null;
+            this._scopeExpanded = false;
+            this._recheckCommits.clear();
             this.seenKeys = new Set(commitKeys);
             for (const key of this.headers.keys()) if (!this.seenKeys.has(key)) this.headers.delete(key);
             return changed;
@@ -1838,14 +2017,18 @@
         }
         addBaseline(rawKey, value) {
             const key = VideoKey.normalize(rawKey);
-            if (!key || !value) return;
-            if (this.scope && !this.scope.has(VideoKey.base(key))) return;
+            if (!key || !value) return false;
+            if (this.scope && !this.scope.has(VideoKey.base(key))) return false;
             let record = StorageManager._compact(value);
             const time = Array.isArray(value) ? Date.parse(value[3]) : value.a !== undefined ? value.a * 1000 : Date.parse(value.savedAt);
             if (!Number.isFinite(time)) record = { ...record, a: null };
             const entry = { key, record, deleted: false, source: 'legacy', version: [Number.isFinite(time) ? time : 0, '', 0] };
             const old = this.baseline.get(key);
-            if (!old || HistoryCommitStore.compare(entry.version, old.version) > 0) this.baseline.set(key, entry);
+            if (!old || HistoryCommitStore.compare(entry.version, old.version) > 0) {
+                this.baseline.set(key, entry);
+                return true;
+            }
+            return false;
         }
         transactionId() { return `${String(Date.now()).padStart(16, '0')}_${this.writer}_${String(++this.sequence).padStart(12, '0')}`; }
         async prepare(entries, kind = 'tx', identity, createdAt = Date.now(), epoch = this.epoch, sampledAt = performance.timeOrigin + performance.now(), cutoverAt = null, baseGroup = null) {
@@ -1934,6 +2117,28 @@
             for (const transaction of transactions) if (!await this.readCommit(transaction.key, undefined, null, null, false))
                 throw new Error('历史提交未确认，请保留备份并重试');
         }
+        _applyLocalTx(transaction) {
+            const container = transaction.key, changed = new Set();
+            for (const block of transaction.blocks) {
+                for (const entry of block.value.entries) {
+                    if (this.scope && !this.scope.has(VideoKey.base(entry.key))) continue;
+                    const previous = this.entries.get(entry.key);
+                    this.clock = Math.max(this.clock, entry.version[0]);
+                    const cmp = previous ? HistoryCommitStore.compare(entry.version, previous.version) : 1;
+                    if (cmp > 0 || (cmp === 0 && container > (previous.container || ''))) {
+                        this.entries.set(entry.key, { ...entry, container });
+                        if (!previous || HistoryCommitStore.compare(previous.version, entry.version) !== 0 || previous.deleted !== entry.deleted) {
+                            changed.add(entry.key);
+                        }
+                    }
+                }
+            }
+            const bases = Array.isArray(transaction.manifest.bases) ? transaction.manifest.bases : [];
+            this.commits.set(container, { manifest: transaction.manifest, bases });
+            this.headers.set(container, transaction.manifest);
+            if (this.seenKeys) this.seenKeys.add(container);
+            return changed;
+        }
         async publish(transaction, guard, deferSync = false, diagnostic) {
             if (!transaction.blocks.length && !['epoch', 'prune'].includes(transaction.manifest.kind)) return new Set();
             await this.writeBlocks(transaction.blocks, diagnostic, transaction.key, transaction.manifest.blocks);
@@ -1947,10 +2152,19 @@
             if (diagnostic) Object.assign(diagnostic.storage, { expectedChecksum, actualChecksum });
             if (prior && actualChecksum !== expectedChecksum) throw new Error('提交清单身份冲突');
             if (diagnostic) diagnostic.stage = '写入提交清单';
+            const signalPayload = {
+                id: transaction.manifest.id,
+                commitKey: transaction.key,
+                kind: transaction.manifest.kind,
+                epoch: transaction.manifest.epoch || 'initial',
+                bases: Array.isArray(transaction.manifest.bases) && transaction.manifest.bases.length <= 32
+                    ? transaction.manifest.bases
+                    : null
+            };
             let signalled = false;
             if (!prior && !deferSync && this.io.canBatch?.('setValues')) {
                 try {
-                    await this.writeValues({ [transaction.key]: transaction.manifest, bvh_change_signal: { id: transaction.manifest.id } });
+                    await this.writeValues({ [transaction.key]: transaction.manifest, bvh_change_signal: signalPayload });
                     signalled = true;
                 } catch (error) {
                     if (!await this.readCommit(transaction.key)) throw error;
@@ -1958,12 +2172,28 @@
                 }
             } else if (!prior) await this.io.set(transaction.key, transaction.manifest);
             if (diagnostic) diagnostic.stage = '确认提交';
-            if (!await this.readCommit(transaction.key, undefined, diagnostic)) throw new Error('历史提交未确认，请保留备份并重试');
+            if (diagnostic) {
+                if (!await this.readCommit(transaction.key, undefined, diagnostic)) throw new Error('历史提交未确认，请保留备份并重试');
+            } else if (!prior) {
+                const confirmedManifest = await this.io.get(transaction.key);
+                if (!confirmedManifest || HistoryCommitStore.checksum(confirmedManifest) !== HistoryCommitStore.checksum(transaction.manifest)) {
+                    throw new Error('历史提交未确认，请保留备份并重试');
+                }
+            }
             if (deferSync) return new Set();
             if (diagnostic) diagnostic.stage = '同步已提交历史';
-            const changed = await this.sync();
+            const currentCommitKeys = !prior && !diagnostic && this._hasView && this.seenKeys
+                ? (await this.io.list()).filter(key => key.startsWith('bvh_commit_'))
+                : null;
+            const noConcurrentCommits = Boolean(currentCommitKeys)
+                && currentCommitKeys.length === this.seenKeys.size + (this.seenKeys.has(transaction.key) ? 0 : 1)
+                && currentCommitKeys.every(key => key === transaction.key || this.seenKeys.has(key));
+            const canFastApply = noConcurrentCommits && !this._incomplete && !this._scopeExpanded
+                && transaction.manifest.kind === 'tx' && (transaction.manifest.epoch || 'initial') === this.epoch
+                && (!this.pruneKey || (transaction.manifest.sampledAt || 0) > this.pruneAt);
+            const changed = canFastApply ? this._applyLocalTx(transaction) : await this.sync();
             // 提示失败不把已经完整发布的事务伪报为失败；枚举会补齐丢失信号。
-            try { if (!signalled) await this.io.set('bvh_change_signal', { id: transaction.manifest.id }); }
+            try { if (!signalled) await this.io.set('bvh_change_signal', signalPayload); }
             catch (error) { Utils.warn('历史已提交，跨页提示稍后通过枚举补齐', error); }
             return changed;
         }
@@ -2004,13 +2234,18 @@
             for (const entries of groups.values()) {
                 // 已完成的组本身就是持久进度；中断重启后验证并复用，不依赖易失游标。
                 const groupKeys = new Set(entries.map(entry => entry.key));
-                const matching = resume && [...this.commits].find(([key, commit]) =>
-                    commit.manifest.kind === 'checkpoint' && commit.entries.length === entries.length
-                    && commit.entries.every(entry => {
-                        const current = this.entries.get(entry.key);
-                        return groupKeys.has(entry.key) && current?.container === key && HistoryCommitStore.compare(current.version, entry.version) === 0;
-                    }));
-                if (matching) { replacements.push(matching[0]); continue; }
+                let matchingKey = null;
+                if (resume) {
+                    for (const [key, commit] of this.commits) {
+                        if (commit.manifest.kind !== 'checkpoint' || commit.manifest.count !== entries.length) continue;
+                        const full = commit.entries ? commit : await this.readCommit(key, commit.manifest);
+                        if (full?.entries.length === entries.length && full.entries.every(entry => {
+                            const current = this.entries.get(entry.key);
+                            return groupKeys.has(entry.key) && current?.container === key && HistoryCommitStore.compare(current.version, entry.version) === 0;
+                        })) { matchingKey = key; break; }
+                    }
+                }
+                if (matchingKey) { replacements.push(matchingKey); continue; }
                 // 同毫秒的跨页提交也必须能被严格更新的物理副本覆盖，业务版本保持不变。
                 const identity = `${String(checkpointTime).padStart(16, '0')}_${this.writer}_${String(++this.sequence).padStart(12, '0')}`;
                 const transaction = await this.prepare(entries, 'checkpoint', identity);
@@ -2032,7 +2267,9 @@
                 if (retained.has(key)) continue;
                 if (commit.manifest.kind === 'epoch' || commit.manifest.kind === 'prune') continue;
                 if (this.pruneKey && (this.commits.get(this.pruneKey)?.manifest.checkpoints || []).includes(key)) continue;
-                const covered = commit.entries.every(entry => {
+                const full = commit.entries ? commit : await this.readCommit(key, commit.manifest);
+                if (!full) continue;
+                const covered = full.entries.every(entry => {
                     const next = byKey.get(entry.key);
                     if (!next) return false;
                     const cmp = HistoryCommitStore.compare(next.version, entry.version);
@@ -2441,6 +2678,7 @@
         _shardCache: new Map(), _bvBaseIndex: new Map(), _shardForBase: new Map(),
         _allKeysCache: null, _changeCallbacks: new Set(), _pendingChange: null, _changeTimer: null,
         _BASE_INDEX_KEY: 'bvh_base_index',
+        _MAINTENANCE_LEASE_KEY: 'bvh_maintenance_lease',
         _getShardId(id) {
             let hash = 0x811c9dc5;
             for (let i = 0; i < id.length; i++) { hash ^= id.charCodeAt(i); hash = (hash * 0x01000193) | 0; }
@@ -2506,6 +2744,31 @@
                 for (const cb of [...s._changeCallbacks]) { try { cb(change); } catch (error) { Utils.error('历史更新回调失败', error); } }
             }, 150);
         },
+        _ensureChangeListener() {
+            const s = StorageManager;
+            if (s._listener !== undefined || typeof GM_addValueChangeListener !== 'function') return;
+            s._listener = GM_addValueChangeListener('bvh_change_signal', (_key, _old, next, remote) => {
+                if (remote) s._handleRemoteSignal(next);
+            });
+        },
+        _handleRemoteSignal(signal) {
+            const s = StorageManager;
+            if (s._disposed) return;
+            const panelOpen = typeof HistoryManagerPanel !== 'undefined' && HistoryManagerPanel.active && !HistoryManagerPanel.active.disposed;
+            if (document.visibilityState === 'hidden' && !panelOpen) {
+                s._remoteStale = true;
+                return;
+            }
+            if (s._store.scope !== null && !s._fullRequested && signal && signal.kind === 'tx'
+                && (signal.epoch || 'initial') === s._store.epoch && Array.isArray(signal.bases)) {
+                if (!signal.bases.some(base => s._store.scope.has(base))) {
+                    s._hasSkippedRemoteCommits = true;
+                    return;
+                }
+            }
+            s._remoteStale = false;
+            s._syncIfStale().catch(error => Utils.warn('跨页同步失败', error));
+        },
         initialize() {
             const s = StorageManager;
             if (!s._ready) s._ready = (async () => {
@@ -2513,9 +2776,7 @@
                 await s._persistBaseIndex();
                 await HistoryStoreIO.set('bvh_protocol', { version: 1, legacyRetained: true });
                 s._scheduleCompaction();
-                if (s._listener === undefined && typeof GM_addValueChangeListener === 'function') s._listener = GM_addValueChangeListener('bvh_change_signal', (_key, _old, _next, remote) => {
-                    if (remote) s._syncIfStale().catch(error => Utils.error('跨页历史同步失败', error));
-                });
+                s._ensureChangeListener();
             })().catch(error => { s._ready = null; throw error; });
             return s._ready;
         },
@@ -2525,16 +2786,15 @@
                 if (s._store.syncing) await s._store.syncing;
                 const full = keys === null || s._fullRequested;
                 if (full) s._fullRequested = true;
-                const scope = full ? null : new Set([...(s._store.scope || []), ...keys.map(VideoKey.base)]);
-                const requested = new Set([...(s._store.requestedKeys || []), ...(keys || []).map(VideoKey.normalize)]);
-                const changedScope = full ? s._store.scope !== null : s._store.scope === null || scope.size !== s._store.scope.size || requested.size !== (s._store.requestedKeys?.size || 0);
-                if (changedScope) { s._store.initialized = false; s._store.baseline.clear(); s._store._hasView = false; }
-                s._store.scope = scope; s._store.requestedKeys = requested;
+                const scope = full ? null : new Set([...(s._store.scope || []), ...(keys || []).map(VideoKey.base).filter(Boolean)]);
+                const requested = full ? null : new Set([...(s._store.requestedKeys || []), ...(keys || []).map(VideoKey.normalize).filter(Boolean)]);
+                const hadView = s._store._hasView;
+                const forceRecheck = !!s._hasSkippedRemoteCommits;
+                s._hasSkippedRemoteCommits = false;
+                s._store.expandScope(scope, requested, forceRecheck);
                 const changed = await s._store.sync(); s._accept(changed);
-                s._scheduleCompaction();
-                if (s._listener === undefined && typeof GM_addValueChangeListener === 'function') s._listener = GM_addValueChangeListener('bvh_change_signal', (_key, _old, _next, remote) => {
-                    if (remote) s._syncIfStale().catch(error => Utils.warn('跨页同步失败', error));
-                });
+                if (!hadView) s._scheduleCompaction();
+                s._ensureChangeListener();
             });
             s._viewQueue = pending.catch(() => {}); return pending;
         },
@@ -2564,6 +2824,7 @@
             s._dataVersion++; s._notifyChange({ changedKeys: changed });
         },
         async _syncIfStale() {
+            StorageManager._remoteStale = false;
             if (!StorageManager._ready && StorageManager._store.scope) {
                 const before = StorageManager._dataVersion;
                 await StorageManager._loadScope([]); return StorageManager._dataVersion !== before;
@@ -2586,7 +2847,8 @@
                 coverage: [...store.commits.keys()].sort(), index,
                 routeVersion: 2,
                 routes: Object.fromEntries([...store.commits].map(([key, commit]) => [key, ['epoch', 'prune'].includes(commit.manifest.kind)
-                    ? null : [...new Set(commit.entries.map(entry => VideoKey.base(entry.key)))]])) });
+                    ? null : (Array.isArray(commit.manifest.bases) ? commit.manifest.bases
+                        : commit.bases || [...new Set((commit.entries || []).map(entry => VideoKey.base(entry.key)))])])) });
         },
         async _rebuildBaseIndex() {
             await StorageManager.initialize();
@@ -2778,7 +3040,9 @@
             StorageManager._disposed = true;
             HistoryWorkPriority.dispose();
             clearInterval(StorageManager._presenceTimer); StorageManager._presenceTimer = null;
+            clearInterval(StorageManager._maintenanceRenewTimer); StorageManager._maintenanceRenewTimer = null;
             HistoryStoreIO.delete(`bvh_active_tab_${StorageManager._tabId}`).catch(() => {});
+            StorageManager._releaseMaintenance().catch(() => {});
             clearTimeout(StorageManager._compactionTimer); StorageManager._compactionTimer = null;
             clearTimeout(StorageManager._localPruneTimer); StorageManager._localPruneTimer = null;
             if (StorageManager._listener !== undefined && typeof GM_removeValueChangeListener === 'function') GM_removeValueChangeListener(StorageManager._listener);
@@ -2921,6 +3185,27 @@
             callback?.({ processed: keys.length, total: keys.length, deleted: count, shardsDone: 1, shardsTotal: 1 }); return count;
         },
         undoDelete(result) { return StorageManager.saveRecords(result.backups, true, { source: 'undo', deleteId: result.deleteId }); },
+        async _leaseMaintenance() {
+            const s = StorageManager, now = Date.now();
+            const prior = await HistoryStoreIO.get(s._MAINTENANCE_LEASE_KEY);
+            if (prior && prior.owner !== s._tabId && prior.until > now) return false;
+            const token = `${s._tabId}:${crypto.randomUUID()}`;
+            await HistoryStoreIO.set(s._MAINTENANCE_LEASE_KEY, { owner: s._tabId, token, until: now + 60000 });
+            await new Promise(resolve => setTimeout(resolve, 35));
+            if (s._disposed) return false;
+            const confirmed = await HistoryStoreIO.get(s._MAINTENANCE_LEASE_KEY);
+            if (confirmed?.owner === s._tabId && confirmed?.token === token) {
+                s._maintenanceLeaseToken = token;
+                return true;
+            }
+            return false;
+        },
+        async _releaseMaintenance() {
+            const s = StorageManager, token = s._maintenanceLeaseToken;
+            s._maintenanceLeaseToken = '';
+            const prior = await HistoryStoreIO.get(s._MAINTENANCE_LEASE_KEY);
+            if (prior?.owner === s._tabId && (!token || prior.token === token)) await HistoryStoreIO.delete(s._MAINTENANCE_LEASE_KEY);
+        },
         _scheduleCompaction() {
             const s = StorageManager;
             if (s._disposed || s._compactionTimer || s._maintenance) return;
@@ -2932,9 +3217,14 @@
         },
         async _maintainHistory() {
             const s = StorageManager;
+            if (s._compactionTimer) { clearTimeout(s._compactionTimer); s._compactionTimer = null; }
             const stats = s._maintenanceStats = { phase: '检查', groupsTotal: 0, groupsDone: 0, scannedEntries: 0,
                 versionEntries: 0, sourceBlockReads: 0, maxInputEntries: 0, maxBufferedEntries: 0, maxBufferedBytes: 0,
                 rewrittenEntries: 0, publishedBatches: 0, foregroundWaits: 0, foregroundWaitMs: 0, waitingForForeground: false };
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (s._disposed) return;
+            await HistoryWorkPriority.background();
+            if (s._disposed) return;
             // 独立实例且每次存储操作让出事件循环，不占用前台保存队列或升级局部缓存。
             const io = Object.fromEntries(['get', 'set', 'list', 'delete', 'getMany', 'setMany', 'deleteMany'].map(name => [name, async (...args) => {
                 await new Promise(resolve => setTimeout(resolve, 0));
@@ -2950,50 +3240,80 @@
                 }
                 return HistoryStoreIO[name](...args);
             }]));
-            const keys = (await io.list()).filter(key => key.startsWith('bvh_commit_'));
-            const done = await io.get('bvh_grouping_complete_v1');
-            const prunePending = await io.get('bvh_prune_pending');
+            const hasWidePending = async (pendingKeys, readManifest) => {
+                for (const key of pendingKeys) {
+                    const manifest = s._store.commits.get(key)?.manifest || s._store.headers.get(key) || await readManifest(key);
+                    if (['epoch', 'prune'].includes(manifest?.kind) || !Array.isArray(manifest?.bases)
+                        || new Set(manifest.bases.map(s._getShardId)).size > 1) return true;
+                }
+                return false;
+            };
+            const preKeys = (await io.list()).filter(key => key.startsWith('bvh_commit_'));
+            const preDone = await io.get('bvh_grouping_complete_v1');
+            const prePrunePending = await io.get('bvh_prune_pending');
             // 每天检查一次完整删除版本，避免局部视频缓存遗漏过期标记。
-            const localOnly = !(await WebDavSync.config()).url;
+            const localOnly = !(await io.get('bvh_webdav_config', { url: '' }))?.url;
             if (localOnly && !s._localPruneTimer && !s._disposed) s._localPruneTimer = setTimeout(() => {
                 s._localPruneTimer = null; s._scheduleCompaction();
             }, 86400000);
-            const checkLocalDeleted = localOnly
-                && Date.now() - (done?.localPruneAt || 0) >= 86400000;
-            const covered = new Set(done?.coverage || []), pending = keys.filter(key => !covered.has(key));
-            if (done && pending.length < 128 && !prunePending && !checkLocalDeleted) {
-                let wide = false;
-                for (const key of pending) {
-                    // 已校验的清单不可变，避免每次播放保存后重新读取全部待整理清单。
-                    const manifest = s._store.commits.get(key)?.manifest || s._store.headers.get(key) || await io.get(key);
-                    if (['epoch', 'prune'].includes(manifest?.kind) || !Array.isArray(manifest?.bases)
-                        || new Set(manifest.bases.map(s._getShardId)).size > 1) { wide = true; break; }
+            const preCheckLocalDeleted = localOnly && Date.now() - (preDone?.localPruneAt || 0) >= 86400000;
+            const preCovered = new Set(preDone?.coverage || []), prePending = preKeys.filter(key => !preCovered.has(key));
+            if (preDone && prePending.length < 128 && !prePrunePending && !preCheckLocalDeleted) {
+                if (!await hasWidePending(prePending, key => io.get(key))) {
+                    stats.phase = '无需整理';
+                    return;
                 }
-                if (!wide) { stats.phase = '无需整理'; return; }
             }
-            stats.phase = '准备';
-            let result;
+            await HistoryWorkPriority.background();
+            if (s._disposed) return;
+            if (!await s._leaseMaintenance()) { stats.phase = '其他页面正在整理'; return; }
+            clearInterval(s._maintenanceRenewTimer);
+            s._maintenanceRenewTimer = setInterval(async () => {
+                if (s._disposed || HistoryWorkPriority.busy()) return;
+                try {
+                    const current = await HistoryStoreIO.get(s._MAINTENANCE_LEASE_KEY);
+                    if (current?.owner === s._tabId && (!s._maintenanceLeaseToken || current.token === s._maintenanceLeaseToken)) {
+                        await HistoryStoreIO.set(s._MAINTENANCE_LEASE_KEY, { owner: s._tabId, token: s._maintenanceLeaseToken, until: Date.now() + 60000 });
+                    }
+                } catch {}
+            }, 25000);
             try {
-                for (let attempt = 0; ; attempt++) {
-                    stats.scanPasses = attempt + 1;
-                    try { result = await new HistoryMaintenance(io, stats).run(keys,
-                        attempt ? await io.get('bvh_grouping_complete_v1') : done,
-                        attempt ? await io.get('bvh_prune_pending') : prunePending, checkLocalDeleted); break; }
-                    catch (error) { if (error.code !== 'BVH_MAINTENANCE_RETRY' || attempt >= 2) throw error; }
+                const keys = (await io.list()).filter(key => key.startsWith('bvh_commit_'));
+                const done = await io.get('bvh_grouping_complete_v1');
+                const prunePending = await io.get('bvh_prune_pending');
+                const checkLocalDeleted = localOnly && Date.now() - (done?.localPruneAt || 0) >= 86400000;
+                const covered = new Set(done?.coverage || []), pending = keys.filter(key => !covered.has(key));
+                if (done && pending.length < 128 && !prunePending && !checkLocalDeleted) {
+                    if (!await hasWidePending(pending, key => io.get(key))) { stats.phase = '无需整理'; return; }
                 }
-            }
-            catch (error) { stats.phase = '中断'; stats.error = Utils._truncate(error.message, 200); throw error; }
-            await io.set('bvh_change_signal', { writer: result.writer, time: Date.now() });
-            await s._syncIfStale();
-            if (result.expiredDeleted.length) {
-                // 沿用回收检查点与多页面保护；真正回收时才加载完整视图。
-                if (await s._pruneDeleted(result.expiredDeleted, { local: true })) {
-                    await new HistoryMaintenance(io, stats).run(await io.list(), await io.get('bvh_grouping_complete_v1'),
-                        await io.get('bvh_prune_pending'), true);
-                    await s._syncIfStale();
+                stats.phase = '准备';
+                let result;
+                try {
+                    for (let attempt = 0; ; attempt++) {
+                        stats.scanPasses = attempt + 1;
+                        try { result = await new HistoryMaintenance(io, stats).run(keys,
+                            attempt ? await io.get('bvh_grouping_complete_v1') : done,
+                            attempt ? await io.get('bvh_prune_pending') : prunePending, checkLocalDeleted); break; }
+                        catch (error) { if (error.code !== 'BVH_MAINTENANCE_RETRY' || attempt >= 2) throw error; }
+                    }
                 }
+                catch (error) { stats.phase = '中断'; stats.error = Utils._truncate(error.message, 200); throw error; }
+                await io.set('bvh_change_signal', { writer: result.writer, kind: 'compact', epoch: s._store.epoch, time: Date.now() });
+                await s._syncIfStale();
+                if (result.expiredDeleted.length) {
+                    // 沿用回收检查点与多页面保护；真正回收时才加载完整视图。
+                    if (await s._pruneDeleted(result.expiredDeleted, { local: true })) {
+                        await new HistoryMaintenance(io, stats).run(await io.list(), await io.get('bvh_grouping_complete_v1'),
+                            await io.get('bvh_prune_pending'), true);
+                        await s._syncIfStale();
+                    }
+                }
+                Utils.log('历史后台分组整理完成', `提交数=${result.before}→${result.after}`);
+            } finally {
+                clearInterval(s._maintenanceRenewTimer);
+                s._maintenanceRenewTimer = null;
+                await s._releaseMaintenance().catch(() => {});
             }
-            Utils.log('历史后台分组整理完成', `提交数=${result.before}→${result.after}`);
         },
         async createLegacySnapshot({ writersStopped = false } = {}) {
             if (!writersStopped) throw new Error('请先停止所有其他页面写入');
@@ -3009,28 +3329,82 @@
             return StorageManager.getAllKeys().length;
         },
         writeBackup(snapshot) {
-            try { localStorage.setItem(BACKUP_PREFIX + snapshot.key, JSON.stringify({ ...snapshot,
+            if (!snapshot?.key) return;
+            const storageKey = BACKUP_PREFIX + snapshot.key;
+            const payload = JSON.stringify({
+                ...snapshot,
+                tabId: snapshot.tabId || StorageManager._tabId,
                 epoch: snapshot.epoch === undefined ? StorageManager._store.epoch : snapshot.epoch,
                 pruneKey: snapshot.pruneKey === undefined ? StorageManager._store.pruneKey : snapshot.pruneKey,
-                savedAt: snapshot.version?.[0] || Date.now() })); }
-            catch (error) { Utils.error('临时备份无法写入', error); }
+                savedAt: snapshot.version?.[0] || Date.now()
+            });
+            try {
+                localStorage.setItem(storageKey, payload);
+            } catch (error) {
+                StorageManager.cleanupLocalStorageBackups();
+                try { localStorage.setItem(storageKey, payload); }
+                catch (retryError) { Utils.error('临时备份无法写入', retryError); }
+            }
+        },
+        clearBackupIfMatch(recordKey, transactionId) {
+            if (!recordKey) return;
+            try {
+                const storageKey = BACKUP_PREFIX + recordKey;
+                if (!transactionId) { localStorage.removeItem(storageKey); return; }
+                const raw = localStorage.getItem(storageKey);
+                if (!raw) return;
+                const parsed = JSON.parse(raw);
+                if (!parsed?.transactionId || parsed.transactionId === transactionId) localStorage.removeItem(storageKey);
+            } catch {}
         },
         async restoreFromLocalStorage() {
             let keys;
             try { keys = Array.from({ length: localStorage.length }, (_, i) => localStorage.key(i)).filter(k => k?.startsWith(BACKUP_PREFIX)); }
             catch (error) { Utils.warn('无法读取临时备份', error); return; }
-            for (const key of keys) {
+            if (!keys.length) return;
+            const now = Date.now(), activeTabs = new Set([StorageManager._tabId]);
+            try {
+                const tabKeys = (await HistoryStoreIO.list()).filter(k => k.startsWith('bvh_active_tab_'));
+                const heartbeats = await readHistoryBatch(tabKeys, k => HistoryStoreIO.get(k));
+                tabKeys.forEach((k, idx) => {
+                    const hb = heartbeats[idx];
+                    if (hb && now - hb.time < 90000) activeTabs.add(k.slice('bvh_active_tab_'.length));
+                });
+            } catch {}
+            let synced = false;
+            const candidates = [];
+            for (const storageKey of keys) {
                 try {
-                    const backup = JSON.parse(localStorage.getItem(key));
-                    await StorageManager._syncIfStale();
-                    if ((backup.epoch || 'initial') !== StorageManager._store.epoch
-                        || (backup.pruneKey || null) !== StorageManager._store.pruneKey) { localStorage.removeItem(key); continue; }
+                    const raw = localStorage.getItem(storageKey);
+                    if (!raw) continue;
+                    const backup = JSON.parse(raw);
                     const time = backup?.savedAt || Date.parse(backup?.value?.savedAt);
-                    if (!Number.isFinite(time) || Date.now() - time > BACKUP_MAX_AGE) { localStorage.removeItem(key); continue; }
+                    if (!Number.isFinite(time) || Date.now() - time > BACKUP_MAX_AGE) { localStorage.removeItem(storageKey); continue; }
+                    if (backup?.tabId && backup.tabId !== StorageManager._tabId && activeTabs.has(backup.tabId)) continue;
+                    candidates.push({ storageKey, backup });
+                } catch (error) { Utils.warn('备份解析失败，跳过', error); }
+            }
+            if (!candidates.length) return;
+            await StorageManager.initializeForKeys(candidates.map(item => item.backup?.key).filter(Boolean));
+            await StorageManager._syncIfStale();
+            synced = true;
+            for (const { storageKey, backup } of candidates) {
+                try {
+                    if (!synced) await StorageManager._syncIfStale();
+                    if ((backup.epoch || 'initial') !== StorageManager._store.epoch
+                        || (backup.pruneKey || null) !== StorageManager._store.pruneKey) {
+                        StorageManager.clearBackupIfMatch(backup.key, backup.transactionId);
+                        continue;
+                    }
                     const rows = StorageManager.validateImport({ [backup.key]: backup.value });
                     const version = backup.version || [Date.parse(backup.value.savedAt) || 0, '', 0];
+                    const current = StorageManager._store.entries.get(VideoKey.normalize(backup.key));
+                    if (current && HistoryCommitStore.compare(version, current.version) <= 0) {
+                        StorageManager.clearBackupIfMatch(backup.key, backup.transactionId);
+                        continue;
+                    }
                     await StorageManager.saveRecords(rows, true, { source: 'backup', version, transactionId: backup.transactionId });
-                    localStorage.removeItem(key);
+                    StorageManager.clearBackupIfMatch(backup.key, backup.transactionId);
                 } catch (error) { Utils.warn('备份未恢复，保留以便重试', error); }
             }
         },
@@ -4120,6 +4494,12 @@
             } catch (e) { }
             if (!pending || VideoKey.normalize(pending.key) !== VideoKey.normalize(currentKey)) {
                 if (pending) Utils.log('UIComponent.applyPendingSeek skip: key mismatch', `pending=${pending.key}`, `current=${currentKey}`);
+                return;
+            }
+            const pageMeta = EpisodeResolver.getVideoPageMeta(VideoKey.base(currentKey));
+            if (pageMeta.confirmed && pageMeta.totalPages >= 1 && VideoKey.page(pending.key) > pageMeta.totalPages) {
+                Utils.log('UIComponent.applyPendingSeek skip: page out of range', `pending=${pending.key}`, `totalPages=${pageMeta.totalPages}`);
+                sessionStorage.removeItem(PENDING_SEEK_KEY);
                 return;
             }
             if (Date.now() - (pending.savedAt || 0) > 60000) {
@@ -5385,10 +5765,28 @@
             this.generation = crypto.randomUUID(); this.state = 'waiting'; this.destroyed = false;
             this.onIdentityChange = onIdentityChange; this.cid = null;
             this.bvId = null; this.title = ''; this.videoEl = null; this.hasPlayed = false;
-            this._lastKnownState = null; this._source = ''; this._metadataSeen = false; this._mediaGeneration = 0;
+            this._lastKnownState = null; this._source = ''; this._metadataSeen = false; this._mediaGeneration = 0; this._titleCheckedKey = '';
+            this._lastSaveFailed = false;
             this._onPlay = () => { HistoryWorkPriority.playing(this.generation, !this.destroyed); this.hasPlayed = true; this.saveProgressDebounced(); };
-            this._onTimeUpdate = () => { HistoryWorkPriority.playing(this.generation, !this.destroyed && this.videoEl?.paused === false); if (this.videoEl?.currentTime > 0) this.hasPlayed = true; this.capture(); this.saveProgressDebounced(); };
+            this._onTimeUpdate = () => {
+                HistoryWorkPriority.playing(this.generation, !this.destroyed && this.videoEl?.paused === false);
+                if (this.videoEl?.currentTime > 0) this.hasPlayed = true;
+                const snap = this.capture();
+                if (snap) {
+                    this.backupSnapshotThrottled(snap);
+                    this.previewProgressThrottled(snap);
+                }
+                this.saveProgressDebounced();
+            };
             this._onPause = () => { HistoryWorkPriority.playing(this.generation, false); this.capture(); this.persistSnapshot(); };
+            this._onVisibilityChange = () => {
+                if (document.visibilityState === 'hidden') {
+                    this.capture();
+                    this.persistSnapshot();
+                } else {
+                    this.previewLiveProgress(this.capture() || this._lastKnownState);
+                }
+            };
             this._onBeforeUnload = () => { HistoryWorkPriority.playing(this.generation, false); this.capture(); this.persistSnapshot(); };
             this._onLoadStart = () => { HistoryWorkPriority.playing(this.generation, false); this.state = 'switching'; this._mediaGeneration++; this._metadataSeen = false; this._cancelSeek?.(); };
             this._onMetadata = () => {
@@ -5396,7 +5794,11 @@
                 if (this._metadataTimer) clearTimeout(this._metadataTimer);
                 this._metadataTimer = setTimeout(() => this.confirmMedia(), 500);
             };
-            this.saveProgressDebounced = Utils.throttle(() => this.saveProgress(), 5000);
+            this.backupSnapshotThrottled = Utils.throttle((snap) => {
+                if (snap && snap !== this._savedSnapshot) StorageManager.writeBackup(this.ensureSnapshotIdentity(snap));
+            }, 5000);
+            this.previewProgressThrottled = Utils.throttle((snap) => this.previewLiveProgress(snap), 3000);
+            this.saveProgressDebounced = Utils.throttle(() => this.saveProgress(), 15000);
         }
         init() {
             this.bvId = EpisodeResolver.getCurrentKey() || VideoKey.fromUrl(location.href);
@@ -5405,9 +5807,10 @@
         }
         identityMatches() {
             if (this.destroyed || !this.bvId || EpisodeResolver.getCurrentKey() !== this.bvId) return false;
-            const data = window.__INITIAL_STATE__?.videoData;
+            const state = EpisodeResolver.getInitialState();
+            const data = state?.videoData;
             if (data?.bvid && VideoKey.base(data.bvid) !== VideoKey.base(this.bvId)) return false;
-            const cid = window.__INITIAL_STATE__?.cid;
+            const cid = state?.cid;
             if (this.cid && cid && String(cid) !== this.cid) return false;
             return true;
         }
@@ -5454,7 +5857,8 @@
             if (retired && retired.key !== this.bvId && !this._metadataSeen && source === retired.source) return false;
             if (this.state === 'switching' && !this._metadataSeen) return false;
             this.state = 'bound'; this._source = source;
-            this.cid = window.__INITIAL_STATE__?.cid ? String(window.__INITIAL_STATE__.cid) : null;
+            const initialState = EpisodeResolver.getInitialState();
+            this.cid = initialState?.cid ? String(initialState.cid) : null;
             this.title = this.getConfirmedTitle() || this.title;
             this.ensureVisitedRecord();
             this.completeMissingTitle();
@@ -5504,7 +5908,10 @@
                 if (!clean || clean === info.title || clean === partTitle)
                     fixes.push({ key, record: { title: partTitle }, expectedTitle: record.title });
             }
-            if (!fixes.length && (!current || current.title)) return;
+            if (!fixes.length && (!current || current.title)) {
+                if (current?.title && info.confirmed) this._titleCheckedKey = `${this.bvId}:${StorageManager._dataVersion}`;
+                return;
+            }
             // 普通标题只补空值；已核对的分 P 标题可修正旧主标题，均保留最新进度、时间和删除状态。
             this._titlePending = (fixes.length ? StorageManager.saveRecords(fixes, true, { source: 'part-title' })
                 : StorageManager.saveRecord(this.bvId, { title }, true, { source: 'title' }))
@@ -5512,6 +5919,7 @@
                     if (!this.destroyed && EpisodeResolver.getCurrentKey() === this.bvId) {
                         const record = StorageManager.getRecord(this.bvId);
                         if (record) UIComponent.showViewPanel(record, this.bvId);
+                        if (info.confirmed) this._titleCheckedKey = `${this.bvId}:${StorageManager._dataVersion}`;
                     }
                 })
                 .catch(error => Utils.warn('标题补全失败，稍后重试', error))
@@ -5540,6 +5948,12 @@
                 || document.querySelector('meta[property="og:title"]')?.getAttribute?.('content');
             return typeof title === 'string' ? EpisodeResolver.cleanTitle(title) : '';
         }
+        ensureSnapshotIdentity(snapshot) {
+            if (!snapshot) return null;
+            if (!snapshot.transactionId) snapshot.transactionId = StorageManager._store.transactionId();
+            if (!snapshot.version) snapshot.version = StorageManager.sampleVersion();
+            return snapshot;
+        }
         capture() {
             if (this.state !== 'bound' || !this.identityMatches() || !this.videoEl || !this.hasPlayed) return null;
             if ((this.videoEl.currentSrc || this.videoEl.src || '') !== this._source) { this.state = 'switching'; return null; }
@@ -5554,15 +5968,26 @@
             const time = (h ? pad(h) + ':' : '') + pad(Math.floor(seconds % 3600 / 60)) + ':' + pad(seconds % 60);
             this._lastKnownState = { key: this.bvId, seconds, mediaGeneration: this._mediaGeneration,
                 epoch: StorageManager._store.epoch, pruneKey: StorageManager._store.pruneKey,
-                transactionId: StorageManager._store.transactionId(), version: StorageManager.sampleVersion(), value: {
+                transactionId: null, version: null, value: {
                 v: 3, status: RECORD_STATUS.WATCHED, currentTime: time, percent,
                 savedAt: Utils.formatTime(), title: this.title
             } };
             return this._lastKnownState;
         }
+        previewLiveProgress(snapshot = this._lastKnownState) {
+            if (!snapshot || document.visibilityState === 'hidden' || this._lastSaveFailed || this._saveTask) return;
+            if (!this._savedSnapshot || this._savedSnapshot.key !== this.bvId || snapshot.key !== this.bvId) return;
+            if (this.state !== 'bound' || !this.identityMatches() || snapshot.mediaGeneration !== this._mediaGeneration) return;
+            if (snapshot.epoch !== StorageManager._store.epoch || snapshot.pruneKey !== StorageManager._store.pruneKey) return;
+            UIComponent.updateViewPanelProgress({
+                ...snapshot.value,
+                savedAt: this._savedSnapshot.value?.savedAt || ''
+            }, snapshot.key);
+        }
         persistSnapshot(snapshot = this._lastKnownState) {
             if (!snapshot || snapshot === this._savedSnapshot || snapshot === this._savingSnapshot || snapshot === this._pendingSnapshot)
                 return this._saveTask || Promise.resolve();
+            this.ensureSnapshotIdentity(snapshot);
             StorageManager.writeBackup(snapshot); this._pendingSnapshot = snapshot;
             if (this._saveTask) { VideoPlayerObserver.metrics.coalesced++; return this._saveTask; }
             // 最多一个写入在途、一个最新采样待存；慢扩展不再积压每个旧采样。
@@ -5570,11 +5995,14 @@
                 while (this._pendingSnapshot) {
                     const next = this._pendingSnapshot; this._pendingSnapshot = null; this._savingSnapshot = next;
                     if (next.epoch !== StorageManager._store.epoch || next.pruneKey !== StorageManager._store.pruneKey) {
+                        StorageManager.clearBackupIfMatch(next.key, next.transactionId);
                         this._savingSnapshot = null; continue;
                     }
                     VideoPlayerObserver.metrics.activeSaves++;
                     try {
                         const count = await StorageManager.saveRecord(next.key, next.value, true, { version: next.version, transactionId: next.transactionId });
+                        StorageManager.clearBackupIfMatch(next.key, next.transactionId);
+                        this._lastSaveFailed = false;
                         if (count > 0) {
                             this._savedSnapshot = next; VideoPlayerObserver.metrics.completed++;
                             // 新采样不妨碍显示已确认进度；离开路由或切换媒体后旧结果不能覆盖新界面。
@@ -5582,7 +6010,11 @@
                                 && next.epoch === StorageManager._store.epoch && next.pruneKey === StorageManager._store.pruneKey)
                                 UIComponent.updateViewPanelProgress(next.value, next.key);
                         }
-                    } catch (error) { VideoPlayerObserver.metrics.failed++; Utils.error('播放进度保存失败，保留原采样备份', error); }
+                    } catch (error) {
+                        this._lastSaveFailed = true;
+                        VideoPlayerObserver.metrics.failed++;
+                        Utils.error('播放进度保存失败，保留原采样备份', error);
+                    }
                     finally { this._savingSnapshot = null; VideoPlayerObserver.metrics.activeSaves--; }
                 }
             };
@@ -5603,17 +6035,26 @@
                 const activeKey = EpisodeResolver.getCurrentKey();
                 if (this.bvId && activeKey && activeKey !== this.bvId) { this.state = 'switching'; this.onIdentityChange?.(); return; }
                 if (!this.bvId) { this.bvId = EpisodeResolver.getCurrentKey(); if (this.bvId) this.setupRecord(); }
-                this.completeMissingTitle();
+                if (this.bvId && this._titleCheckedKey !== `${this.bvId}:${StorageManager._dataVersion}`) this.completeMissingTitle();
                 const video = this.getCurrentVideo();
                 HistoryWorkPriority.playing(this.generation, video?.paused === false);
                 if (video !== this.videoEl) this.bindVideo(video);
                 if (this.state === 'waiting') this.confirmMedia();
-                if (video && !video.paused) { this.hasPlayed = true; this.saveProgress(); }
+                if (video && !video.paused) {
+                    this.hasPlayed = true;
+                    const snap = this.capture();
+                    if (snap) {
+                        this.backupSnapshotThrottled(snap);
+                        this.previewProgressThrottled(snap);
+                    }
+                    this.saveProgressDebounced();
+                }
             }, 5000);
         }
         bindEvents() {
             for (const [event, fn] of this.events()) this.videoEl.addEventListener(event, fn);
             window.addEventListener('beforeunload', this._onBeforeUnload);
+            document.addEventListener('visibilitychange', this._onVisibilityChange);
         }
         events() { return [['play', this._onPlay], ['timeupdate', this._onTimeUpdate], ['pause', this._onPause], ['loadstart', this._onLoadStart], ['emptied', this._onLoadStart], ['loadedmetadata', this._onMetadata]]; }
         unbindVideoEvents(video) { if (video) for (const [event, fn] of this.events()) video.removeEventListener(event, fn); }
@@ -5624,6 +6065,7 @@
             if (this.videoEl) VideoPlayerObserver.retired.set(this.videoEl, { key: this.bvId, source: this._source });
             this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
             window.removeEventListener('beforeunload', this._onBeforeUnload);
+            document.removeEventListener('visibilitychange', this._onVisibilityChange);
             this._cancelWait?.(); this._cancelSeek?.(); this._cancelPrompt?.();
             clearInterval(this.videoWatchInterval); clearTimeout(this._metadataTimer);
         }
@@ -5945,6 +6387,7 @@
             this.scheduleEndingRecommendRefresh = Utils.debounce(() => this.enqueueLinks(document.querySelectorAll(ENDING_RECOMMEND_ITEM_SELECTOR)), 120);
             this.scheduleObserverRootRefresh = Utils.debounce(() => this.refreshObserverRoots(), 180);
             this.scheduleFullRescan = Utils.debounce(() => this.flushRescanRoots(), DOM_RESCAN_DELAY);
+            this.schedulePruneDisconnected = Utils.debounce(() => this.pruneDisconnected(), 1000);
             this.initIntersectionObserver();
             this.initMutationObserver();
             MultiPageHistoryPreview.init();
@@ -6026,9 +6469,18 @@
         }
 
         getPageMode() {
-            return /\/(video|v|medialist\/play|list)\//.test(location.href) || /[?&]bvid=/.test(location.href) || window.__INITIAL_STATE__?.bvid
+            return /\/(video|v|medialist\/play|list)\//.test(location.href) || /[?&]bvid=/.test(location.href) || EpisodeResolver.getInitialState()?.bvid
                 ? 'video'
                 : 'list';
+        }
+
+        isIgnoredPlayerMutationTarget(node) {
+            const el = node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement;
+            if (!el) return false;
+            if (!el.closest?.('#bilibili-player, .bpx-player-container')) return false;
+            if (el.closest?.('.bpx-player-ending-related, .bpx-player-ctrl-eplist')) return false;
+            if (el.querySelector?.('.bpx-player-ending-related, .bpx-player-ctrl-eplist')) return false;
+            return true;
         }
 
         refreshForRoute() {
@@ -6052,11 +6504,13 @@
                 const start = performance.now();
                 let shouldRefreshRoots = false;
                 let shouldRefreshHeaderPopoverCards = false;
+                let hasRelevantRemoval = false;
                 let childListCount = 0;
                 let addedNodeCount = 0;
-                if (mutations.some(m => m.removedNodes.length)) this.pruneDisconnected();
                 mutations.forEach(m => {
                     if (m.type !== 'childList') return;
+                    if (this.isIgnoredPlayerMutationTarget(m.target)) return;
+                    if (m.removedNodes.length) hasRelevantRemoval = true;
                     childListCount++;
                     m.addedNodes.forEach(node => {
                         addedNodeCount++;
@@ -6073,6 +6527,7 @@
                         }
                     });
                 });
+                if (hasRelevantRemoval) this.schedulePruneDisconnected();
                 if (shouldRefreshRoots) this.scheduleObserverRootRefresh();
                 if (shouldRefreshHeaderPopoverCards) this.scheduleHeaderPopoverRefresh();
                 const cost = performance.now() - start;
@@ -6671,15 +7126,16 @@
 
             const tagEl = this.createEpisodeTag(record, isGridItem);
             const isSectionItem = !!el.closest('.video-pod__list.section');
-            const target = isGridItem
+            const isPlayerMenuItem = el.matches('.bpx-player-ctrl-eplist-multi-menu-item');
+            const target = isGridItem || isPlayerMenuItem
                 ? el
                 : isSectionItem
                     ? (el.matches('.simple-base-item.page-item')
                         ? (el.querySelector(':scope > .title') || el.querySelector('.title') || el)
                         : (el.querySelector('.simple-base-item.normal > .title') || el.querySelector('.title') || el))
-                    : (el.querySelector('.title-txt, .bpx-player-ctrl-eplist-multi-menu-item-text, .title') || el);
+                    : (el.querySelector('.title-txt, .title') || el);
             target.appendChild(tagEl);
-            if (el.matches('.bpx-player-ctrl-eplist-multi-menu-item')) {
+            if (isPlayerMenuItem) {
                 const size = parseFloat(tagEl.style.fontSize), padding = parseFloat(tagEl.style.paddingLeft);
                 const width = tagEl.classList.contains('bvh-tag-ring') ? parseFloat(tagEl.style.width) : tagEl.textContent.length * size + padding * 2;
                 el.style.setProperty('--bvh-episode-label-space', `${width + 20}px`);
@@ -6972,27 +7428,89 @@
                 }, DOM_START_FALLBACK_DELAY);
             };
 
-            const waitForPageReady = () => {
-                // 播放记录和悬浮进度框只依赖 DOM 就绪，不等待页面接管或卡片扫描。
-                this.checkAndInitVideoPage();
-                // SSR 顶栏也会长时间保持静止，不能据此判断 Vue 已完成接管。
-                // 接管前修改选集/卡片会触发 hydration 回退，导致原生顶栏重复挂载。
-                if (!document.querySelector('#app[data-server-rendered]')) { waitForHeader(); return; }
-                Utils.log('AppController.waitForPageReady waiting for SSR hydration');
+            const waitForPlayerSettled = (next) => {
+                if (this._domStarted) return;
+                if (!isVideoPageRoute()) { next(); return; }
+                const findMedia = () => document.querySelector('#bilibili-player video, .bpx-player-container video, bwp-video');
+                const initialMedia = findMedia();
+                if (initialMedia && initialMedia.readyState >= 1) { next(); return; }
+                Utils.log('AppController.waitForPlayerSettled waiting for video player');
+                let settled = false;
+                let boundMedia = null;
+                const onMediaReady = () => finish('player media ready');
+                const bindMedia = (media) => {
+                    if (!media || media === boundMedia) return;
+                    if (media.readyState >= 1) { finish('player media readyState>=1'); return; }
+                    if (boundMedia) {
+                        boundMedia.removeEventListener('loadedmetadata', onMediaReady);
+                        boundMedia.removeEventListener('loadeddata', onMediaReady);
+                        boundMedia.removeEventListener('canplay', onMediaReady);
+                    }
+                    boundMedia = media;
+                    boundMedia.addEventListener('loadedmetadata', onMediaReady, { once: true });
+                    boundMedia.addEventListener('loadeddata', onMediaReady, { once: true });
+                    boundMedia.addEventListener('canplay', onMediaReady, { once: true });
+                };
                 const cleanup = () => {
                     observer.disconnect();
+                    clearTimeout(timer);
                     window.removeEventListener('pagehide', onPageHide);
+                    if (boundMedia) {
+                        boundMedia.removeEventListener('loadedmetadata', onMediaReady);
+                        boundMedia.removeEventListener('loadeddata', onMediaReady);
+                        boundMedia.removeEventListener('canplay', onMediaReady);
+                        boundMedia = null;
+                    }
+                };
+                const finish = (reason) => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    Utils.log('AppController.waitForPlayerSettled complete:', reason);
+                    next();
                 };
                 const onPageHide = event => { if (!event.persisted) cleanup(); };
                 const observer = new MutationObserver(() => {
-                    if (document.querySelector('#app[data-server-rendered]')) return;
+                    const media = findMedia();
+                    if (media) bindMedia(media);
+                });
+                observer.observe(document.documentElement || document.body, { childList: true, subtree: true });
+                const timer = setTimeout(() => finish('player wait timeout'), 5000);
+                window.addEventListener('pagehide', onPageHide);
+                if (initialMedia) bindMedia(initialMedia);
+            };
+
+            const ssrPendingSelector = '#app[data-server-rendered], #i_cecream[data-server-rendered]';
+            const waitForPageReady = () => {
+                // 播放记录和悬浮进度框只依赖 DOM 就绪，不等待页面接管或卡片扫描。
+                this.checkAndInitVideoPage();
+                const proceedAfterHydration = () => waitForPlayerSettled(waitForHeader);
+                // SSR 顶栏也会长时间保持静止，不能据此判断 Vue 已完成接管。
+                // 接管前修改选集/卡片会触发 hydration 回退，导致原生顶栏重复挂载或播放器容器黑屏。
+                if (!document.querySelector(ssrPendingSelector)) { proceedAfterHydration(); return; }
+                Utils.log('AppController.waitForPageReady waiting for SSR hydration');
+                let doneHydration = false;
+                const cleanup = () => {
+                    observer.disconnect();
+                    clearTimeout(fallbackTimer);
+                    window.removeEventListener('pagehide', onPageHide);
+                };
+                const finishHydration = (reason) => {
+                    if (doneHydration) return;
+                    doneHydration = true;
                     cleanup();
-                    Utils.log('AppController.waitForPageReady SSR hydration complete');
-                    waitForHeader();
+                    Utils.log('AppController.waitForPageReady SSR gate complete:', reason);
+                    proceedAfterHydration();
+                };
+                const onPageHide = event => { if (!event.persisted) cleanup(); };
+                const observer = new MutationObserver(() => {
+                    if (document.querySelector(ssrPendingSelector)) return;
+                    finishHydration('hydrated');
                 });
                 observer.observe(document.documentElement || document.body, {
                     childList: true, subtree: true, attributes: true, attributeFilter: ['data-server-rendered']
                 });
+                const fallbackTimer = setTimeout(() => finishHydration('hydration timeout'), 5000);
                 window.addEventListener('pagehide', onPageHide);
             };
 
@@ -7100,14 +7618,14 @@
         }
 
         getRouteVideoKey() {
-            return VideoKey.fromUrl(location.href) || VideoKey.normalize(window.__INITIAL_STATE__?.bvid) || '';
+            return VideoKey.fromUrl(location.href) || VideoKey.normalize(EpisodeResolver.getInitialState()?.bvid) || '';
         }
 
         async checkAndInitVideoPage() {
             const isVideoPage = isVideoPageRoute();
             const routeKey = this.getRouteVideoKey();
             const observerKey = this.playerObserver?.bvId ? VideoKey.normalize(this.playerObserver.bvId) : '';
-            Utils.log('AppController.checkAndInitVideoPage', `isVideoPage=${!!isVideoPage}`, `routeKey=${routeKey || 'none'}`, `observerKey=${observerKey || 'none'}`, `url=${location.href}`, `stateBvid=${window.__INITIAL_STATE__?.bvid || 'none'}`);
+            Utils.log('AppController.checkAndInitVideoPage', `isVideoPage=${!!isVideoPage}`, `routeKey=${routeKey || 'none'}`, `observerKey=${observerKey || 'none'}`, `url=${location.href}`, `stateBvid=${EpisodeResolver.getInitialState()?.bvid || 'none'}`);
             if (isVideoPage) {
                 if (this.playerObserver && !this.playerObserver.destroyed && routeKey && observerKey === VideoKey.normalize(routeKey)) {
                     Utils.log('AppController.checkAndInitVideoPage skip: same video key');
@@ -7133,50 +7651,68 @@
         }
 
         hijackRouter() {
-            if (!history.pushState.__bvh_patched) {
-                Utils.log('AppController.hijackRouter patch history methods');
-                const originalPushState = history.pushState;
-                const originalReplaceState = history.replaceState;
+            if (this._routerBound) return;
+            this._routerBound = true;
+            let routeCheckScheduled = false;
+            const handleRouteChange = () => {
+                routeCheckScheduled = false;
+                if (this.currentUrl === location.href) return;
+                // 追加追踪参数不改变视频身份，保留媒体绑定和正在进行的保存。
+                const routeKey = this.getRouteVideoKey();
+                if (!isVideoPageRoute() || !routeKey || VideoKey.normalize(this.playerObserver?.bvId) !== VideoKey.normalize(routeKey)) {
+                    this.playerObserver?.destroy(); this.playerObserver = null;
+                }
+                this.currentUrl = location.href;
+                Utils.log('Route changed:', this.currentUrl);
+                setTimeout(() => {
+                    const done = Utils.debugTime('AppController.locationchange delayed refresh');
+                    this.checkAndInitVideoPage();
+                    UIComponent.showQuickEntry();
+                    HistoryPageSync.refreshControl();
+                    if (this.domWatcher) {
+                        this.domWatcher.refreshForRoute();
+                    }
+                    done(`url=${location.href}`);
+                }, 500);
+            };
+            const scheduleRouteCheck = () => {
+                if (routeCheckScheduled) return;
+                routeCheckScheduled = true;
+                if (typeof queueMicrotask === 'function') queueMicrotask(handleRouteChange);
+                else setTimeout(handleRouteChange, 0);
+            };
 
-                history.pushState = function (...args) {
-                    originalPushState.apply(this, args);
-                    window.dispatchEvent(new Event('pushstate'));
-                    window.dispatchEvent(new Event('locationchange'));
-                };
-
-                history.replaceState = function (...args) {
-                    originalReplaceState.apply(this, args);
-                    window.dispatchEvent(new Event('replacestate'));
-                    window.dispatchEvent(new Event('locationchange'));
-                };
-                history.pushState.__bvh_patched = true;
+            if (window.navigation && typeof window.navigation.addEventListener === 'function') {
+                Utils.log('AppController.hijackRouter bind Navigation API');
+                window.navigation.addEventListener('currententrychange', scheduleRouteCheck);
+                window.navigation.addEventListener('navigatesuccess', scheduleRouteCheck);
+            } else {
+                const callbacks = history.pushState.__bvhCallbacks ||= new Set();
+                callbacks.add(scheduleRouteCheck);
+                if (!history.pushState.__bvh_patched) {
+                    Utils.log('AppController.hijackRouter wrap history methods (internal callbacks only)');
+                    const originalPushState = history.pushState;
+                    const originalReplaceState = history.replaceState;
+                    const notifyInternal = () => {
+                        for (const cb of callbacks) {
+                            try { cb(); } catch (error) { Utils.warn('路由回调执行异常', error); }
+                        }
+                    };
+                    history.pushState = function (...args) {
+                        try { return originalPushState.apply(this, args); }
+                        finally { notifyInternal(); }
+                    };
+                    history.replaceState = function (...args) {
+                        try { return originalReplaceState.apply(this, args); }
+                        finally { notifyInternal(); }
+                    };
+                    history.pushState.__bvhCallbacks = callbacks;
+                    history.pushState.__bvh_patched = true;
+                }
             }
 
-            window.addEventListener('popstate', () => {
-                window.dispatchEvent(new Event('locationchange'));
-            });
-
-            window.addEventListener('locationchange', () => {
-                if (this.currentUrl !== location.href) {
-                    // 追加追踪参数不改变视频身份，保留媒体绑定和正在进行的保存。
-                    const routeKey = this.getRouteVideoKey();
-                    if (!isVideoPageRoute() || !routeKey || VideoKey.normalize(this.playerObserver?.bvId) !== VideoKey.normalize(routeKey)) {
-                        this.playerObserver?.destroy(); this.playerObserver = null;
-                    }
-                    this.currentUrl = location.href;
-                    Utils.log('Route changed:', this.currentUrl);
-                    setTimeout(() => {
-                        const done = Utils.debugTime('AppController.locationchange delayed refresh');
-                        this.checkAndInitVideoPage();
-                        UIComponent.showQuickEntry();
-                        HistoryPageSync.refreshControl();
-                        if (this.domWatcher) {
-                            this.domWatcher.refreshForRoute();
-                        }
-                        done(`url=${location.href}`);
-                    }, 500);
-                }
-            });
+            window.addEventListener('popstate', scheduleRouteCheck);
+            window.addEventListener('hashchange', scheduleRouteCheck);
         }
     }
 

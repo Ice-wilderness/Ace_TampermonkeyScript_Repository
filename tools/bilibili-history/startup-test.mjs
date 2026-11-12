@@ -97,6 +97,7 @@ for (const [url, changed] of [
     route.HistoryPageSync.refreshControl = () => {};
     controller.hijackRouter();
     route.context.history.replaceState({}, '', url);
+    await Promise.resolve(); // 路由检测通过微任务合并同一轮 URL 变化。
     assert.equal(destroyed, changed ? 1 : 0, `路由 ${url} 的播放器监听清理不正确`);
     if (!changed) assert.equal(controller.playerObserver, observer, '附加参数丢失原媒体监听会话');
     route.flushTimers(); assert.equal(refreshed, 1);
