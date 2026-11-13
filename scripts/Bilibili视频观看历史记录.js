@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.9.3
-// @description  记录并提示 Bilibili 视频观看进度，支持原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
+// @version      4.10.0
+// @description  记录 Bilibili 视频观看进度，支持提示或自动续播、原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
 // @match        https://www.bilibili.com/v/*
@@ -103,10 +103,15 @@
         lowThreshold: 30,
         highThreshold: 80,
         autoResumePrompt: true,
+        resumeMode: 'prompt',
         floatingButtonVisibility: FLOATING_BUTTON_VISIBILITY.SHOW_ALL
     };
 
-    const CONFIG = Object.assign({}, DEFAULT_CONFIG, GM_getValue('bvh_settings', {}));
+    const normalizeResumeMode = settings => ['off', 'prompt', 'auto'].includes(settings?.resumeMode)
+        ? settings.resumeMode : settings?.autoResumePrompt === false ? 'off' : 'prompt';
+    const savedSettings = GM_getValue('bvh_settings', {});
+    const CONFIG = Object.assign({}, DEFAULT_CONFIG, savedSettings);
+    CONFIG.resumeMode = normalizeResumeMode(savedSettings);
     Object.assign(CONFIG, normalizeTagStyle(CONFIG));
     Object.assign(CONFIG, normalizeFloatingStyle(CONFIG));
     CONFIG.showMultiPageHistory = CONFIG.showMultiPageHistory === true;
@@ -1019,6 +1024,11 @@
             if (!timeStr) return 0;
             return timeStr.split(":").reverse().reduce((total, item, index) => total + parseInt(item || 0) * Math.pow(60, index), 0);
         },
+        resumeSeconds: value => {
+            if (typeof value !== 'string' || !/^\d+(?::[0-5]\d){1,2}$/.test(value)) return null;
+            const seconds = Utils.timeToSeconds(value);
+            return Number.isSafeInteger(seconds) && seconds >= 0 ? seconds : null;
+        },
         escapeHTML: (value) => String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])),
         debounce: (fn, delay) => {
             let timer;
@@ -1056,6 +1066,8 @@
     const SettingsManager = {
         save: async (patch = {}) => {
             const next = Object.assign({}, CONFIG, patch);
+            next.resumeMode = normalizeResumeMode(next);
+            next.autoResumePrompt = next.resumeMode !== 'off';
             Object.assign(next, normalizeTagStyle(next));
             Object.assign(next, normalizeFloatingStyle(next));
             next.showMultiPageHistory = next.showMultiPageHistory === true;
@@ -4450,20 +4462,59 @@
                 FloatingEntry.show(record, key || '');
             } else FloatingEntry.show(null);
         },
+        // 手动与自动续播共用有界的媒体等待和结果确认；取消不会改变播放状态。
+        seekVideo: (video, seconds, { isValid = () => true, play = false, onSuccess = () => {}, onFailure = () => {} } = {}) => {
+            let stopped = false, attempts = 0, retryTimer, timeout;
+            const events = ['loadedmetadata', 'durationchange', 'canplay', 'seeked', 'timeupdate'];
+            const cancel = () => {
+                stopped = true; clearTimeout(retryTimer); clearTimeout(timeout);
+                for (const event of events) video.removeEventListener(event, update);
+                video.removeEventListener('seeking', onSeeking);
+            };
+            const onSeeking = () => { if (attempts && Math.abs(video.currentTime - seconds) > 1) cancel(); };
+            const finish = success => {
+                if (stopped) return;
+                cancel();
+                if (!success) { onFailure(); return; }
+                onSuccess();
+                if (play && isValid()) {
+                    try { Promise.resolve(video.play()).catch(() => {
+                        if (isValid()) UIComponent.toast('已恢复进度，请点击播放器开始播放', 'info');
+                    }); } catch (error) { if (isValid()) UIComponent.toast('已恢复进度，请点击播放器开始播放', 'info'); }
+                }
+            };
+            const update = () => {
+                if (stopped) return;
+                if (!isValid()) { finish(false); return; }
+                if (video.readyState < 1 || !Number.isFinite(video.duration) || video.duration <= 0) return;
+                if (!Number.isFinite(seconds) || seconds < 0 || seconds >= video.duration) { finish(false); return; }
+                if (Math.abs(video.currentTime - seconds) <= 1 && !video.seeking) { finish(true); return; }
+                if (attempts >= 2 || video.seeking) return;
+                attempts++;
+                try { video.currentTime = seconds; } catch (error) { Utils.log('续播等待媒体可跳转', error); }
+                if (!stopped && Math.abs(video.currentTime - seconds) <= 1 && !video.seeking) finish(true);
+            };
+            for (const event of events) video.addEventListener(event, update);
+            video.addEventListener('seeking', onSeeking);
+            timeout = setTimeout(() => finish(false), 4000);
+            retryTimer = setTimeout(update, 1200);
+            update();
+            return cancel;
+        },
         jumpToProgress: (record) => {
-            if (!record?.currentTime) {
-                Utils.log('UIComponent.jumpToProgress skipped: no currentTime');
-                return;
-            }
-            const video = document.querySelector("#bilibili-player video, bwp-video");
-            if (video) {
-                Utils.log('UIComponent.jumpToProgress', record.currentTime, record.percent || '');
-                video.currentTime = Utils.timeToSeconds(record.currentTime);
-                video.play();
-                UIComponent.toast(`已跳转到 ${record.currentTime}`, 'success', 2000);
-            } else {
-                Utils.warn('UIComponent.jumpToProgress skipped: video element not found');
-            }
+            const seconds = Utils.resumeSeconds(record?.currentTime);
+            if (seconds === null) return;
+            const observer = VideoPlayerObserver.active;
+            const video = document.querySelector('#bilibili-player video, bwp-video');
+            if (!video) return;
+            observer?.cancelResume();
+            const key = EpisodeResolver.getCurrentKey();
+            const valid = () => EpisodeResolver.getCurrentKey() === key
+                && video === document.querySelector('#bilibili-player video, bwp-video');
+            const cancel = UIComponent.seekVideo(video, seconds, { isValid: valid, play: true,
+                onSuccess: () => UIComponent.toast(`已跳转到 ${record.currentTime}`, 'success', 2000),
+                onFailure: () => { if (valid()) UIComponent.toast('未能恢复进度，请稍后重试', 'info'); } });
+            if (observer) observer._cancelSeek = cancel;
         },
         resumeToRecord: (target) => {
             if (!target?.record?.currentTime) {
@@ -4486,43 +4537,45 @@
             }));
             location.href = targetUrl;
         },
-        applyPendingSeek: (currentKey, video, isValid = () => EpisodeResolver.getCurrentKey() === currentKey) => {
-            if (!currentKey || !video) return;
+        getPendingSeek: (currentKey) => {
+            if (!currentKey) return null;
             let pending = null;
             try {
                 pending = JSON.parse(sessionStorage.getItem(PENDING_SEEK_KEY) || 'null');
             } catch (e) { }
             if (!pending || VideoKey.normalize(pending.key) !== VideoKey.normalize(currentKey)) {
                 if (pending) Utils.log('UIComponent.applyPendingSeek skip: key mismatch', `pending=${pending.key}`, `current=${currentKey}`);
-                return;
+                return null;
             }
             const pageMeta = EpisodeResolver.getVideoPageMeta(VideoKey.base(currentKey));
             if (pageMeta.confirmed && pageMeta.totalPages >= 1 && VideoKey.page(pending.key) > pageMeta.totalPages) {
                 Utils.log('UIComponent.applyPendingSeek skip: page out of range', `pending=${pending.key}`, `totalPages=${pageMeta.totalPages}`);
                 sessionStorage.removeItem(PENDING_SEEK_KEY);
-                return;
+                return null;
             }
-            if (Date.now() - (pending.savedAt || 0) > 60000) {
+            if (!Number.isFinite(pending.savedAt) || Date.now() - pending.savedAt > 60000
+                || pending.savedAt > Date.now() || Utils.resumeSeconds(pending.currentTime) === null) {
                 Utils.log('UIComponent.applyPendingSeek expired', pending);
                 sessionStorage.removeItem(PENDING_SEEK_KEY);
-                return;
+                return null;
             }
-            const seek = () => {
-                if (!isValid()) return;
-                Utils.log('UIComponent.applyPendingSeek seek', `key=${currentKey}`, `time=${pending.currentTime}`);
-                video.currentTime = Utils.timeToSeconds(pending.currentTime);
-                video.play();
-                sessionStorage.removeItem(PENDING_SEEK_KEY);
-                UIComponent.toast(`已跳转到 ${EpisodeResolver.getPageLabel(currentKey)} ${pending.currentTime}`, 'success', 2500);
-            };
-            if (video.readyState >= 1) seek();
-            else video.addEventListener('loadedmetadata', seek, { once: true });
-            return () => video.removeEventListener('loadedmetadata', seek);
+            return pending;
+        },
+        applyPendingSeek: (currentKey, video, isValid = () => EpisodeResolver.getCurrentKey() === currentKey) => {
+            const pending = UIComponent.getPendingSeek(currentKey);
+            if (!pending || !video) return;
+            return UIComponent.seekVideo(video, Utils.resumeSeconds(pending.currentTime), { isValid, play: true,
+                onSuccess: () => {
+                    sessionStorage.removeItem(PENDING_SEEK_KEY);
+                    UIComponent.toast(`已跳转到 ${EpisodeResolver.getPageLabel(currentKey)} ${pending.currentTime}`, 'success', 2500);
+                },
+                onFailure: () => { if (isValid()) UIComponent.toast('未能恢复进度，请稍后重试', 'info'); }
+            });
         },
         showResumePrompt: (target, onStartFresh, isValid = () => true) => {
             const record = target?.record || target;
-            const resumeSeconds = Utils.timeToSeconds(record?.currentTime);
-            if (!CONFIG.autoResumePrompt || !record?.currentTime || resumeSeconds < MIN_RESUME_SECONDS) {
+            const resumeSeconds = Utils.resumeSeconds(record?.currentTime);
+            if (CONFIG.resumeMode !== 'prompt' || resumeSeconds === null || resumeSeconds < MIN_RESUME_SECONDS) {
                 Utils.log('UIComponent.showResumePrompt skipped', `auto=${CONFIG.autoResumePrompt}`, `hasTime=${!!record?.currentTime}`, `seconds=${resumeSeconds}`);
                 return;
             }
@@ -4930,7 +4983,7 @@
             const toggle = (key, label, note) => `<div class="bvh-setting-row"><label for="bvh-setting-${key}">${label}<small>${note}</small></label><input class="bvh-switch" id="bvh-setting-${key}" data-setting="${key}" type="checkbox" ${d[key] ? 'checked' : ''}></div>`;
             const threshold = (key, label) => `<label class="bvh-number-field">${label}<div><input id="bvh-setting-${key}" data-setting="${key}" type="number" min="1" max="99" value="${esc(d[key])}" aria-describedby="bvh-error-${key}"><span>%</span></div><small class="bvh-field-error" id="bvh-error-${key}"></small></label>`;
             this.q('[data-pane="settings"]').innerHTML = `<div class="bvh-settings-layout"><div class="bvh-setting-groups">
-                <section class="bvh-section"><div class="bvh-section-heading"><span>01</span><h2>播放与提示</h2></div>${toggle('autoResumePrompt', '续播提示', '再次打开视频时，提示上次观看的位置。')}<div class="bvh-setting-row"><label for="bvh-setting-floatingButtonVisibility">悬浮入口<small>选择在哪些页面显示快捷入口。</small></label><select id="bvh-setting-floatingButtonVisibility" data-setting="floatingButtonVisibility">${[['show-all', '所有页面显示'], ['hide-video', '仅非视频页显示'], ['hide-non-video', '仅视频页显示'], ['hide-all', '全部隐藏']].map(([value, text]) => `<option value="${value}" ${d.floatingButtonVisibility === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div></section>
+                <section class="bvh-section"><div class="bvh-section-heading"><span>01</span><h2>播放与提示</h2></div><div class="bvh-setting-row"><label for="bvh-setting-resumeMode">续播方式<small>默认提示。自动续播仅恢复当前分 P，并保持播放器的播放或暂停状态。</small></label><div><select id="bvh-setting-resumeMode" data-setting="resumeMode" aria-describedby="bvh-error-resumeMode">${[['off', '关闭'], ['prompt', '提示续播'], ['auto', '自动续播']].map(([value, text]) => `<option value="${value}" ${d.resumeMode === value ? 'selected' : ''}>${text}</option>`).join('')}</select><small class="bvh-field-error" id="bvh-error-resumeMode"></small></div></div><div class="bvh-setting-row"><label for="bvh-setting-floatingButtonVisibility">悬浮入口<small>选择在哪些页面显示快捷入口。</small></label><select id="bvh-setting-floatingButtonVisibility" data-setting="floatingButtonVisibility">${[['show-all', '所有页面显示'], ['hide-video', '仅非视频页显示'], ['hide-non-video', '仅视频页显示'], ['hide-all', '全部隐藏']].map(([value, text]) => `<option value="${value}" ${d.floatingButtonVisibility === value ? 'selected' : ''}>${text}</option>`).join('')}</select></div></section>
                 <section class="bvh-section"><div class="bvh-section-heading"><span>02</span><h2>页面标记</h2></div>${toggle('showProgressBar', '观看进度条', '在视频封面上显示已观看的进度。')}${toggle('showVisitedTag', '已访问标签', '标记打开过、但还未开始观看的视频。')}${toggle('showMultiPageHistory', '多 P 悬停详情', '默认关闭。悬停显示分 P 记录；收藏夹、历史记录等悬浮菜单内优先在侧边显示，空间不足时在列表内展开。')}</section>
                 <section class="bvh-section"><div class="bvh-section-heading"><span>03</span><h2>标签样式</h2></div><fieldset class="bvh-position"><legend>标签位置</legend><div>${[['top-left', '左上'], ['top-right', '右上'], ['bottom-left', '左下'], ['bottom-right', '右下']].map(([value, label]) => `<label><input type="radio" name="bvh-position" data-setting="tagPosition" value="${value}" ${d.tagPosition === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset><div class="bvh-setting-row"><label for="bvh-opacity-number">标签透明度<small>数值越高，标签越清晰。</small></label><div class="bvh-opacity"><input aria-label="标签透明度滑块" type="range" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><input id="bvh-opacity-number" type="number" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><span>%</span></div></div><div class="bvh-thresholds">${threshold('lowThreshold', '低进度分界')}${threshold('highThreshold', '高进度分界')}</div><p class="bvh-help">低于低分界为低进度；超过高分界为高进度。</p></section>
                 ${this.renderTagStyleSettings()}
@@ -5215,6 +5268,8 @@
         async save() {
             if (this.saving) return false;
             const errors = {}, next = { ...this.draft };
+            if (!['off', 'prompt', 'auto'].includes(next.resumeMode)) errors.resumeMode = '请选择有效的续播方式';
+            next.autoResumePrompt = next.resumeMode !== 'off';
             for (const [key, [min, max]] of Object.entries({ lowThreshold: [1, 99], highThreshold: [1, 99], tagOpacity: [40, 100], ...TAG_STYLE_RANGES })) {
                 const raw = String(next[key]).trim(), number = Number(raw);
                 if (!raw || !Number.isFinite(number) || !Number.isInteger(number) || number < min || number > max) errors[key] = `请输入 ${min}–${max} 的整数`;
@@ -5228,7 +5283,7 @@
             for (const key of Object.keys(TAG_STYLE_DEFAULTS).filter(key => !TAG_STYLE_RANGES[key])) {
                 if (key.endsWith('Style') ? !['label', 'ring'].includes(next[key]) : key.endsWith('Mode') ? !['full', 'compact'].includes(next[key]) : !/^#[0-9a-f]{6}$/i.test(next[key])) errors[key] = '请选择有效的标签样式';
             }
-            for (const key of ['lowThreshold', 'highThreshold', 'tagOpacity', ...Object.keys(TAG_STYLE_DEFAULTS), ...Object.keys(FLOATING_STYLE_DEFAULTS)]) {
+            for (const key of ['resumeMode', 'lowThreshold', 'highThreshold', 'tagOpacity', ...Object.keys(TAG_STYLE_DEFAULTS), ...Object.keys(FLOATING_STYLE_DEFAULTS)]) {
                 this.root.querySelectorAll(`[data-setting="${key}"]`).forEach(input => input.setAttribute('aria-invalid', !!errors[key]));
                 const error = this.q(`#bvh-error-${key}`); if (error) error.textContent = errors[key] || '';
             }
@@ -5760,6 +5815,7 @@
     // --- 播放器监控层 ---
     class VideoPlayerObserver {
         static retired = new WeakMap();
+        static active = null;
         static metrics = { activeSaves: 0, coalesced: 0, completed: 0, failed: 0 };
         constructor(onIdentityChange = null) {
             this.generation = crypto.randomUUID(); this.state = 'waiting'; this.destroyed = false;
@@ -5767,6 +5823,23 @@
             this.bvId = null; this.title = ''; this.videoEl = null; this.hasPlayed = false;
             this._lastKnownState = null; this._source = ''; this._metadataSeen = false; this._mediaGeneration = 0; this._titleCheckedKey = '';
             this._lastSaveFailed = false;
+            this._onResumeInput = event => {
+                if (event.isTrusted === false) return;
+                const target = event.target;
+                if (event.type === 'keydown') {
+                    if (target?.closest?.('input, textarea, select, [contenteditable="true"]')
+                        || !['ArrowLeft', 'ArrowRight', 'Home', 'End', ' ', 'j', 'k', 'l'].includes(event.key)) return;
+                } else if (!target?.closest?.('#bilibili-player, .bpx-player-container, bwp-video')) return;
+                this.cancelResume();
+            };
+            this._onSeeking = () => {
+                if (!this._resumePending) return;
+                const expected = this._resumeExpectedSeconds;
+                if (expected === undefined ? this.videoEl.currentTime > 2 : Math.abs(this.videoEl.currentTime - expected) > 1) this.cancelResume();
+            };
+            this._onResumeReady = () => {
+                if (this._resumeStarted && this._resumePending && !this._autoResumeTimer && !this._cancelSeek) this.tryAutoResume();
+            };
             this._onPlay = () => { HistoryWorkPriority.playing(this.generation, !this.destroyed); this.hasPlayed = true; this.saveProgressDebounced(); };
             this._onTimeUpdate = () => {
                 HistoryWorkPriority.playing(this.generation, !this.destroyed && this.videoEl?.paused === false);
@@ -5788,7 +5861,7 @@
                 }
             };
             this._onBeforeUnload = () => { HistoryWorkPriority.playing(this.generation, false); this.capture(); this.persistSnapshot(); };
-            this._onLoadStart = () => { HistoryWorkPriority.playing(this.generation, false); this.state = 'switching'; this._mediaGeneration++; this._metadataSeen = false; this._cancelSeek?.(); };
+            this._onLoadStart = () => { HistoryWorkPriority.playing(this.generation, false); this.state = 'switching'; this._mediaGeneration++; this._metadataSeen = false; this.suspendResume(); };
             this._onMetadata = () => {
                 this._metadataSeen = true;
                 if (this._metadataTimer) clearTimeout(this._metadataTimer);
@@ -5816,6 +5889,7 @@
         }
         setupRecord() {
             if (this.destroyed) return;
+            this.prepareResume();
             this.title = this.getConfirmedTitle();
             const record = StorageManager.getRecord(this.bvId);
             if (record) UIComponent.showViewPanel(record, this.bvId);
@@ -5842,9 +5916,11 @@
         }
         bindVideo(video) {
             if (!video || this.destroyed || video === this.videoEl) return;
+            this.prepareResume(); this.suspendResume();
             this.ensureVisitedRecord();
             this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
             this.videoEl = video; this._mediaGeneration++; this._metadataSeen = false; this.state = 'waiting';
+            VideoPlayerObserver.active = this;
             HistoryWorkPriority.playing(this.generation, video.paused === false);
             this.bindEvents();
             const retired = VideoPlayerObserver.retired.get(video);
@@ -5862,16 +5938,103 @@
             this.title = this.getConfirmedTitle() || this.title;
             this.ensureVisitedRecord();
             this.completeMissingTitle();
-            if (!this._resumeShown) {
-                this._resumeShown = true;
-                const valid = () => this.state === 'bound' && this.identityMatches() && this.videoEl === this.getCurrentVideo();
-                const latest = EpisodeResolver.getLatestRecord(VideoKey.base(this.bvId));
-                if (latest) this._cancelPrompt = UIComponent.showResumePrompt(latest, () => {
-                    if (valid()) { this.videoEl.currentTime = 0; this.videoEl.play(); }
-                }, valid);
-                this._cancelSeek = UIComponent.applyPendingSeek(this.bvId, this.videoEl, valid);
-            }
+            this.beginResume();
             return true;
+        }
+        prepareResume() {
+            if (this._resumePrepared || !this.bvId) return;
+            this._resumePrepared = true;
+            const record = StorageManager.getRecord(this.bvId);
+            this._resumeRecord = record ? { ...record } : null;
+            this._resumeEpoch = StorageManager._store.epoch; this._resumePruneKey = StorageManager._store.pruneKey;
+            const seconds = Utils.resumeSeconds(record?.currentTime);
+            this._resumePending = CONFIG.resumeMode === 'auto' && record?.status === RECORD_STATUS.WATCHED
+                && seconds !== null && seconds >= MIN_RESUME_SECONDS;
+            if (this._resumePending) {
+                document.addEventListener('pointerdown', this._onResumeInput, true);
+                document.addEventListener('keydown', this._onResumeInput, true);
+            }
+        }
+        resumeValid(video, generation) {
+            return this.state === 'bound' && this.identityMatches() && this.videoEl === video
+                && video === this.getCurrentVideo() && this._mediaGeneration === generation
+                && (video.currentSrc || video.src || '') === this._source;
+        }
+        hasExplicitStart() {
+            const url = new URL(location.href);
+            return url.searchParams.has('t') || url.searchParams.has('start_progress') || /(?:^#|[?&])t=/.test(url.hash);
+        }
+        beginResume() {
+            if (this._resumeFinished || this._resumeStarted) return;
+            const video = this.videoEl, generation = this._mediaGeneration;
+            const valid = () => this.resumeValid(video, generation);
+            // 用户已经点选的跨页续播优先于设置及链接中的默认起播位置。
+            if (UIComponent.getPendingSeek(this.bvId)) {
+                this.cancelResume();
+                this._cancelSeek = UIComponent.applyPendingSeek(this.bvId, video, valid);
+                return;
+            }
+            if (this.hasExplicitStart()) { this.cancelResume(); return; }
+            if (CONFIG.resumeMode !== 'auto') {
+                this._resumeFinished = true;
+                const latest = CONFIG.resumeMode === 'prompt' ? EpisodeResolver.getLatestRecord(VideoKey.base(this.bvId)) : null;
+                if (latest) this._cancelPrompt = UIComponent.showResumePrompt(latest, () => {
+                    this.cancelResume();
+                    if (valid()) this._cancelSeek = UIComponent.seekVideo(video, 0, { isValid: valid, play: true });
+                }, valid);
+                return;
+            }
+            if (!this._resumePending) { this.cancelResume(); return; }
+            this._resumeStarted = true;
+            this._autoResumeTimeout = setTimeout(() => this.cancelResume(), 4500);
+            // 给站点初始化及原生续播留出短暂窗口，期间用户操作可直接取消。
+            this._autoResumeTimer = setTimeout(() => { this._autoResumeTimer = null; this.tryAutoResume(); }, 350);
+        }
+        tryAutoResume() {
+            const video = this.videoEl, generation = this._mediaGeneration;
+            const valid = () => this.resumeValid(video, generation);
+            if (!this._resumePending || this._resumeFinished) return;
+            if (!valid() || this.hasExplicitStart() || CONFIG.resumeMode !== 'auto' || this._resumeEpoch !== StorageManager._store.epoch
+                || this._resumePruneKey !== StorageManager._store.pruneKey
+                || StorageManager.getRecord(this.bvId)?.status !== RECORD_STATUS.WATCHED) { this.cancelResume(); return; }
+            const seconds = Utils.resumeSeconds(this._resumeRecord?.currentTime), duration = video.duration;
+            if (!Number.isFinite(duration) || duration <= 0 || video.readyState < 1) return;
+            if (seconds === null || seconds < MIN_RESUME_SECONDS || seconds >= duration
+                || duration - seconds < Math.min(10, duration * .05)
+                || video.currentTime > 2) { this.cancelResume(); return; }
+            if (video.seeking) return;
+            this._resumeExpectedSeconds = seconds;
+            this._cancelSeek = UIComponent.seekVideo(video, seconds, { isValid: () => valid() && !this.hasExplicitStart() && CONFIG.resumeMode === 'auto',
+                onSuccess: () => {
+                    this._resumePending = false; this._resumeFinished = true;
+                    clearTimeout(this._autoResumeTimeout); this.removeResumeInput();
+                    const notice = UIComponent.toast(`已恢复至 ${this._resumeRecord.currentTime}`, 'success', 5000);
+                    this._resumeNotice = notice;
+                    const button = document.createElement('button'); button.textContent = '从头播放'; notice.appendChild(button);
+                    button.addEventListener('click', () => {
+                        if (!valid()) { notice.remove(); return; }
+                        this.cancelResume();
+                        this._cancelSeek = UIComponent.seekVideo(video, 0, { isValid: valid });
+                    });
+                },
+                onFailure: () => { this.cancelResume(); }
+            });
+        }
+        removeResumeInput() {
+            document.removeEventListener('pointerdown', this._onResumeInput, true);
+            document.removeEventListener('keydown', this._onResumeInput, true);
+        }
+        suspendResume() {
+            clearTimeout(this._autoResumeTimer); clearTimeout(this._autoResumeTimeout);
+            this._autoResumeTimer = null;
+            this._resumeExpectedSeconds = undefined;
+            this._cancelSeek?.(); this._cancelSeek = null;
+            this._resumeNotice?.remove();
+            if (!this._resumeFinished) this._resumeStarted = false;
+        }
+        cancelResume() {
+            this._resumePending = false; this._resumeFinished = true;
+            this.suspendResume(); this.removeResumeInput(); this._cancelPrompt?.();
         }
         ensureVisitedRecord() {
             // 访问身份来自当前路由，不等待媒体确认，也不读取旧媒体的时间或标题。
@@ -5955,7 +6118,7 @@
             return snapshot;
         }
         capture() {
-            if (this.state !== 'bound' || !this.identityMatches() || !this.videoEl || !this.hasPlayed) return null;
+            if (this._resumePending || this.state !== 'bound' || !this.identityMatches() || !this.videoEl || !this.hasPlayed) return null;
             if ((this.videoEl.currentSrc || this.videoEl.src || '') !== this._source) { this.state = 'switching'; return null; }
             const current = this.videoEl.currentTime, duration = this.videoEl.duration;
             if (!Number.isFinite(current) || !Number.isFinite(duration) || duration <= 0 || current < MIN_WATCH_SAVE_SECONDS) return null;
@@ -6056,7 +6219,7 @@
             window.addEventListener('beforeunload', this._onBeforeUnload);
             document.addEventListener('visibilitychange', this._onVisibilityChange);
         }
-        events() { return [['play', this._onPlay], ['timeupdate', this._onTimeUpdate], ['pause', this._onPause], ['loadstart', this._onLoadStart], ['emptied', this._onLoadStart], ['loadedmetadata', this._onMetadata]]; }
+        events() { return [['play', this._onPlay], ['timeupdate', this._onTimeUpdate], ['pause', this._onPause], ['loadstart', this._onLoadStart], ['emptied', this._onLoadStart], ['loadedmetadata', this._onMetadata], ['seeking', this._onSeeking], ['seeked', this._onResumeReady], ['durationchange', this._onResumeReady], ['canplay', this._onResumeReady]]; }
         unbindVideoEvents(video) { if (video) for (const [event, fn] of this.events()) video.removeEventListener(event, fn); }
         destroy() {
             if (this.destroyed) return;
@@ -6066,7 +6229,8 @@
             this.persistSnapshot(); this.unbindVideoEvents(this.videoEl);
             window.removeEventListener('beforeunload', this._onBeforeUnload);
             document.removeEventListener('visibilitychange', this._onVisibilityChange);
-            this._cancelWait?.(); this._cancelSeek?.(); this._cancelPrompt?.();
+            this._cancelWait?.(); this.cancelResume();
+            if (VideoPlayerObserver.active === this) VideoPlayerObserver.active = null;
             clearInterval(this.videoWatchInterval); clearTimeout(this._metadataTimer);
         }
     }
