@@ -265,14 +265,14 @@ try {
     assert.equal(await leaving.count(), 1);
     assert.equal(await leaving.evaluate(el => getComputedStyle(el).pointerEvents), 'none');
     await leaving.waitFor({ state: 'detached' });
-    await page.locator('#card-2 .card-title').hover(); await popup.waitFor();
+    await page.locator('#card-2 img').hover(); await popup.waitFor();
     assert.deepEqual(await popup.locator('.bvh-multi-page').allTextContents(), ['P2']);
     await page.mouse.move(900, 600); await popup.waitFor({ state: 'detached' });
-    await page.locator('#card-1 .card-title').focus(); await popup.waitFor();
+    await page.locator('#card-1 a').first().focus(); await popup.waitFor();
     assert.equal(await popup.locator('.bvh-multi-row').count(), 4);
-    assert.equal(await page.locator('#card-1 .card-title').getAttribute('aria-describedby'), 'bvh-multi-history');
+    assert.equal(await page.locator('#card-1 a').first().getAttribute('aria-describedby'), 'bvh-multi-history');
     await page.locator('#focus-start').focus(); await popup.waitFor({ state: 'detached' });
-    assert.equal(await page.locator('#card-1 .card-title').getAttribute('aria-describedby'), null);
+    assert.equal(await page.locator('#card-1 a').first().getAttribute('aria-describedby'), null);
     await page.locator('#card-3 img').hover();
     await page.waitForTimeout(250); assert.equal(await popup.count(), 0);
     await page.evaluate(async () => {
@@ -283,7 +283,7 @@ try {
     assert.equal(await popup.locator('.bvh-multi-row').count(), 4, 'P1 仅访问且关闭访问标签时，仍应展示已观看的其他分 P');
     await page.evaluate(() => watcher.refreshForRoute()); await popup.waitFor({ state: 'detached' });
     await page.mouse.move(1000, 600);
-    console.log('通过：封面与标题悬停、P 序号排序、时间进度、访问记录、仅有 P2、单 P、键盘与原生说明清理、转义及实时更新');
+    console.log('通过：封面悬停、P 序号排序、时间进度、访问记录、仅有 P2、单 P、键盘与原生说明清理、转义及实时更新');
 
     await page.evaluate(async () => {
         const rows = {};

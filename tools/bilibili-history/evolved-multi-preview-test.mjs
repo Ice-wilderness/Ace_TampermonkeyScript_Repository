@@ -71,7 +71,9 @@ try {
         await page.evaluate(name => renderMenu(name), name);
         await page.waitForFunction(() => document.querySelectorAll('[data-bvh-multi-base]').length === 2);
         await openMenu();
-        await page.locator('.list .title').first().hover(); await panel.waitFor();
+        await page.locator('.list .title').first().hover(); await page.waitForTimeout(240);
+        assert.equal(await panel.count(), 0, `${name} 标题区域不能触发详情`);
+        await page.locator('.list .cover').first().hover(); await panel.waitFor();
         assert.deepEqual(await panel.locator('.bvh-multi-page').allTextContents(), ['P1', 'P2', 'P10']);
         assert.equal(await panel.evaluate(el => el.matches(':popover-open')), true);
         assert.equal(await page.locator('.popup-container').evaluate(el => el.getBoundingClientRect().width), 0);
@@ -82,19 +84,19 @@ try {
         assert.equal(await page.locator('.custom-navbar-item').getAttribute('data-closed'), null, '移入详情不触发菜单移出关闭');
         assert.equal(await page.locator('.popup').evaluate(el => getComputedStyle(el).opacity), '1', '菜单不能因顶层详情未传递 hover 状态而消失');
         assert.equal(await panel.evaluate(el => getComputedStyle(el).pointerEvents), 'auto');
-        await page.locator('.list .title').last().hover();
+        await page.locator('.list .cover').last().hover();
         await page.waitForFunction(() => document.querySelector('#bvh-multi-history .bvh-multi-page')?.textContent === 'P2');
         assert.deepEqual(await panel.locator('.bvh-multi-page').allTextContents(), ['P2']);
         await page.keyboard.press('Escape'); await page.mouse.move(20, 700);
-        await page.locator(name === 'feeds' ? '.list a.video-card' : '.list .title').first().focus(); await panel.waitFor();
+        await page.locator(name === 'feeds' ? '.list a.video-card' : '.list a[class$="-cover-container"]').first().focus(); await panel.waitFor();
         await page.locator('#outside').focus(); await panel.waitFor({ state: 'detached' });
         assert.equal(await page.locator('.custom-navbar-item').getAttribute('data-bvh-multi-open'), null, '关闭后恢复 Evolved 原有菜单行为');
     }
-    console.log('通过：四种 Evolved 菜单的标题/键盘触发、P 排序、仅 P2、真实弹窗边界定位及移入详情保持菜单');
+    console.log('通过：四种 Evolved 菜单的封面/键盘触发、P 排序、仅 P2、真实弹窗边界定位及移入详情保持菜单');
 
     await page.evaluate(() => { document.querySelector('.custom-navbar-item').style.left = '140px'; renderMenu('watchlater'); });
     await openMenu();
-    await page.locator('.list .title').first().hover(); await panel.waitFor();
+    await page.locator('.list .cover').first().hover(); await panel.waitFor();
     assert.equal(await panel.getAttribute('data-side'), 'right');
     await page.keyboard.press('Escape'); await page.mouse.move(700, 700);
     await page.setViewportSize({ width: 430, height: 700 });
@@ -102,7 +104,7 @@ try {
     await page.waitForFunction(() => document.querySelector('[data-bvh-multi-base]'));
     await openMenu();
     const before = await page.locator('.watchlater-card').first().evaluate(el => [el.getBoundingClientRect().width, el.getBoundingClientRect().height]);
-    await page.locator('.list .title').first().hover(); await panel.waitFor();
+    await page.locator('.list .cover').first().hover(); await panel.waitFor();
     assert.equal(await panel.getAttribute('data-inline'), 'true');
     assert.equal(await panel.evaluate(el => el.previousElementSibling.matches('.watchlater-card') && el.parentElement.matches('.list')), true);
     assert.deepEqual(await page.locator('.watchlater-card').first().evaluate(el => [el.getBoundingClientRect().width, el.getBoundingClientRect().height]), before);
@@ -111,7 +113,7 @@ try {
     await page.keyboard.press('Escape'); await page.mouse.move(420, 650);
     await page.evaluate(() => renderMenu('feeds'));
     await openMenu();
-    await page.locator('.list .title').first().hover(); await panel.waitFor();
+    await page.locator('.list .cover').first().hover(); await panel.waitFor();
     assert.equal(await panel.getAttribute('data-inline'), 'true');
     assert.equal(await panel.evaluate(el => el.previousElementSibling.matches('a.video-card') && !el.closest('a')), true, '动态详情不嵌入整卡链接');
     console.log('通过：左右展开、窄屏按整张卡片内嵌、保留网格布局、动态整卡链接隔离和实际菜单高度');
@@ -120,11 +122,11 @@ try {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.evaluate(() => { document.querySelector('.custom-navbar-item').style.left = '820px'; renderMenu('favorites'); });
     await openMenu();
-    await page.locator('.list .title').first().hover(); await panel.waitFor();
+    await page.locator('.list .cover').first().hover(); await panel.waitFor();
     await page.evaluate(() => document.querySelector('.favorites-cover-container').href = '/video/BV0000000002');
     await panel.waitFor({ state: 'detached' });
     await page.waitForFunction(() => document.querySelector('.favorites-cover-container').dataset.bvhMultiBase === 'BV0000000002');
-    await page.mouse.move(20, 700); await openMenu(); await page.locator('.list .title').first().hover(); await panel.waitFor();
+    await page.mouse.move(20, 700); await openMenu(); await page.locator('.list .cover').first().hover(); await panel.waitFor();
     assert.deepEqual(await panel.locator('.bvh-multi-page').allTextContents(), ['P2']);
     await page.evaluate(() => {
         records.get('BV0000000002?p=2').title = '更新后的分 P 标题';

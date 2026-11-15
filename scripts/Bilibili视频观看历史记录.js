@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.10.0
+// @version      4.10.1
 // @description  记录 Bilibili 视频观看进度，支持提示或自动续播、原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -423,7 +423,6 @@
         ${multi} .bvh-multi-heading { flex-shrink: 0; padding: 14px 16px 12px; border-bottom: 1px solid var(--bvh-multi-line); }
         ${multi} .bvh-multi-heading { flex-wrap: wrap; }
         ${multi} .bvh-multi-tools { display: flex; align-items: center; gap: 6px; margin-left: auto; }
-        ${multi}[data-history-compact=true] .bvh-multi-tools small { display: none; }
         ${multi} .bvh-multi-refresh { appearance: none; display: inline-flex; align-items: center; justify-content: center; min-width: 62px; min-height: 26px; padding: 3px 7px; border: 1px solid var(--bvh-multi-line); border-radius: 6px; background: var(--bvh-multi-paper); color: var(--bvh-multi-ink); font: inherit; font-size: 10px; line-height: 1.5; white-space: nowrap; cursor: pointer; }
         ${multi} .bvh-multi-refresh:hover:not(:disabled) { background: var(--bvh-multi-soft); border-color: var(--bvh-multi-accent); }
         ${multi} .bvh-multi-refresh:focus-visible { outline: 2px solid var(--bvh-multi-accent); outline-offset: 2px; }
@@ -6239,23 +6238,43 @@
     const MultiPageHistoryPreview = {
         anchor: null, panel: null, menu: null, evolvedMenuHost: null, showTimer: null, hideTimer: null, closingPanel: null, removeTimer: null, initialized: false,
         titleRequest: null, titleFeedback: null,
-        cardSelector: `.bili-video-card, .video-card, .video-page-card-small, .video-page-card, .card-box, .history-card, .header-history-card, ${EVOLVED_HEADER_CARD_SELECTOR}`,
-        historyCover(anchor) {
-            const card = anchor?.closest?.('.history-card');
-            return card ? anchor.querySelector('picture, img') || card.querySelector('.bili-video-card__cover picture, .bili-video-card__cover img, .bili-cover-card picture, .bili-cover-card img') : null;
+        cardSelector: `.bili-video-card, .video-card, .video-page-card-small, .video-page-card, .card-box, .history-card, .header-history-card, .header-fav-card, .header-dynamic__box--right, .watchlater-card, .watch-later-card, .favorite-card, .fav-video-list .small-item, .fav-video-list .video-item, .watch-later-list .av-item, .watch-later-list .video-item, ${ENDING_RECOMMEND_ITEM_SELECTOR}, ${EVOLVED_HEADER_CARD_SELECTOR}`,
+        coverSelector: '.bili-video-card__cover, .bili-cover-card__cover, .bili-cover-card, .cover-container, .cover, .header-history-video__image, .header-fav-card__image, .bpx-player-ending-related-item-img',
+        actionSelector: 'button, [role="button"], [role="menuitem"], input, [class*="delete"], [class*="remove"], [aria-haspopup="menu"], .be-dropdown, .more, .more-btn, .more-button, .more-icon, .card-more, .bili-video-card__more, .bili-cover-card__more',
+        getCard(anchor) {
+            if (!anchor) return null;
+            const card = anchor.closest(this.cardSelector);
+            if (card) return card;
+            // 收藏夹／稍后再看的变体：封面和同一视频的独立标题链接共同确定卡片边界。
+            const base = anchor.dataset.bvhMultiBase;
+            for (let parent = anchor.parentElement, depth = 0; parent && parent !== document.body && depth < 4; parent = parent.parentElement, depth++) {
+                const links = Array.from(parent.querySelectorAll(VIDEO_LINK_SELECTOR));
+                if (links.filter(link => link.querySelector('img, picture')).length > 1) break;
+                if (links.some(link => link !== anchor && !anchor.contains(link) && !link.querySelector('img, picture')
+                    && VideoKey.base(VideoKey.fromUrl(link.href)) === base && link.textContent.trim())) return parent;
+            }
+            return anchor;
+        },
+        getCover(anchor, card = this.getCard(anchor)) {
+            if (!card) return null;
+            const marked = anchor?._bvhMarkParent;
+            const cover = anchor?.querySelector(this.coverSelector) || card.querySelector(this.coverSelector);
+            return marked?.querySelector('img') || anchor?.querySelector('img') || cover?.querySelector('img')
+                || marked?.querySelector('picture') || anchor?.querySelector('picture') || cover
+                || card.querySelector('img, picture');
         },
         init() {
             if (this.initialized) return;
             this.initialized = true;
-            const actions = 'button, [role="button"], input, [class*="delete"]';
+            const actions = this.actionSelector;
             const find = (node, event) => {
                 const anchor = node?.closest?.('[data-bvh-multi-base]')
                     || node?.closest?.(this.cardSelector)?.querySelector('[data-bvh-multi-base]');
-                if (!anchor?.closest('.history-card')) return anchor;
+                if (!anchor) return null;
                 if (node.closest(actions)) return null;
-                const cover = this.historyCover(anchor);
+                const cover = this.getCover(anchor);
                 if (!cover) return null;
-                if (!event?.type.startsWith('pointer')) return anchor.contains(node) ? anchor : null;
+                if (!event?.type.startsWith('pointer')) return (node.closest('a, [tabindex]') || node).contains(cover) ? anchor : null;
                 const rect = cover.getBoundingClientRect();
                 return event.clientX >= rect.left && event.clientX < rect.right && event.clientY >= rect.top && event.clientY < rect.bottom ? anchor : null;
             };
@@ -6265,11 +6284,12 @@
                 if (inside(event.target)) { clearTimeout(this.hideTimer); return; }
                 const anchor = find(event.target, event);
                 if (!anchor) {
-                    const card = this.anchor?.closest('.history-card');
+                    const card = this.getCard(this.anchor);
                     if (card && card.contains(event.target)) {
-                        const cover = this.historyCover(this.anchor)?.getBoundingClientRect();
+                        const cover = this.getCover(this.anchor, card)?.getBoundingClientRect();
                         const action = event.target.closest(actions);
-                        if (action || (this.panel?.dataset.historyBelow !== 'true' && (!event.type.startsWith('pointer') || !cover || event.clientY >= cover.bottom))) this.hide();
+                        if (action || (this.panel?.dataset.cardBelow !== 'true' && this.panel?.dataset.inline !== 'true'
+                            && (!event.type.startsWith('pointer') || !cover || event.clientY >= cover.bottom))) this.hide();
                     }
                     return;
                 }
@@ -6282,7 +6302,7 @@
                 if (!CONFIG.showMultiPageHistory) return;
                 if (inside(event.relatedTarget) || (this.anchor && find(event.relatedTarget, event) === this.anchor)) return;
                 // 下方展示时允许经过标题区域移入详情，但原生删除等操作仍立即让开。
-                if (this.panel?.dataset.historyBelow === 'true' && this.anchor?.closest('.history-card')?.contains(event.relatedTarget)
+                if ((this.panel?.dataset.cardBelow === 'true' || this.panel?.dataset.inline === 'true') && this.getCard(this.anchor)?.contains(event.relatedTarget)
                     && !event.relatedTarget.closest(actions)) return;
                 // 禁用正在请求的按钮会触发 focusout，不能把这当作用户移出了详情。
                 if (event.type === 'focusout' && (this.panel?.matches(':hover') || (this.titleRequest && inside(event.target)))) return;
@@ -6444,7 +6464,7 @@
             this.panel.style.maxHeight = `${Math.max(100, Math.min(430, this.menu.clientHeight - 16, window.innerHeight - 16))}px`;
             // Evolved 卡片内部使用固定网格；详情放到整张卡片之后，避免挤乱标题和 UP 信息。
             this.panel.dataset.inline = 'true';
-            (this.anchor.closest(EVOLVED_HEADER_CARD_SELECTOR) || this.anchor).after(this.panel);
+            this.getCard(this.anchor).after(this.panel);
         },
         place() {
             if (!this.anchor || !this.panel) return;
@@ -6463,45 +6483,62 @@
                 panel.style.top = `${Math.max(8, Math.min(rect.top, height - bounds.height - 8))}px`;
                 return;
             }
-            const history = this.anchor.closest('.history-card'), cover = this.historyCover(this.anchor)?.getBoundingClientRect();
-            if (history && cover) {
-                // 历史页的标题、元信息和原生删除操作必须保持可达。
-                const bounds = panel.getBoundingClientRect(), card = history.getBoundingClientRect();
-                const left = Math.max(8, Math.min(cover.left, width - bounds.width - 8));
-                const protectedAreas = Array.from(document.querySelectorAll('.history-card'), item => {
-                    const media = item.querySelector('.bili-video-card__cover picture, .bili-video-card__cover img, .bili-cover-card picture, .bili-cover-card img');
-                    const box = item.getBoundingClientRect(), image = media?.getBoundingClientRect();
-                    return image ? { left: box.left, right: box.right, top: image.bottom, bottom: box.bottom } : box;
+            const cardElement = this.getCard(this.anchor), cover = this.getCover(this.anchor, cardElement)?.getBoundingClientRect();
+            if (cardElement && cover) {
+                const card = cardElement.getBoundingClientRect().toJSON(), list = panel.querySelector('.bvh-multi-rows'), scrollTop = list.scrollTop;
+                // 部分原生操作按钮略超出卡片边框，侧边浮层及其悬停桥也要让开。
+                cardElement.querySelectorAll(this.actionSelector).forEach(action => {
+                    const box = action.getBoundingClientRect();
+                    if (!box.width || !box.height) return;
+                    card.left = Math.min(card.left, box.left); card.right = Math.max(card.right, box.right);
+                    card.top = Math.min(card.top, box.top); card.bottom = Math.max(card.bottom, box.bottom);
                 });
-                const candidates = [
-                    { left: card.right + 8, top: Math.max(8, Math.min(cover.top, height - bounds.height - 8)), side: 'right' },
-                    { left: card.left - bounds.width - 8, top: Math.max(8, Math.min(cover.top, height - bounds.height - 8)), side: 'left' },
-                    { left, top: cover.top - bounds.height - 8, side: '' },
-                    { left, top: card.bottom + 8, side: '', below: true }
+                card.height = card.bottom - card.top;
+                // 每次从正常尺寸测量，不能沿用上次窄空间留下的高度；临时测量后恢复阅读位置。
+                panel.style.removeProperty('width'); panel.style.removeProperty('max-height');
+                const bounds = panel.getBoundingClientRect();
+                const leftSpace = card.left - 16, rightSpace = width - card.right - 16;
+                let lastColumn = false;
+                for (let parent = cardElement.parentElement, depth = 0; parent && parent !== document.body && depth < 4; parent = parent.parentElement, depth++) {
+                    const peers = new Set(Array.from(parent.querySelectorAll(`${this.cardSelector}, [data-bvh-multi-base]`), item => this.getCard(item)));
+                    const row = Array.from(peers).filter(item => item && item !== cardElement && !item.contains(cardElement) && !cardElement.contains(item))
+                        .map(item => item.getBoundingClientRect()).filter(box => box.width && box.height && Math.abs(box.top - card.top) < Math.min(box.height, card.height) / 2);
+                    if (!row.length) continue;
+                    lastColumn = row.some(box => box.right <= card.left) && !row.some(box => box.left >= card.right);
+                    break;
+                }
+                // 列表最右列向内展开，即使列表右侧仍留有大片页面空白。
+                const preferLeft = lastColumn || (cover.left + cover.width / 2 > width / 2);
+                const sides = preferLeft ? ['left', 'right'] : ['right', 'left'];
+                const makeSide = (side, size) => ({ side, width: size, height: bounds.height,
+                    left: side === 'right' ? card.right + 8 : card.left - size - 8,
+                    top: Math.max(8, Math.min(cover.top, height - bounds.height - 8)) });
+                const left = Math.max(8, Math.min(cover.left, width - bounds.width - 8));
+                const vertical = [
+                    { left, top: card.bottom + 8, width: bounds.width, height: height - card.bottom - 16, below: true },
+                    { left, top: 8, width: bounds.width, height: card.top - 16, below: false }
                 ];
-                let position = candidates.find(pos => pos.left >= 8 && pos.top >= 8 && pos.left + bounds.width <= width - 8 && pos.top + bounds.height <= height - 8
-                    && !protectedAreas.some(area => pos.left < area.right && pos.left + bounds.width > area.left && pos.top < area.bottom && pos.top + bounds.height > area.top));
+                // 只避让当前卡片；邻卡不能把正常详情切成封面高度的一条窄带。
+                let position = sides.filter(side => (side === 'left' ? leftSpace : rightSpace) >= bounds.width)
+                    .map(side => makeSide(side, bounds.width))[0];
                 if (!position) {
-                    // 密集网格按操作区边界缩短详情高度，继续使用内部滚动，不覆盖当前封面链接。
-                    for (const candidate of candidates.filter(pos => pos.side || pos.below)) {
-                        const availableWidth = candidate.side === 'right' ? width - card.right - 16 : candidate.side === 'left' ? card.left - 16 : width - 16;
-                        if (availableWidth < 240) continue;
-                        const size = Math.min(bounds.width, availableWidth), top = candidate.below ? card.bottom + 8 : Math.max(8, cover.top);
-                        const left = candidate.side === 'right' ? card.right + 8 : candidate.side === 'left' ? card.left - size - 8 : Math.max(8, Math.min(cover.left, width - size - 8));
-                        let available = height - top - 8;
-                        for (const area of protectedAreas) {
-                            if (left >= area.right || left + size <= area.left || area.bottom <= top) continue;
-                            available = Math.min(available, area.top - top - 8);
-                        }
-                        if (available < 120) continue;
-                        panel.dataset.historyCompact = 'true'; panel.style.width = `${size}px`; panel.style.maxHeight = `${Math.min(430, available)}px`;
-                        position = { ...candidate, left, top }; break;
-                    }
+                    const side = sides.find(side => (side === 'left' ? leftSpace : rightSpace) >= 240);
+                    if (side) position = makeSide(side, Math.min(bounds.width, side === 'left' ? leftSpace : rightSpace));
+                }
+                if (!position) {
+                    const full = vertical.find(pos => pos.height >= bounds.height);
+                    if (full) position = { ...full, height: bounds.height, top: full.below ? full.top : card.top - bounds.height - 8 };
+                }
+                if (!position) {
+                    const available = vertical.sort((a, b) => b.height - a.height)[0];
+                    if (available.height >= 180) position = { ...available, height: Math.min(bounds.height, available.height) };
                 }
                 if (!position) { this.hide(); return; }
-                panel.dataset.historyBelow = String(!!position.below);
+                panel.style.width = `${position.width}px`; panel.style.maxHeight = `${position.height}px`;
+                panel.dataset.cardBelow = String(!!position.below);
                 if (position.side) panel.dataset.side = position.side; else panel.removeAttribute('data-side');
                 panel.style.left = `${position.left}px`; panel.style.top = `${position.top}px`;
+                list.scrollTop = scrollTop;
                 return;
             }
             const bounds = panel.getBoundingClientRect();

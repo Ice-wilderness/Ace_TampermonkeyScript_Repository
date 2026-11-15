@@ -7,7 +7,7 @@ const browser = await chromium.launch({ headless: true });
 try {
     const page = await browser.newPage({ viewport: { width: 1100, height: 900 } });
     const errors = []; page.on('pageerror', error => errors.push(error.message));
-    await page.route('**/*', route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><html><head><style>
+    await page.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<!doctype html><html><head><style>
         body{margin:0;background:#f5f4f0;font:14px sans-serif}main{display:grid;grid-template-columns:repeat(3,280px);gap:20px;padding:40px}
         .history-card{width:280px}.bili-cover-card{display:block;position:relative}.bili-cover-card img{display:block;width:280px;height:180px;background:#dce6eb}
         .info{display:flex;align-items:flex-start;gap:8px;padding-top:10px;min-height:45px}.title{flex:1}.native-delete{width:34px;height:30px}a{color:inherit}
@@ -47,9 +47,10 @@ try {
     await card.locator('.title').focus(); await page.waitForTimeout(250);
     assert.equal(await popup.count(), 0, '聚焦标题也不能触发详情');
     await card.locator('.bili-cover-card').focus(); await popup.waitFor();
-    assert.equal(await popup.getAttribute('data-history-compact'), 'true', '密集网格应限制详情高度，避开邻近卡片操作区');
     const coverBox = await card.locator('img').boundingBox(), detailBox = await popup.boundingBox();
-    assert(detailBox.y >= coverBox.y && detailBox.y + detailBox.height <= coverBox.y + coverBox.height + 1);
+    assert(detailBox.height >= 420, '网格相邻卡片不能把详情压成一行');
+    assert.equal(await popup.locator('.bvh-multi-tools small').isVisible(), true, '记录总数仍应可见');
+    assert(detailBox.x + detailBox.width <= coverBox.x || detailBox.x >= coverBox.x + coverBox.width, '优先侧边正常展开');
     assert.equal(await card.locator('img').evaluate(el => {
         const rect = el.getBoundingClientRect(); return document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2) === el;
     }), true, '当前封面链接也应保持可点击');
@@ -85,17 +86,40 @@ try {
     await card.locator('.title').hover(); await popup.waitFor({ state: 'detached' });
     console.log('通过：宽松布局侧边详情、封面移入侧边详情可滚动、返回标题时让开');
 
+    await page.setViewportSize({ width: 650, height: 900 });
+    await card.locator('img').hover(); await popup.waitFor();
+    assert.equal(await popup.getAttribute('data-side'), 'right', '侧边略窄但可用时仍优先侧边，不先落到下方');
+    assert((await popup.boundingBox()).width >= 240 && (await popup.boundingBox()).height >= 420);
+    await card.locator('.native-delete').hover(); await popup.waitFor({ state: 'detached' });
     await card.locator('img').hover(); await card.locator('.native-delete').hover();
     await page.waitForTimeout(250); assert.equal(await popup.count(), 0, '从封面快速移到删除按钮应取消待弹出的详情');
     await page.setViewportSize({ width: 390, height: 740 });
     await card.locator('img').hover(); await popup.waitFor();
     const narrow = await popup.boundingBox();
     assert(narrow.x >= 8 && narrow.x + narrow.width <= 382 && narrow.y >= (await card.boundingBox()).y + (await card.boundingBox()).height + 8);
-    assert.equal(await popup.getAttribute('data-history-below'), 'true');
+    assert.equal(await popup.getAttribute('data-card-below'), 'true');
     await card.locator('.title').hover(); assert.equal(await popup.count(), 1, '经过标题移入下方详情时应保持显示，且不遮挡标题操作区');
     await rows.hover(); await page.mouse.wheel(0, 200);
     await page.waitForFunction(() => document.querySelector('#bvh-multi-history .bvh-multi-rows')?.scrollTop > 0);
     await card.locator('.native-delete').click(); assert.equal(await page.evaluate(() => deleteClicks), 2);
     console.log('通过：快速移出取消触发，窄屏详情可滚动且删除按钮保持可达');
+
+    await page.evaluate(() => document.querySelector('#card-2').style.transform = 'translateY(300px)');
+    await card.locator('img').hover(); await popup.waitFor();
+    const above = await popup.boundingBox();
+    assert(above.y + above.height <= (await card.boundingBox()).y - 8 && above.height >= 300);
+    await rows.hover(); await page.mouse.wheel(0, 200);
+    await page.waitForFunction(() => document.querySelector('#bvh-multi-history .bvh-multi-rows')?.scrollTop > 0);
+    const aboveScroll = await rows.evaluate(el => el.scrollTop);
+    await page.evaluate(async () => {
+        document.querySelector('#card-2').style.transform = '';
+        const s = testAPI.StorageManager; await s.saveRecord('BV0000000002', { ...s.getRecord('BV0000000002'), percent: '72%' });
+    });
+    await page.waitForFunction(() => document.querySelector('#bvh-multi-history')?.textContent.includes('72%'));
+    const restored = await popup.boundingBox(), restoredCard = await card.boundingBox();
+    assert.equal(restored.height, Math.min(430, 740 - restoredCard.y - restoredCard.height - 16), '恢复可用空间后不能沿用之前的较小高度');
+    assert(restored.height > above.height);
+    assert.equal(await rows.evaluate(el => el.scrollTop), aboveScroll, '重新测量尺寸保留滚动位置');
+    console.log('通过：侧边略窄优先侧边，窄屏按上下空间选择，空间恢复后详情恢复正常高度且不回顶');
     assert.deepEqual(errors, []);
 } finally { await browser.close(); }
