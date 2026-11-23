@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         【自写】自用论坛辅助签到自写
 // @namespace    bbshelperforme
-// @version      2.25.0
+// @version      2.25.1
 // @description  论坛辅助签到工具 - 支持 limestart 签到控制台、多站独立签到、状态复查与配置备份恢复
 // @author       Ice_wilderness
 // @match        https://www.limestart.cn/*
@@ -970,12 +970,14 @@
         // SS同盟失败页刷新仍属于原标签；续接过期任务，保留控制台持有的关页句柄关联。
         if (key === 'sstm' && taskId && lease?.kind === 'page' && lease.taskId === taskId &&
             lease.date === context.date && lease.mutationId === context.mutationId && lease.expiresAt <= Date.now() &&
+            !isSignSuccessRecorded(key) &&
             (!manuallyStopped || (lease.checkOnly && ['explicit', 'manual'].includes(lease.checkOnlySource)))) {
             GM_setValue(getScopedStorageKey(STORAGE_KEYS.task, key), { ...lease, ownerId: executionOwnerId, updatedAt: Date.now(), expiresAt: Date.now() + AUTO_CLOSE_PENDING_TTL_MS });
             lease = getTaskLease(key);
         }
         if (token && lease?.taskId === token && lease.date === getToday() && lease.expiresAt > Date.now()) {
             sessionStorage.setItem(sessionKey, token);
+            if (key === 'sstm') sessionStorage.setItem('BBSSignHelperSstmLaunchedTask', token);
             url.searchParams.delete('__bbs_task');
             try { history.replaceState(history.state, '', url.href); } catch (err) { /* 管理器可能禁止改写 URL。 */ }
         }
@@ -1007,6 +1009,8 @@
         if (options.source === 'manual' || !getDashboardConfig().preferences.autoClosePageAfterSign || !isCurrentPageForSite(key)) return;
         const operation = options.context || pageOperations.get(key);
         if (!operation || !isOperationCurrent(operation)) return;
+        // 普通访问跨页也会续接任务；只有控制台打开的标签或本次实际提交回复的标签可以关闭。
+        if (key === 'sstm' && sessionStorage.getItem('BBSSignHelperSstmLaunchedTask') !== operation.taskId && !hasPageSubmittedAction(key, operation)) return;
         if (key === 'sehuatang' && (!isSehuatangSignPage() || !getSehuatangPendingAction(operation))) return;
         let action;
         try { action = JSON.parse(sessionStorage.getItem(`BBSSignHelperPageAction:${key}`) || 'null'); } catch (err) { return; }
@@ -5195,6 +5199,9 @@
             releaseLegacyQueuedTask(site.key);
             const manualStatus = getRawTargetStatus(site.key);
             let operation = bindPageTask(site.key);
+            // 普通访问已有今日签到记录时直接浏览，避免创建新任务或覆盖完成证据。
+            if (site.key === 'sstm' && !operation?.checkOnly &&
+                (manualStatus?.status === 'success' || (!operation && getData(site.key) === todayStr))) return;
             if (manualStatus?.stage === 'manual' && ['failed', 'skipped'].includes(manualStatus.status) && !operation?.checkOnly) return;
             if (site.key === 'sehuatang') {
                 // 98堂独立观察各标签；只保留本标签实际发起签到的关页关联，不占用独占任务。

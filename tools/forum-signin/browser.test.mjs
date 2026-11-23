@@ -348,6 +348,24 @@ try {
     assert.equal(await failedHunt.evaluate(() => __requests.length), 1, '提交后网络失败不能自动重试寻宝');
     await failedHunt.close();
 
+    for (const mode of ['bookmark', 'finished-check', 'legacy-date']) {
+        const url = mode === 'finished-check' ? 'https://sstm.moe/topic/321-discussion/' : 'https://sstm.moe/';
+        const visit = await pageFor(url, '<h1 class="ipsType_pageTitle">论坛</h1><a id="elUserLink" href="/profile/7-me/">本人</a>');
+        await evaluate(visit, "updateDashboardPreference({autoClosePageAfterSign:true})");
+        if (mode === 'finished-check') {
+            await seedLegacyPageTask(visit, 'sstm', 'opened');
+            await evaluate(visit, "GM_setValue(getScopedStorageKey(STORAGE_KEYS.task,'sstm'),{...getTaskLease('sstm'),checkOnlySource:'explicit'})");
+        }
+        if (mode === 'legacy-date') await evaluate(visit, "GM_setValue(STORAGE_KEYS.successData,{sstm:getToday()})");
+        else await evaluate(visit, "completeSign('sstm','已确认本人今日回帖'); finishTaskLease(pageOperations.get('sstm'))");
+        const before = await visit.evaluate(() => [...__storage]);
+        await visit.evaluate(engine);
+        assert.equal(visit.url(), url, '已有今日签到记录，停留在收藏夹或帖子原址');
+        assert.deepEqual(await visit.evaluate(() => [...__storage]), before, '普通浏览不创建或续接任务，也保留原成功证据');
+        assert.equal(await visit.evaluate(() => __requests.length), 0);
+        await visit.close();
+    }
+
     const sstm = await pageFor('https://sstm.moe/topic/123-test/', '<h1 class="ipsType_pageTitle">【2026/10/9】签到</h1><a id="elUserLink" href="/profile/me/">本人</a><div class="ipsComposeArea"><div contenteditable="true">2026年10月9日 草稿</div></div><article class="ipsComment"><aside class="cAuthorPane"><h3><a href="/profile/other/">他人</a></h3></aside><div class="ipsComment_content">2026年10月9日</div></article>');
     assert.equal(await evaluate(sstm, 'isSstmSignedToday()'), false);
     await sstm.evaluate(() => { document.querySelector('article a').href = '/profile/me/'; });
@@ -424,7 +442,9 @@ try {
     await ipsEditor.close();
 
     const pagedSstm = await pageFor('https://sstm.moe/topic/123-test/page/40/', ipsMarkup + '<a href="/topic/123-test/?view_author=11">只看该作者</a>');
+    await evaluate(pagedSstm, "updateDashboardPreference({autoClosePageAfterSign:true}); const op=acquireTaskLease('sstm','page'); sessionStorage.setItem('BBSSignHelperPageTask:sstm',op.taskId)");
     await pagedSstm.evaluate(() => {
+        window.__closes = 0; window.close = () => __closes++;
         window.__fetchResponses.push({ text: '<h1 class="ipsType_pageTitle">签到【2026/10/9】</h1><article class="ipsComment"><aside class="cAuthorPane"><h3><a href="/profile/7-me/">本人</a></h3></aside><time datetime="2026-10-09T03:00:00Z"></time><div data-role="commentContent">每日一签</div></article>' });
         window.__unexpectedPosts = 0; document.querySelector('form').onsubmit = event => { event.preventDefault(); __unexpectedPosts++; };
     });
@@ -435,13 +455,22 @@ try {
     assert.equal(ownRequests.length, 1, '几十页评论只发一次本人过滤请求');
     assert.equal(new URL(ownRequests[0].url).searchParams.get('view_author'), '7');
     assert.equal(new URL(ownRequests[0].url).pathname, '/topic/123-test/');
+    await pagedSstm.waitForTimeout(900);
+    assert.equal(await pagedSstm.evaluate(() => __closes), 0, '普通访问跨页只查到既有回帖时，保留用户标签');
     await pagedSstm.close();
 
     // 从控制台点击检查 → 列表找今日帖 → 同标签跳转 → 检查本人评论，全程只读。
     for (const outcome of ['found', 'missing', '404']) {
         const origin = await pageFor('https://www.limestart.cn/');
-        await evaluate(origin, "for (const target of getBuiltInTargets()) updateBuiltInTargetSetting(target.id,{enabled:target.id==='sstm'}); recordTargetStatus('sstm','result-unknown',{message:'等待检查'}); showDashboard()");
-        await origin.getByRole('button', { name: '检查结果', exact: true }).click();
+        await evaluate(origin, "for (const target of getBuiltInTargets()) updateBuiltInTargetSetting(target.id,{enabled:target.id==='sstm'})");
+        if (outcome === 'found') {
+            await evaluate(origin, "completeSign('sstm','已有今日记录'); showDashboard()");
+            await origin.locator('[data-group="completed"] > summary').click();
+            await origin.getByRole('button', { name: '重新检查', exact: true }).click();
+        } else {
+            await evaluate(origin, "recordTargetStatus('sstm','result-unknown',{message:'等待检查'}); showDashboard()");
+            await origin.getByRole('button', { name: '检查结果', exact: true }).click();
+        }
         const launched = await origin.evaluate(() => ({ tab: __tabs[0], records: [...__storage] }));
         assert.ok(launched.tab.url.includes('__bbs_task='));
         const checkPage = await pageFor(launched.tab.url, '<h1 class="ipsType_pageTitle">同盟签到区</h1><a id="elUserLink" href="/profile/7-me/">本人</a><h4 class="ipsDataItem_title"><a href="/topic/yesterday/">签到【2026/10/8】</a></h4><h4 class="ipsDataItem_title"><a href="/topic/today-check/">签到【2026/10/9】</a></h4>');
@@ -480,6 +509,7 @@ try {
     // 新一天本人尚无评论：IPS 的作者过滤可能返回 404，不能因此中断首次签到。
     const newDayMarkup = ipsMarkup.replaceAll('2026/10/9', '2026/10/10').replace(' disabled', '') + '<a href="/topic/123-test/?view_author=11">只看该作者</a>';
     const missingAuthorSstm = await pageFor('https://sstm.moe/topic/123-test/', newDayMarkup);
+    await evaluate(missingAuthorSstm, "completeSign('sstm','昨天已签到')");
     await missingAuthorSstm.evaluate(() => {
         window.__now = new Date('2026-10-10T11:17:43+08:00').getTime();
         window.__fetchResponses.push({ status: 404, text: '<h1>找不到此页面</h1>' });
