@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.10.1
+// @version      4.10.2
 // @description  记录 Bilibili 视频观看进度，支持提示或自动续播、原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -1087,6 +1087,7 @@
     };
 
     const EpisodeResolver = {
+        documentBase: VideoKey.base(VideoKey.fromUrl(location.href)),
         getInitialState: () => Utils._getPageWindow()?.__INITIAL_STATE__ || window.__INITIAL_STATE__ || null,
         getBaseKey: () => VideoKey.base(VideoKey.fromUrl(location.href) || EpisodeResolver.getInitialState()?.bvid || ''),
         getVideoPageMeta: (base = EpisodeResolver.getBaseKey()) => {
@@ -1331,14 +1332,19 @@
         },
         cleanTitle: value => String(value || '').trim().replace(/\s*(?:[_-]\s*哔哩哔哩(?:[_-]bilibili)?|_\s*bilibili)\s*$/i, '').trim(),
         getTitleInfo: base => {
-            const info = { title: '', parts: new Map(), confirmed: false };
+            const info = { title: '', parts: new Map(), confirmed: false, totalPages: 0 };
             for (const state of [Utils._getPageWindow()?.__INITIAL_STATE__, window.__INITIAL_STATE__]) {
-                const data = state?.videoData, id = data?.bvid || state?.bvid;
-                if (!id || VideoKey.base(id) !== base) continue;
+                const data = state?.videoData;
+                // SPA 先更新路由字段时，只有视频数据自身的编号能够证明标题归属。
+                const id = data?.bvid || (base === EpisodeResolver.documentBase && state?.bvid);
+                if (!data || !id || VideoKey.base(id) !== base) continue;
                 info.confirmed = true;
-                info.title ||= EpisodeResolver.cleanTitle(data?.title);
-                if (!Array.isArray(data?.pages)) continue;
-                data.pages.forEach((part, index) => {
+                info.title ||= EpisodeResolver.cleanTitle(data.title);
+                const pages = Array.isArray(data.pages) ? data.pages : [];
+                info.totalPages = Math.max(info.totalPages, pages.length, Number.isSafeInteger(data.videos) ? data.videos : 0);
+                // 单 P 的 part 常是投稿文件名、曲名或编号，和视频主标题可以完全不同。
+                if (info.totalPages < 2) continue;
+                pages.forEach((part, index) => {
                     const page = part?.page ?? index + 1, title = typeof part?.part === 'string' ? EpisodeResolver.cleanTitle(part.part) : '';
                     if (Number.isSafeInteger(page) && page > 0 && title) info.parts.set(VideoKey.withPage(base, page), title);
                 });
@@ -1366,7 +1372,11 @@
                             const data = body.data;
                             const matches = base.startsWith('av') ? String(data?.aid) === base.slice(2).replace(/^0+(?=\d)/, '') : data?.bvid === base;
                             if (!matches || !Array.isArray(data.pages) || !data.pages.length) throw new Error('返回的视频信息不匹配，已保留原标题');
-                            const info = { title: EpisodeResolver.cleanTitle(data.title), parts: new Map(), confirmed: true };
+                            const info = { title: EpisodeResolver.cleanTitle(data.title), parts: new Map(), confirmed: true, totalPages: data.pages.length };
+                            if (info.totalPages === 1) {
+                                if (data.pages[0]?.page !== 1 || !info.title) throw new Error('返回的视频主标题不完整，已保留原标题');
+                                resolve(info); return;
+                            }
                             for (const part of data.pages) {
                                 const title = typeof part?.part === 'string' ? EpisodeResolver.cleanTitle(part.part) : '';
                                 if (!Number.isSafeInteger(part?.page) || part.page < 1 || !title) throw new Error('返回的分 P 标题不完整，已保留原标题');
@@ -3088,16 +3098,13 @@
                     const current = s._store.entries.get(key), record = s._compact(item.record);
                     if ((source === 'import' || source === 'visit') && current && !current.deleted) continue;
                     if (source === 'visit' && current && HistoryCommitStore.compare(version, current.version) <= 0) continue;
-                    if (source === 'title') {
-                        if (!current || current.deleted || current.record.n || !record.n?.trim()) continue;
-                        const title = record.n.trim();
-                        Object.assign(record, current.record, { n: title });
-                    }
-                    if (source === 'part-title') {
+                    if (source === 'title' || source === 'part-title') {
                         // 只修正采样时核对过的标题；提交时保留最新进度、时间及删除状态。
-                        if (!current || current.deleted || (current.record.n || '') !== item.expectedTitle || !record.n?.trim()) continue;
+                        if (!current || current.deleted || (current.record.n || '') !== (item.expectedTitle ?? '') || !record.n?.trim()) continue;
                         Object.assign(record, current.record, { n: record.n.trim() });
                     }
+                    if ((source === 'playback' || source === 'backup') && !record.n && !current?.deleted && current?.record.n)
+                        record.n = current.record.n;
                     if (source === 'history' && current && !current.deleted) {
                         if (record.p - current.record.p <= 5) continue;
                         if (!record.t) record.t = current.record.t;
@@ -6055,10 +6062,21 @@
                     if (!this.destroyed && EpisodeResolver.getCurrentKey() === this.bvId) UIComponent.showViewPanel({ ...visited, status: '访问记录保存失败，等待重试', savedAt: '' }, this.bvId);
                 });
         }
-        completeMissingTitle() {
+        completeMissingTitle(allowLookup = false) {
             if (this.destroyed || !this.bvId || EpisodeResolver.getCurrentKey() !== this.bvId || this._titlePending) return;
-            const info = EpisodeResolver.getTitleInfo(VideoKey.base(this.bvId));
+            const key = this.bvId, base = VideoKey.base(key);
+            const info = this._fetchedTitleInfo || EpisodeResolver.getTitleInfo(base);
             const title = this.getConfirmedTitle(info);
+            // 先让站点完成切换。低频检查仍不能区分主标题与分 P 时，每个播放会话最多按编号查询一次。
+            if (allowLookup && (!title || !info.totalPages) && !this._titleLookupStarted && typeof GM_xmlhttpRequest === 'function') {
+                this._titleLookupStarted = true;
+                return EpisodeResolver.fetchTitleInfo(base).then(async result => {
+                    await this._titlePending;
+                    if (this.destroyed || this.bvId !== key || EpisodeResolver.getCurrentKey() !== key) return;
+                    this._fetchedTitleInfo = result;
+                    return this.completeMissingTitle();
+                }).catch(error => Utils.warn('未能获取视频标题', error));
+            }
             if (!title) return;
             this.title = title;
             const current = StorageManager.getRecord(this.bvId);
@@ -6070,41 +6088,50 @@
                 if (!clean || clean === info.title || clean === partTitle)
                     fixes.push({ key, record: { title: partTitle }, expectedTitle: record.title });
             }
-            if (!fixes.length && (!current || current.title)) {
-                if (current?.title && info.confirmed) this._titleCheckedKey = `${this.bvId}:${StorageManager._dataVersion}`;
+            const singleVideo = key === base && info.totalPages === 1 && !!info.title;
+            if (current && !info.parts.has(key) && current.title !== title && (singleVideo || !current.title))
+                fixes.push({ key, record: { title }, expectedTitle: current.title });
+            // 单 P 元数据很小，继续随播放器低频核对，兼容站点先改编号、稍后才替换主标题。
+            const checked = info.totalPages > 1 && info.parts.has(key);
+            if (!fixes.length) {
+                if (current?.title && checked) this._titleCheckedKey = `${key}:${StorageManager._dataVersion}`;
                 return;
             }
-            // 普通标题只补空值；已核对的分 P 标题可修正旧主标题，均保留最新进度、时间和删除状态。
-            this._titlePending = (fixes.length ? StorageManager.saveRecords(fixes, true, { source: 'part-title' })
-                : StorageManager.saveRecord(this.bvId, { title }, true, { source: 'title' }))
+            this._titlePending = StorageManager.saveRecords(fixes, true, { source: 'title' })
                 .then(() => {
                     if (!this.destroyed && EpisodeResolver.getCurrentKey() === this.bvId) {
                         const record = StorageManager.getRecord(this.bvId);
                         if (record) UIComponent.showViewPanel(record, this.bvId);
-                        if (info.confirmed) this._titleCheckedKey = `${this.bvId}:${StorageManager._dataVersion}`;
+                        if (checked && record?.title === title) this._titleCheckedKey = `${key}:${StorageManager._dataVersion}`;
                     }
                 })
                 .catch(error => Utils.warn('标题补全失败，稍后重试', error))
                 .finally(() => { this._titlePending = null; });
             return this._titlePending;
         }
-        getConfirmedTitle(info = EpisodeResolver.getTitleInfo(VideoKey.base(this.bvId))) {
+        getConfirmedTitle(info = this._fetchedTitleInfo || EpisodeResolver.getTitleInfo(VideoKey.base(this.bvId))) {
             if (this.destroyed || EpisodeResolver.getCurrentKey() !== this.bvId) return '';
             const base = VideoKey.base(this.bvId);
             if (info.parts.has(this.bvId)) return EpisodeResolver.resolvePartTitle(this.bvId, StorageManager.getRecord(this.bvId)?.title, info);
-            // 用页面状态或带视频身份的元信息核对列表标题；不直接采用 document.title。
+            const needsPart = this.bvId !== base || info.totalPages > 1;
+            if (!needsPart && info.title) return info.title;
+            // 列表可按分 P 键补标题。整页通用的 h1 和 meta 只在初次加载且身份一致时使用。
             const canonical = document.querySelector('link[rel="canonical"]')?.getAttribute?.('href');
             const ogUrl = document.querySelector('meta[property="og:url"]')?.getAttribute?.('content');
-            const identityUrl = ogUrl || canonical;
-            if (!info.confirmed && (!identityUrl || VideoKey.base(VideoKey.fromUrl(identityUrl)) !== base)) return '';
-            const items = EpisodeResolver.getItems().filter(item => VideoKey.normalize(item.key) === this.bvId && item.title);
-            const item = items.find(item => item.el.matches?.('.video-pod__list.section .simple-base-item.page-item, .bpx-player-ctrl-eplist-multi-menu-item'))
-                || items.find(item => !item.el.querySelector?.('.page-list .simple-base-item.page-item'));
-            if (item) {
-                const title = EpisodeResolver.cleanTitle(item.title);
-                if (title) { info.parts.set(this.bvId, title); return EpisodeResolver.resolvePartTitle(this.bvId, StorageManager.getRecord(this.bvId)?.title, info); }
+            const urls = [canonical, ogUrl].filter(Boolean);
+            const state = EpisodeResolver.getInitialState(), stateId = state?.videoData?.bvid || state?.bvid;
+            const verifiedDocument = base === EpisodeResolver.documentBase && (!stateId || VideoKey.base(stateId) === base)
+                && urls.length > 0 && urls.every(url => VideoKey.base(VideoKey.fromUrl(url)) === base);
+            if (needsPart) {
+                if (!info.confirmed && !verifiedDocument) return '';
+                const item = EpisodeResolver.getItems().find(item => !item.guessedPage && item.key === this.bvId && item.title &&
+                    (item.el.matches?.('.video-pod__list.section .simple-base-item.page-item, .bpx-player-ctrl-eplist-multi-menu-item')
+                    || /^\d+$/.test(item.cid)));
+                if (!item) return '';
+                info.parts.set(this.bvId, EpisodeResolver.cleanTitle(item.title));
+                return EpisodeResolver.resolvePartTitle(this.bvId, StorageManager.getRecord(this.bvId)?.title, info);
             }
-            if (info.title) return info.title;
+            if (!verifiedDocument) return '';
             const heading = document.querySelector('h1.video-title, h1[title]');
             const title = heading?.getAttribute?.('title') || heading?.textContent
                 || document.querySelector('meta[property="og:title"]')?.getAttribute?.('content');
@@ -6197,7 +6224,7 @@
                 const activeKey = EpisodeResolver.getCurrentKey();
                 if (this.bvId && activeKey && activeKey !== this.bvId) { this.state = 'switching'; this.onIdentityChange?.(); return; }
                 if (!this.bvId) { this.bvId = EpisodeResolver.getCurrentKey(); if (this.bvId) this.setupRecord(); }
-                if (this.bvId && this._titleCheckedKey !== `${this.bvId}:${StorageManager._dataVersion}`) this.completeMissingTitle();
+                if (this.bvId && this._titleCheckedKey !== `${this.bvId}:${StorageManager._dataVersion}`) this.completeMissingTitle(true);
                 const video = this.getCurrentVideo();
                 HistoryWorkPriority.playing(this.generation, video?.paused === false);
                 if (video !== this.videoEl) this.bindVideo(video);
@@ -6437,7 +6464,7 @@
                     await StorageManager.initializeForKeys([base]); await StorageManager._syncIfStale();
                     const fixes = []; let matched = 0;
                     for (const key of StorageManager.getRelatedKeys(base)) {
-                        const record = StorageManager.getRecord(key), title = info.parts.get(key);
+                        const record = StorageManager.getRecord(key), title = info.totalPages === 1 && key === base ? info.title : info.parts.get(key);
                         if (!record || !title) continue;
                         matched++;
                         if (record.title !== title) fixes.push({ key, record: { title }, expectedTitle: record.title });
@@ -7860,6 +7887,7 @@
                 if (this.currentUrl === location.href) return;
                 // 追加追踪参数不改变视频身份，保留媒体绑定和正在进行的保存。
                 const routeKey = this.getRouteVideoKey();
+                if (VideoKey.base(routeKey) !== EpisodeResolver.documentBase) EpisodeResolver.documentBase = '';
                 if (!isVideoPageRoute() || !routeKey || VideoKey.normalize(this.playerObserver?.bvId) !== VideoKey.normalize(routeKey)) {
                     this.playerObserver?.destroy(); this.playerObserver = null;
                 }

@@ -17,6 +17,59 @@ const setup = async () => {
     return { w, p, get video() { return video; }, setVideo(v) { video = v; }, setKey(k) { currentKey = k; } };
 };
 const cases = [
+    ['单 P 使用视频主标题，重访修正曲名、文件名和上个视频标题并保留进度', async () => {
+        const { w, p } = await setup(); await w.StorageManager._queue;
+        const id = key(1), data = { bvid: id, title: '投稿主标题', pages: [{ page: 1, part: 'Lino - Lap Tap Love' }] };
+        w.context.window.__INITIAL_STATE__ = { videoData: data };
+        w.EpisodeResolver.getItems = () => [{ key: id, title: '合集内的短名称', el: { matches: () => true } }];
+        const progress = { status: '已观看', currentTime: '00:30', percent: '30%', savedAt: '2026-09-01 09:10:11' };
+        for (const oldTitle of ['Lino - Lap Tap Love', 'tttt', '123', '上一条视频']) {
+            await w.StorageManager.saveRecord(id, { ...progress, title: oldTitle });
+            await p.completeMissingTitle();
+            const record = w.StorageManager.getRecord(id);
+            assert.equal(record.title, data.title); assert.equal(p.capture().value.title, data.title);
+            for (const field of Object.keys(progress)) assert.equal(record[field], progress[field]);
+        }
+        p.startVideoWatch(); data.title = '123'; w.flushTimers(); await w.StorageManager._queue;
+        assert.equal(w.StorageManager.getRecord(id).title, '123', '真实的短标题同样有效');
+        p.destroy();
+    }],
+    ['推荐切换时拒绝滞后的标题，按新编号补全且不重复请求', async () => {
+        const { w, p, setKey } = await setup(); await w.StorageManager._queue; p.destroy();
+        const id = key(2), url = 'https://www.bilibili.com/video/' + id;
+        setKey(id); w.context.location.href = url;
+        w.context.window.__INITIAL_STATE__ = { bvid: id, videoData: { title: '上一条标题', pages: [{ page: 1, part: '旧文件名' }] } };
+        w.context.document.querySelector = selector => selector.startsWith('h1') ? { textContent: '上一条标题' } : { getAttribute: () => url };
+        const next = new w.VideoPlayerObserver(); next.bvId = id; next.ensureVisitedRecord(); await w.StorageManager._queue;
+        const before = w.StorageManager.getRecord(id); assert.equal(before.title, '');
+        const requests = []; w.context.GM_xmlhttpRequest = req => requests.push(req);
+        const pending = next.completeMissingTitle(true); await next.completeMissingTitle(true);
+        assert.equal(requests.length, 1); assert.equal(new URL(requests[0].url).searchParams.get('bvid'), id);
+        requests[0].onload({ status: 200, response: { code: 0, data: { bvid: id, title: '推荐目标视频', pages: [{ page: 1, part: '003' }] } } });
+        await pending;
+        assert.deepEqual({ ...w.StorageManager.getRecord(id) }, { ...before, title: '推荐目标视频' });
+        await w.StorageManager.saveRecord(id, { status: '已观看', percent: '50%', title: '' });
+        assert.equal(w.StorageManager.getRecord(id).title, '推荐目标视频', '等待期间的无标题进度不能擦除已补全的标题');
+        next.destroy();
+    }],
+    ['离开视频后丢弃迟到的标题响应，限流后仍可用页面数据补全', async () => {
+        for (const leave of [true, false]) {
+            const { w, p, setKey } = await setup(); await w.StorageManager._queue;
+            const id = key(1), requests = []; w.context.GM_xmlhttpRequest = req => requests.push(req);
+            const pending = p.completeMissingTitle(true);
+            if (leave) {
+                setKey(key(2)); p.destroy();
+                requests[0].onload({ status: 200, response: { code: 0, data: { bvid: id, title: '迟到的响应', pages: [{ page: 1 }] } } });
+            } else requests[0].onload({ status: 429 });
+            await pending;
+            assert.equal(w.StorageManager.getRecord(id).title, ''); assert.equal(w.StorageManager.getRecord(key(2)), null);
+            if (!leave) {
+                await p.completeMissingTitle(true); assert.equal(requests.length, 1);
+                w.context.window.__INITIAL_STATE__ = { videoData: { bvid: id, title: '迟到的主标题', videos: 1 } };
+                await p.completeMissingTitle(true); assert.equal(w.StorageManager.getRecord(id).title, '迟到的主标题'); p.destroy();
+            }
+        }
+    }],
     ['分 P 优先保存独立标题，并安全修正同一视频的旧主标题及站点后缀', async () => {
         const { w, p, video } = await setup(); await w.StorageManager._queue;
         const base = key(1), second = base + '?p=2', deleted = base + '?p=3';
