@@ -182,7 +182,19 @@ try {
     await page.screenshot({ path: path.join(os.tmpdir(), 'bvh-tag-style-mobile.png') });
     const overflow = await page.evaluate(() => [...panel.root.querySelectorAll('.bvh-content, .bvh-section, .bvh-shell')].filter(el => el.scrollWidth > el.clientWidth + 1).length);
     assert.equal(overflow, 0, '窄窗口不应出现横向溢出');
-    console.log('通过：四种状态与多 P 预览，390px 窄窗口无横向溢出');
+    const previewOrder = await page.evaluate(() => {
+        const row = panel.q('.bvh-preview-episode-row');
+        const title = row.querySelector('span:first-child').getBoundingClientRect();
+        const tag = row.querySelector('[data-preview-episode]').getBoundingClientRect();
+        const duration = row.querySelector('.bvh-preview-episode-duration').getBoundingClientRect();
+        return {
+            tagBeforeDuration: row.querySelector('[data-preview-episode]').nextElementSibling === row.querySelector('.bvh-preview-episode-duration'),
+            orderedLeftToRight: title.right <= tag.left + 1 && tag.right <= duration.left + 1,
+            noRowOverflow: row.scrollWidth <= row.clientWidth + 1
+        };
+    });
+    assert.deepEqual(previewOrder, { tagBeforeDuration: true, orderedLeftToRight: true, noRowOverflow: true }, '设置页合集预览应呈现标题-标签-时长且无溢出');
+    console.log('通过：四种状态与多 P 预览，合集预览符合标题-标签-时长顺序，390px 窄窗口无横向溢出');
 
     await page.setViewportSize({ width: 700, height: 500 });
     const layout = await page.evaluate(() => {

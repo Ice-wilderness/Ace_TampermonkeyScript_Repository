@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Bilibili视频观看历史记录
 // @namespace    Bilibili-video-History
-// @version      4.10.2
+// @version      4.10.3
 // @description  记录 Bilibili 视频观看进度，支持提示或自动续播、原生与 Bilibili Evolved 顶栏标记、分 P 悬停详情与标题刷新、左右贴边隐藏、历史管理、统计、JSON/CSV 导入导出与诊断、官方历史同步及可选 WebDAV 云同步与备份。
 // @author       Ice_wilderness
 // @match        https://www.bilibili.com/video/*
@@ -369,7 +369,9 @@
         }
         .bvh-tag-small { margin: .2em!important; padding: 0 4px!important; height: 18px; line-height: 18px; font-size: 10px; }
         .bvh-tag-big { height: 22px; line-height: 23px; font-size: 14px; }
-        .bvh-episode-tag { display: inline-block; margin-left: 6px; padding: 0 4px; height: 16px; line-height: 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 600; vertical-align: middle; white-space: nowrap; pointer-events: none; }
+        .bvh-episode-tag { display: inline-block; flex-shrink: 0; margin-left: 6px; padding: 0 4px; height: 16px; line-height: 16px; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 600; vertical-align: middle; white-space: nowrap; pointer-events: none; }
+        .simple-base-item:has(> .bvh-episode-tag) > .title { min-width: 0; overflow: hidden; }
+        .simple-base-item > .bvh-episode-tag { margin-left: 6px; margin-right: 0; }
         .action-list-item-wrap .cover, .action-list-item-wrap .cover-img { position: relative; }
         ${HEADER_POPOVER_COVER_SELECTOR} { position: relative; }
         ${ENDING_RECOMMEND_ITEM_SELECTOR} { position: relative; }
@@ -4994,7 +4996,7 @@
                 <section class="bvh-section"><div class="bvh-section-heading"><span>03</span><h2>标签样式</h2></div><fieldset class="bvh-position"><legend>标签位置</legend><div>${[['top-left', '左上'], ['top-right', '右上'], ['bottom-left', '左下'], ['bottom-right', '右下']].map(([value, label]) => `<label><input type="radio" name="bvh-position" data-setting="tagPosition" value="${value}" ${d.tagPosition === value ? 'checked' : ''}><span>${label}</span></label>`).join('')}</div></fieldset><div class="bvh-setting-row"><label for="bvh-opacity-number">标签透明度<small>数值越高，标签越清晰。</small></label><div class="bvh-opacity"><input aria-label="标签透明度滑块" type="range" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><input id="bvh-opacity-number" type="number" data-setting="tagOpacity" min="40" max="100" value="${d.tagOpacity}"><span>%</span></div></div><div class="bvh-thresholds">${threshold('lowThreshold', '低进度分界')}${threshold('highThreshold', '高进度分界')}</div><p class="bvh-help">低于低分界为低进度；超过高分界为高进度。</p></section>
                 ${this.renderTagStyleSettings()}
                 <section class="bvh-section"><div class="bvh-section-heading"><span>05</span><h2>诊断与维护</h2></div>${toggle('debug', '调试日志', '需要排查问题时开启。导入失败诊断会自动保留，无需开启此开关。')}<div class="bvh-maintenance-links"><button data-action="download-log">下载日志</button><button data-action="download-import-diagnostic">下载导入诊断</button><button data-action="clear-log">清空日志</button><button data-action="reset-position">恢复悬浮位置</button>${this.options.currentKey && StorageManager.getRecord(this.options.currentKey)?.currentTime ? '<button data-action="jump">跳转到已记录进度</button>' : ''}</div><details class="bvh-storage-tools"><summary>存储维护</summary><p class="bvh-help">以下离线操作需要先关闭其他所有运行本脚本的页面。</p><button data-action="staging-info">检查暂存数据</button><button data-action="cleanup-staging">离线清理暂存数据</button><button data-action="legacy-snapshot">生成旧版兼容快照</button><p data-storage-info role="status"></p></details></section>
-                </div><aside class="bvh-preview-panel"><div class="bvh-eyebrow">LIVE PREVIEW</div><h2>标记效果预览</h2><p>调整左侧选项，即时查看效果。</p><div class="bvh-preview-cover"><div class="bvh-preview-art">${workbenchIcon('mark')}<span>每一段观看，都有迹可循。</span><small>WATCH · PAUSE · CONTINUE</small></div><div data-preview-tag></div><div data-preview-bar></div><span class="bvh-preview-duration">12:48</span></div><h3>下一次，从这里继续</h3><p class="bvh-preview-caption">演示画幅 · 仅用于样式预览</p><div class="bvh-preview-states" aria-label="预览记录类型">${[['visited', '已访问'], ['low', '低进度'], ['mid', '中进度'], ['high', '高进度'], ['multi', '多 P']].map(([v, l]) => `<button data-preview="${v}" aria-pressed="${v === this.previewState}">${l}</button>`).join('')}</div><div class="bvh-preview-playlist"><span class="bvh-help">合集列表</span><div class="bvh-preview-episode-row"><span>01 · 下一段旅程</span><span data-preview-episode></span></div><div class="bvh-preview-grid-row"><span class="bvh-help">网格分 P</span><div class="bvh-preview-grid-cell">01<span data-preview-grid></span></div></div></div><div class="bvh-preview-note"><span class="bvh-dot"></span>预览不会修改实际记录<br><small>保存设置后，页面上的标记才会更新。</small></div></aside></div>`;
+                </div><aside class="bvh-preview-panel"><div class="bvh-eyebrow">LIVE PREVIEW</div><h2>标记效果预览</h2><p>调整左侧选项，即时查看效果。</p><div class="bvh-preview-cover"><div class="bvh-preview-art">${workbenchIcon('mark')}<span>每一段观看，都有迹可循。</span><small>WATCH · PAUSE · CONTINUE</small></div><div data-preview-tag></div><div data-preview-bar></div><span class="bvh-preview-duration">12:48</span></div><h3>下一次，从这里继续</h3><p class="bvh-preview-caption">演示画幅 · 仅用于样式预览</p><div class="bvh-preview-states" aria-label="预览记录类型">${[['visited', '已访问'], ['low', '低进度'], ['mid', '中进度'], ['high', '高进度'], ['multi', '多 P']].map(([v, l]) => `<button data-preview="${v}" aria-pressed="${v === this.previewState}">${l}</button>`).join('')}</div><div class="bvh-preview-playlist"><span class="bvh-help">合集列表</span><div class="bvh-preview-episode-row"><span>01 · 下一段旅程</span><span data-preview-episode></span><span class="bvh-preview-episode-duration">12:48</span></div><div class="bvh-preview-grid-row"><span class="bvh-help">网格分 P</span><div class="bvh-preview-grid-cell">01<span data-preview-grid></span></div></div></div><div class="bvh-preview-note"><span class="bvh-dot"></span>预览不会修改实际记录<br><small>保存设置后，页面上的标记才会更新。</small></div></aside></div>`;
             this.organizeSettings();
             this.renderPreview();
         }
@@ -5389,7 +5391,7 @@
         .bvh-stat-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}.bvh-stat-summary section{padding:18px;border-radius:12px;background:white;border:1px solid var(--bvh-line)}.bvh-stat-summary span{font-size:11px;color:var(--bvh-muted)}.bvh-stat-summary strong{display:block;font-size:28px;letter-spacing:-1px;line-height:1.2;margin:12px 0 10px;font-weight:600}.bvh-stat-summary small{font-size:9px;color:var(--bvh-muted)}.bvh-stat-summary section.featured{background:#263D49;color:white;border-color:#263D49}.bvh-stat-summary .featured span,.bvh-stat-summary .featured small{color:#CCDDE5}.bvh-stats-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.bvh-chart-card{padding:18px}.bvh-chart-card h2{font-size:13px}.bvh-donut{max-width:160px;margin:10px auto 0}.bvh-donut svg{display:block;width:100%}.bvh-chart-card .bvh-help{font-size:9px}.bvh-distribution{margin-top:24px;font-size:11px}.bvh-distribution>div:first-child{display:flex;justify-content:space-between;margin-bottom:8px}.bvh-distribution>div:last-child{height:5px;background:#EDF1F2;border-radius:5px;overflow:hidden}.bvh-distribution i{display:block;height:100%;border-radius:5px}.bvh-trend{margin-top:20px}.bvh-trend-heading{display:flex;justify-content:space-between;align-items:center;gap:12px}.bvh-trend-heading p{font-size:10px;color:var(--bvh-muted);margin-top:4px}.bvh-range-buttons{display:flex;gap:5px}.bvh-range-buttons button{font-size:10px;min-height:32px;padding:6px 9px}.bvh-chart-scroll{overflow-x:auto;padding-top:18px}.bvh-chart-scroll svg{min-width:440px;width:100%;display:block}.bvh-trend summary{font-size:10px;color:var(--bvh-muted)}.bvh-daily-values{display:grid;grid-template-columns:repeat(auto-fill,minmax(85px,1fr));gap:10px;font-size:10px}.bvh-daily-values strong{display:block;font-weight:500}.bvh-dialog-mask{z-index:2147483100;background:#15202E66}.bvh-confirm{width:min(460px,100%);padding:28px;background:var(--bvh-paper);border:1px solid white;border-radius:16px;box-shadow:0 24px 100px #0004}.bvh-confirm h2{font-size:20px}.bvh-confirm-message{white-space:pre-line;overflow-wrap:anywhere;color:var(--bvh-muted);font-size:13px;margin:16px 0 24px!important}.bvh-dialog-actions{display:flex;justify-content:flex-end;flex-wrap:wrap;gap:8px}.bvh-dialog-actions button{font-size:12px}.bvh-sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
         .bvh-toast-container{z-index:2147483200!important;max-width:calc(100vw - 32px)!important}.bvh-toast{font:13px/1.6 "Microsoft YaHei",sans-serif!important;border-radius:10px!important;box-shadow:0 8px 32px #14212F33!important;max-width:min(460px,calc(100vw - 32px))!important;overflow-wrap:anywhere}.bvh-toast button{font:inherit;color:inherit;background:transparent;border:1px solid currentColor;border-radius:5px;padding:3px 10px;margin-left:14px;cursor:pointer}.bvh-resume{z-index:2147482900!important}.bvh-toast button:focus-visible{outline:3px solid #007EAD;outline-offset:3px}
         @keyframes bvh-spin{to{transform:rotate(360deg)}}
-        .bvh-tag-colors{margin:16px 0}.bvh-color-heading,.bvh-color-row{display:grid;grid-template-columns:minmax(0,1fr) 52px 52px;align-items:center;gap:12px;padding:6px 0}.bvh-color-heading{font-size:10px;color:var(--bvh-muted)}.bvh-color-heading span:not(:first-child){text-align:center}.bvh-color-row>span{font-size:12px}.bvh-workbench .bvh-color-row input[type=color]{width:52px;height:32px;min-height:32px;padding:3px;border-radius:6px;cursor:pointer}.bvh-tag-dimensions{min-width:0;border:0;border-top:1px solid var(--bvh-line);padding:16px 0;margin:16px 0 0}.bvh-tag-dimensions legend{font-size:12px;font-weight:600;padding:0 8px 0 0}.bvh-tag-size-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.bvh-tag-size-fields .bvh-number-field input{width:100%;min-width:0;padding:8px}.bvh-tag-size-fields .bvh-number-field>div{gap:4px}.bvh-tag-size-fields .bvh-number-field span{font-size:10px;color:var(--bvh-muted)}.bvh-style-reset{margin-top:14px;font-size:11px!important}.bvh-preview-playlist{margin-top:20px;padding-top:14px;border-top:1px solid var(--bvh-line)}.bvh-preview-episode-row{display:flex;align-items:center;justify-content:space-between;gap:4px;margin-top:8px;padding:12px 8px;border-radius:8px;background:white;min-width:0;overflow:hidden}.bvh-preview-episode-row>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}.bvh-preview-episode-row .bvh-episode-tag{flex-shrink:0}.bvh-preview-grid-row{display:flex;align-items:center;justify-content:space-between;margin-top:10px}.bvh-preview-grid-cell{position:relative;width:76px;height:44px;border:1px solid var(--bvh-line);border-radius:6px;background:white;padding:16px 8px 4px;font-size:11px}.bvh-preview-bar{background:linear-gradient(90deg,rgba(122,134,234,.9),rgba(156,166,255,.7))}
+        .bvh-tag-colors{margin:16px 0}.bvh-color-heading,.bvh-color-row{display:grid;grid-template-columns:minmax(0,1fr) 52px 52px;align-items:center;gap:12px;padding:6px 0}.bvh-color-heading{font-size:10px;color:var(--bvh-muted)}.bvh-color-heading span:not(:first-child){text-align:center}.bvh-color-row>span{font-size:12px}.bvh-workbench .bvh-color-row input[type=color]{width:52px;height:32px;min-height:32px;padding:3px;border-radius:6px;cursor:pointer}.bvh-tag-dimensions{min-width:0;border:0;border-top:1px solid var(--bvh-line);padding:16px 0;margin:16px 0 0}.bvh-tag-dimensions legend{font-size:12px;font-weight:600;padding:0 8px 0 0}.bvh-tag-size-fields{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.bvh-tag-size-fields .bvh-number-field input{width:100%;min-width:0;padding:8px}.bvh-tag-size-fields .bvh-number-field>div{gap:4px}.bvh-tag-size-fields .bvh-number-field span{font-size:10px;color:var(--bvh-muted)}.bvh-style-reset{margin-top:14px;font-size:11px!important}.bvh-preview-playlist{margin-top:20px;padding-top:14px;border-top:1px solid var(--bvh-line)}.bvh-preview-episode-row{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:8px;padding:12px 8px;border-radius:8px;background:white;min-width:0;overflow:hidden}.bvh-preview-episode-row>span:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}.bvh-preview-episode-row .bvh-episode-tag{flex-shrink:0;margin-left:0}.bvh-preview-episode-duration{flex-shrink:0;font-size:11px;color:var(--bvh-muted);font-variant-numeric:tabular-nums}.bvh-preview-grid-row{display:flex;align-items:center;justify-content:space-between;margin-top:10px}.bvh-preview-grid-cell{position:relative;width:76px;height:44px;border:1px solid var(--bvh-line);border-radius:6px;background:white;padding:16px 8px 4px;font-size:11px}.bvh-preview-bar{background:linear-gradient(90deg,rgba(122,134,234,.9),rgba(156,166,255,.7))}
         .bvh-settings-details{border-top:1px solid var(--bvh-line);margin-top:16px;padding-top:6px}.bvh-settings-details>summary{font-size:12px;font-weight:600;min-height:38px;align-content:center}.bvh-settings-details[open]>summary{margin-bottom:8px}.bvh-diagnostics .bvh-settings-details{border-top:0;margin:0;padding:0}.bvh-workbench .bvh-setting-groups [hidden]{display:none!important}.bvh-tag-dimensions .bvh-tag-size-fields{padding-top:14px}.bvh-tag-dimensions .bvh-field-error:empty{display:none}
         @media(max-width:1050px){.bvh-settings-layout{grid-template-columns:minmax(0,1fr) 210px;gap:18px}.bvh-shell{grid-template-columns:164px minmax(0,1fr)}.bvh-page-header{padding:24px}.bvh-content{padding:20px 24px}.bvh-footer{padding:14px 24px}.bvh-section{padding:16px}.bvh-setting-row{gap:10px}.bvh-setting-row select{max-width:135px}.bvh-opacity input[type=range]{width:45px}.bvh-stat-summary section{padding:14px}.bvh-stat-summary strong{font-size:25px}}
         @media(max-width:779px){.bvh-manager-mask{padding:12px}.bvh-shell{display:flex;flex-direction:column;height:calc(100dvh - 24px);border-radius:14px}.bvh-nav{padding:12px 16px;flex-direction:row;align-items:center;gap:16px;flex-shrink:0}.bvh-brand{padding:0}.bvh-brand>svg{width:24px}.bvh-brand>span{font-size:12px}.bvh-brand small,.bvh-nav-label,.bvh-nav-note{display:none}.bvh-nav nav{display:flex;gap:4px;flex:1;justify-content:flex-end}.bvh-nav button{padding:8px;gap:5px;min-height:44px;font-size:12px}.bvh-nav button svg{width:16px;height:16px}.bvh-nav button[aria-current=page]{box-shadow:inset 0 -2px #00AEEC}.bvh-main{flex:1}.bvh-page-header{padding:20px}.bvh-content{padding:18px 20px}.bvh-footer{padding:12px 20px}.bvh-settings-layout{grid-template-columns:minmax(0,1fr) 220px}.bvh-setting-row{flex-wrap:wrap}.bvh-stats-grid{grid-template-columns:1fr 1fr}.bvh-stats-grid>.bvh-section:first-child{grid-row:span 2}.bvh-workbench button,.bvh-workbench select{min-height:44px}}
@@ -7301,6 +7303,25 @@
             return this.relatedKeysCache.get(bvBase) || [];
         }
 
+        getPlaylistTagPlacement(el, { isGridItem = false, isPlayerMenuItem = false } = {}) {
+            if (isGridItem || isPlayerMenuItem) {
+                return { parent: el, beforeNode: null };
+            }
+            const row = el.matches('.simple-base-item')
+                ? el
+                : (el.querySelector('.single-p > .simple-base-item.normal')
+                    || el.querySelector('.simple-base-item.normal')
+                    || el);
+            const anchor = row.querySelector(':scope > .stats')
+                || row.querySelector(':scope > .stat-item.duration, :scope > .duration');
+            if (anchor && anchor.parentNode === row) {
+                return { parent: row, beforeNode: anchor };
+            }
+            const title = row.querySelector(':scope > .title');
+            if (title) return { parent: title, beforeNode: null };
+            return { parent: row, beforeNode: null };
+        }
+
         processPlaylistItem(el) {
             const start = performance.now();
             const item = this.getPlaylistItemInfo(el);
@@ -7310,9 +7331,16 @@
             let record = StorageManager.getRecord(item.key);
             const isActionListItem = el.matches(ACTION_LIST_ITEM_SELECTOR);
             const isGridItem = el.classList.contains('page') || !!el.closest('.video-pod__list.grid');
+            const isPlayerMenuItem = el.matches('.bpx-player-ctrl-eplist-multi-menu-item');
+            const placement = isActionListItem ? null : this.getPlaylistTagPlacement(el, { isGridItem, isPlayerMenuItem });
             const signature = JSON.stringify([item.key, record?.status, record?.percent, record?.savedAt,
                 CONFIG.showVisitedTag, CONFIG.tagOpacity, CONFIG.tagPosition, CONFIG.lowThreshold, CONFIG.highThreshold, isGridItem, TagStyle.signature()]);
-            if (el._bvhEpisodeSignature === signature && el._bvhEpisodeTag && el.contains(el._bvhEpisodeTag)) return;
+            if (
+                el._bvhEpisodeSignature === signature &&
+                el._bvhEpisodeTag &&
+                el.contains(el._bvhEpisodeTag) &&
+                (!placement || (el._bvhEpisodeTag.parentNode === placement.parent && el._bvhEpisodeTag.nextElementSibling === placement.beforeNode))
+            ) return;
             el._bvhEpisodeSignature = null;
             el._bvhEpisodeTag = null;
             el.style.removeProperty('--bvh-episode-label-space');
@@ -7353,16 +7381,7 @@
             }
 
             const tagEl = this.createEpisodeTag(record, isGridItem);
-            const isSectionItem = !!el.closest('.video-pod__list.section');
-            const isPlayerMenuItem = el.matches('.bpx-player-ctrl-eplist-multi-menu-item');
-            const target = isGridItem || isPlayerMenuItem
-                ? el
-                : isSectionItem
-                    ? (el.matches('.simple-base-item.page-item')
-                        ? (el.querySelector(':scope > .title') || el.querySelector('.title') || el)
-                        : (el.querySelector('.simple-base-item.normal > .title') || el.querySelector('.title') || el))
-                    : (el.querySelector('.title-txt, .title') || el);
-            target.appendChild(tagEl);
+            placement.parent.insertBefore(tagEl, placement.beforeNode);
             if (isPlayerMenuItem) {
                 const size = parseFloat(tagEl.style.fontSize), padding = parseFloat(tagEl.style.paddingLeft);
                 const width = tagEl.classList.contains('bvh-tag-ring') ? parseFloat(tagEl.style.width) : tagEl.textContent.length * size + padding * 2;
